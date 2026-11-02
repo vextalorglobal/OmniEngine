@@ -1,0 +1,24 @@
+# Rust build artifacts — the space hog. Never committed.
+/target
+**/target/
+
+# Local cargo escape hatch (CARGO_HOME relocation lives here if opted in; see GUIDE.md)
+.cargo-home/
+
+# Python SDK build/install residue
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+
+# Node SDK — SDK deps are not vendored into the engine repo
+node_modules/
+
+# Editors and OS noise
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
