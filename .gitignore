@@ -22,3 +22,8 @@ node_modules/
 *.swp
 Thumbs.db
 .DS_Store
+
+# Windows writes its app-compatibility cache into a directory literally named
+# "%SystemDrive%" when a tool inherits an unexpanded environment variable. It
+# appeared inside the workspace during a cargo build; it is not ours.
+%SystemDrive%/

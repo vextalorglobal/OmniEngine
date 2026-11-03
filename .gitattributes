@@ -1,0 +1,56 @@
+# ---------------------------------------------------------------------------
+# Line endings
+# ---------------------------------------------------------------------------
+# Normalize the repository to LF and stop Git rewriting the C sources that the
+# Windows build depends on. Without these rules every `git add` on this machine
+# warns "LF will be replaced by CRLF", and a CRLF-mangled .h or .py still parses
+# but diffs noisily forever after.
+* text=auto eol=lf
+
+*.rs    text eol=lf
+*.toml  text eol=lf
+*.md    text eol=lf
+*.py    text eol=lf
+*.js    text eol=lf
+*.json  text eol=lf
+*.h     text eol=lf
+*.omni  text eol=lf
+*.ox    text eol=lf
+Cargo.lock text eol=lf
+
+# Never text-mangle a binary. A CRLF-converted cdylib simply stops loading,
+# with an error that gives no hint as to why.
+*.dll  binary
+*.so   binary
+*.dylib binary
+*.lib  binary
+*.wasm binary
+*.pdb  binary
+*.obj  binary
+
+# ---------------------------------------------------------------------------
+# GitHub language identity — tier 1
+# ---------------------------------------------------------------------------
+# The honest constraint: .gitattributes can only remap a path to a language that
+# GitHub Linguist ALREADY knows. It cannot mint a language named "OmniEngine".
+# Rust is the closest known syntax for `let` bindings and `//` comments, which
+# gets .omni files counted and highlighted today.
+#
+# Making "OmniEngine" a real language is the tier 2 github/linguist pull request
+# documented in docs/GUIDE.md: a languages.yml entry plus a Chroma or Prism
+# lexer, and it will not be accepted until the language is used outside this
+# repository.
+*.omni linguist-language=Rust linguist-detectable=true
+*.ox   linguist-language=Rust linguist-detectable=true
+
+# SDK glue must not dilute the engine's own statistics. Vendored paths are
+# excluded from the language bar but stay fully browsable, which is exactly the
+# property that Python and Node wrapper code should not become the repo's
+# headline language.
+/sdks/** linguist-vendored=true
+
+# Prose and specs are documentation: counted nowhere, visible everywhere.
+/docs/** linguist-documentation=true
+
+# Generated artifacts that no reviewer should have to read.
+crates/omni-ffi/include/omni.h linguist-generated=false
