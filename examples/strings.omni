@@ -1,0 +1,6 @@
+// Strings: literals, escapes, + concatenation, == content equality.
+// Run with:  cargo run -q -p omni-cli -- run examples/strings.omni
+let greeting = "hello, "
+let who = "world"
+who != "world!"
+greeting + who + " \u{1F600}"

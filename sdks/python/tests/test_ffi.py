@@ -5,12 +5,15 @@ Standard library only, so they run with no install step:
     python sdks/python/tests/test_ffi.py
     python -m unittest discover -s sdks/python/tests
 
-They need the built engine: `cargo build -p omni-ffi`.
+They need the built engine: `cargo build -p omni-ffi`. Note the *build*, not
+`cargo test`: the tests load the artifact on disk, and `cargo test -p omni-ffi`
+does not refresh it.
 """
 
 from __future__ import annotations
 
 import pathlib
+import struct
 import sys
 import unittest
 
@@ -37,10 +40,14 @@ class VerticalSlice(unittest.TestCase):
         self.assertEqual(result.value, 42.0)
         self.assertEqual(str(result), "42.0")
 
-    def test_library_version_is_reported(self) -> None:
+    def test_library_version_and_abi_level_are_reported(self) -> None:
         engine = omni.Engine()
         self.addCleanup(engine.close)
         self.assertRegex(engine.version, r"^\d+\.\d+\.\d+")
+        # The SDK refused to hand back a library whose layout this file cannot
+        # read, so by the time an Engine exists the level is known.
+        self.assertEqual(engine.abi_version, _ffi.OMNI_ABI_VERSION)
+        self.assertEqual(engine.abi_version, 2)
 
     def test_arithmetic_precedence_and_parentheses(self) -> None:
         engine = omni.Engine()
@@ -66,6 +73,266 @@ class VerticalSlice(unittest.TestCase):
         with self.assertRaises(omni.OmniError) as caught:
             b.run("x")
         self.assertEqual(caught.exception.kind, "runtime")
+
+
+class Strings(unittest.TestCase):
+    """Phase 2's new payload: text crosses the boundary as copied bytes."""
+
+    def setUp(self) -> None:
+        self.engine = omni.Engine()
+        self.addCleanup(self.engine.close)
+
+    def test_concatenation_comes_back_as_a_string(self) -> None:
+        result = self.engine.run(r'"omni" + " " + "engine"')
+        self.assertEqual(result.tag, "string")
+        self.assertEqual(result.value, "omni engine")
+        self.assertEqual(result.text, b"omni engine")
+        self.assertEqual(str(result), "'omni engine'")
+
+    def test_a_string_result_reports_no_number(self) -> None:
+        # The eight payload bytes of a string are an address. Reporting them as
+        # a double would put meaningless noise in every log that prints a
+        # Result, so the wrapper reads that arm only for the number tags.
+        result = self.engine.run('"x"')
+        self.assertEqual(result.number, 0.0)
+        self.assertEqual(result.tag, "string")
+
+    def test_escapes_survive_the_boundary_byte_for_byte(self) -> None:
+        # Raw strings on the left: the source really does contain a backslash,
+        # and the engine is what turns it into the character.
+        cases = {
+            r'"a\nb"': b"a\nb",
+            r'"a\tb"': b"a\tb",
+            r'"a\rb"': b"a\rb",
+            r'"a\"b"': b'a"b',
+            r'"a\\b"': b"a\\b",
+            r'"\u{41}\u{42}"': b"AB",
+            r'"\u{1F600}"': "\U0001f600".encode(),
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                result = self.engine.run(source)
+                self.assertEqual(result.tag, "string")
+                self.assertEqual(result.text, expected)
+
+    def test_a_string_may_contain_a_nul_byte(self) -> None:
+        # Length-delimited, not C strings: `len` is the only end-of-string, so
+        # text after a NUL must still arrive.
+        result = self.engine.run(r'"a" + "\u{0}" + "b"')
+        self.assertEqual(result.text, b"a\x00b")
+        self.assertEqual(len(result.value), 3)
+        self.assertEqual(result.value, "a\x00b")
+
+    def test_a_multiline_string_is_a_compile_error_not_a_truncated_result(self) -> None:
+        with self.assertRaises(omni.OmniError) as caught:
+            self.engine.run('"a\nb"')  # a real newline inside the literal
+        self.assertEqual(caught.exception.kind, "compile")
+        self.assertIn("cannot span lines", caught.exception.message)
+
+    def test_non_ascii_text_keeps_its_bytes(self) -> None:
+        # Bengali in the source, Bengali out: the ABI carries UTF-8 bytes, and
+        # `text` counts those while `value` counts characters.
+        expected = "নমস্কার!"
+        result = self.engine.run(r'"নমস্কার" + "!"')
+        self.assertEqual(result.value, expected)
+        self.assertEqual(result.text, expected.encode("utf-8"))
+        self.assertEqual(len(result.text), 22)  # seven 3-byte code units plus "!"
+        self.assertEqual(len(result.value), 8)
+        self.assertEqual(result.text.decode("utf-8"), result.value)
+
+    def test_equality_compares_content_not_addresses(self) -> None:
+        self.assertTrue(self.engine.run(r'"ab" == "a" + "b"').value)
+        self.assertFalse(self.engine.run(r'"ab" == "ac"').value)
+        self.assertTrue(self.engine.run(r'"ab" != "a"').value)
+
+    def test_the_empty_string_is_a_string_not_undef(self) -> None:
+        result = self.engine.run(r'""')
+        self.assertEqual(result.tag, "string")
+        self.assertEqual(result.value, "")
+        self.assertEqual(result.text, b"")
+        self.assertEqual(self.engine.run("").tag, "undef")
+
+    def test_mixing_a_string_and_a_number_names_the_rule(self) -> None:
+        with self.assertRaises(omni.OmniError) as caught:
+            self.engine.run(r'"hi" + 42')
+        self.assertEqual(caught.exception.kind, "runtime")
+        self.assertEqual(caught.exception.message, r'line 1: cannot add string to number: "hi" + 42')
+
+    def test_evaluate_refuses_a_string_and_string_refuses_a_number(self) -> None:
+        with self.assertRaises(omni.OmniError) as caught:
+            self.engine.evaluate('"text"')
+        self.assertEqual(caught.exception.kind, "runtime")
+        with self.assertRaises(omni.OmniError) as caught:
+            self.engine.string("1 + 1")
+        self.assertEqual(caught.exception.kind, "runtime")
+        self.assertIn("did not evaluate to a string", caught.exception.message)
+        self.assertEqual(self.engine.string(r'"fine"'), "fine")
+
+    def test_a_copied_string_is_unaffected_by_the_next_execution(self) -> None:
+        # The egress block rewinds on the next call. `result` was built before
+        # that call and is still correct afterwards, because it holds Python
+        # bytes rather than an address.
+        result = self.engine.run('"kept"')
+        for _ in range(20):
+            self.engine.run('"overwritten with other text entirely"')
+        self.assertEqual(result.value, "kept")
+
+
+class StaleStrings(unittest.TestCase):
+    """What a host that ignored the copy rule would have seen -- tested instead."""
+
+    def setUp(self) -> None:
+        self.raw = _ffi.RawEngine()
+        self.addCleanup(self.raw.close)
+
+    def test_a_stale_value_reads_the_bytes_that_are_there_now(self) -> None:
+        _, first = self.raw.exec('"first"')
+        self.assertEqual(self.raw.read_string(first), b"first")
+        self.raw.exec('"a much longer second"')
+        # Not a segfault and not the old text: the address still points into
+        # live, engine-owned memory, and the copy is bounded by the stale value's
+        # own `len` hint. This is the documented consequence of a rewind.
+        self.assertEqual(self.raw.read_string(first), b"a muc")
+
+    def test_a_foreign_or_fabricated_address_copies_nothing(self) -> None:
+        _, value = self.raw.exec('"real"')
+        value.ptr = 0x7FFF_EFFF_FFFF_FFF0  # inside 48 bits, owned by nothing
+        self.assertEqual(self.raw.read_string(value), b"")
+        value.ptr = 1 << 50  # outside the address bits the value format carries
+        self.assertEqual(self.raw.read_string(value), b"")
+
+    def test_read_string_ignores_a_value_that_is_not_a_string(self) -> None:
+        _, value = self.raw.exec("1 + 1")
+        self.assertEqual(value.tag, _ffi.OMNI_NUMBER)
+        self.assertEqual(self.raw.read_string(value), b"")
+
+
+class HostStrings(unittest.TestCase):
+    """`define_string`: bytes the host owns, bound for the engine's lifetime."""
+
+    def setUp(self) -> None:
+        self.engine = omni.Engine()
+        self.addCleanup(self.engine.close)
+
+    def test_a_host_string_is_readable_by_the_program(self) -> None:
+        self.engine.define_string("greeting", "hello wörld")
+        result = self.engine.run('greeting + "!"')
+        self.assertEqual(result.value, "hello wörld!")
+        # 12 bytes of UTF-8 for the payload, 13 with the bang.
+        self.assertEqual(len(result.text), 13)
+
+    def test_a_host_string_survives_executions_a_result_does_not(self) -> None:
+        self.engine.define_string("stable", "still here")
+        for _ in range(50):
+            self.engine.run('"unrelated work"')
+        self.assertEqual(self.engine.run("stable").value, "still here")
+
+    def test_redefining_replaces_the_binding(self) -> None:
+        self.engine.define_string("name", "before")
+        self.engine.define_string("name", "after")
+        self.assertEqual(self.engine.run("name").value, "after")
+
+    def test_an_old_value_of_a_redefined_name_copies_nothing(self) -> None:
+        raw = _ffi.RawEngine()
+        self.addCleanup(raw.close)
+        self.assertEqual(raw.define_string("name", "before"), _ffi.OMNI_OK)
+        status, value = raw.exec("name")
+        self.assertEqual(status, _ffi.OMNI_OK)
+        self.assertEqual(raw.read_string(value), b"before")
+        raw.define_string("name", "a longer replacement")
+        # The previous binding was released, and the engine no longer
+        # recognises the address: zero bytes, not freed memory.
+        self.assertEqual(raw.read_string(value), b"")
+        self.assertEqual(raw.read_string(raw.exec("name")[1]), b"a longer replacement")
+
+    def test_the_name_is_validated_before_the_call(self) -> None:
+        with self.assertRaises(omni.OmniError) as caught:
+            self.engine.define_string("", "value")
+        self.assertEqual(caught.exception.kind, "argument")
+
+    def test_a_name_too_long_is_rejected(self) -> None:
+        original = _ffi.MAX_IDENTIFIER_LEN
+        _ffi.MAX_IDENTIFIER_LEN = 8
+        try:
+            with self.assertRaises(omni.OmniError) as caught:
+                self.engine.define_string("n" * 9, "value")
+            self.assertEqual(caught.exception.kind, "argument")
+            self.assertIn("at most 8", caught.exception.message)
+        finally:
+            _ffi.MAX_IDENTIFIER_LEN = original
+        # And the ABI's own ceiling is the same number, so a name that passes
+        # here is a name the library will accept.
+        self.assertEqual(_ffi.MAX_IDENTIFIER_LEN, 32)
+
+    def test_a_non_utf8_payload_is_rejected_by_the_library(self) -> None:
+        raw = _ffi.RawEngine()
+        self.addCleanup(raw.close)
+        status = raw.define_string("bad", b"\xff\xfe")
+        self.assertEqual(status, _ffi.OMNI_ERR_ARG)
+        self.assertEqual(raw.last_error(), "")  # the status is the whole report
+
+
+class Memory(unittest.TestCase):
+    """The counters exist so a host can tell a high-water mark from a leak."""
+
+    def setUp(self) -> None:
+        self.engine = omni.Engine()
+        self.addCleanup(self.engine.close)
+
+    def test_stats_reports_counters_of_the_right_size(self) -> None:
+        stats = self.engine.stats()
+        self.assertEqual(stats.execs, 0)
+        self.assertEqual(stats.egress_high_water, 0)
+        self.engine.run('"one"')
+        self.engine.run('"two"')
+        stats = self.engine.stats()
+        self.assertEqual(stats.execs, 2)
+        self.assertGreaterEqual(stats.strings, 2)
+        self.assertGreaterEqual(stats.egress_high_water, 3)
+        self.assertGreaterEqual(stats.arena_bytes_reserved, 1)
+
+    def test_repeated_string_executions_reserve_no_more_memory(self) -> None:
+        program = r'"a string long enough to be interesting"'
+        self.engine.run(program)
+        before = self.engine.stats()
+        for _ in range(5_000):
+            self.assertEqual(self.engine.run(program).value, "a string long enough to be interesting")
+        after = self.engine.stats()
+        self.assertEqual(after.execs, before.execs + 5_000)
+        self.assertEqual(after.arena_bytes_reserved, before.arena_bytes_reserved)
+        self.assertEqual(after.egress_bytes_reserved, before.egress_bytes_reserved)
+        self.assertEqual(after.egress_high_water, before.egress_high_water)
+
+    def test_a_larger_result_grows_the_egress_once_and_then_stops(self) -> None:
+        self.engine.define_string("chunk", "x" * (256 * 1024))
+        self.engine.run('"small"')
+        small = self.engine.stats()
+        first = self.engine.run("chunk + chunk")
+        self.assertEqual(len(first.text), 512 * 1024)
+        grown = self.engine.stats()
+        self.assertGreater(grown.egress_bytes_reserved, small.egress_bytes_reserved)
+        # Every later call of the same size reuses the same reservation: rewind,
+        # not free-then-re-map.
+        for _ in range(10):
+            self.engine.run("chunk + chunk")
+        again = self.engine.stats()
+        self.assertEqual(again.egress_bytes_reserved, grown.egress_bytes_reserved)
+        self.assertEqual(again.egress_high_water, grown.egress_high_water)
+
+    def test_a_string_over_the_engines_ceiling_is_a_runtime_error(self) -> None:
+        # 16 MiB + 1 byte of literal is the program's fault, and the message
+        # says how big the ceiling is. Building the same bytes in Python to hand
+        # to define_string instead is the host's fault.
+        payload = "y" * (_ffi.MAX_STRING_LEN + 1)
+        with self.assertRaises(omni.OmniError) as caught:
+            self.engine.run(f'"{payload}"')
+        self.assertEqual(caught.exception.kind, "runtime")
+        self.assertIn("MiB", caught.exception.message)
+
+        with self.assertRaises(omni.OmniError) as caught:
+            self.engine.define_string("s", payload)
+        self.assertEqual(caught.exception.kind, "argument")
+        self.assertIn("the ABI accepts at most", caught.exception.message)
 
 
 class Errors(unittest.TestCase):
@@ -119,6 +386,12 @@ class Errors(unittest.TestCase):
         self.assertTrue(message)
         self.assertEqual(self.engine.last_status, 1)
 
+    def test_try_run_copies_a_string_the_same_way_run_does(self) -> None:
+        status, result, message = self.engine.try_run('"no exceptions here"')
+        self.assertEqual(status, 0)
+        self.assertEqual(message, "")
+        self.assertEqual(result.value, "no exceptions here")
+
     def test_a_success_clears_the_stale_error(self) -> None:
         with self.assertRaises(omni.OmniError):
             self.engine.run("###")
@@ -139,6 +412,16 @@ class SafetyBoundaries(unittest.TestCase):
         status, value = raw.exec("1 + 1")
         self.assertEqual(status, 0)
         self.assertEqual(value.number, 2.0)
+
+    def test_a_panicking_engine_survives_a_string_too(self) -> None:
+        raw = _ffi.RawEngine()
+        self.addCleanup(raw.close)
+        _, before = raw.exec('"alive"')
+        self.assertEqual(raw.read_string(before), b"alive")
+        self.assertEqual(raw.debug_panic(), 3)
+        status, after = raw.exec('"still alive"')
+        self.assertEqual(status, 0)
+        self.assertEqual(raw.read_string(after), b"still alive")
 
     def test_error_text_is_copied_out_and_truncates(self) -> None:
         raw = _ffi.RawEngine()
@@ -230,6 +513,7 @@ class Discovery(unittest.TestCase):
     def test_the_built_library_is_reachable(self) -> None:
         lib = _ffi.load_library()
         self.assertTrue(lib.omni_version())
+        self.assertEqual(lib.omni_abi_version(), _ffi.OMNI_ABI_VERSION)
 
     def test_a_missing_library_names_the_build_command(self) -> None:
         home = _ffi.os.environ.get("OMNI_ENGINE_HOME")
@@ -251,12 +535,56 @@ class Discovery(unittest.TestCase):
             if library is not None:
                 _ffi.os.environ["OMNI_ENGINE_LIBRARY"] = library
 
+    def test_a_library_with_a_different_abi_is_refused(self) -> None:
+        class Fake:
+            def omni_abi_version(self) -> int:
+                return 1
+
+        with self.assertRaises(omni.OmniLibraryError) as caught:
+            _ffi._checked(Fake(), "stale-omni.dll")
+        self.assertIn("ABI version 1", str(caught.exception))
+        self.assertIn("ABI version 2", str(caught.exception))
+        self.assertIn("cargo build -p omni-ffi", str(caught.exception))
+
+    def test_a_library_without_an_abi_version_export_is_refused(self) -> None:
+        class Phase1:  # a v1 artifact has no such symbol at all
+            def __getattr__(self, name: str):
+                raise AttributeError(name)
+
+        with self.assertRaises(omni.OmniLibraryError) as caught:
+            _ffi._checked(Phase1(), "omni.dll")
+        self.assertIn("predates the ABI", str(caught.exception))
+
+    def test_the_current_abi_is_accepted(self) -> None:
+        class Fake:
+            def omni_abi_version(self) -> int:
+                return _ffi.OMNI_ABI_VERSION
+
+        self.assertIsInstance(_ffi._checked(Fake(), "omni.dll"), Fake)
+
 
 class AbiLayout(unittest.TestCase):
     def test_value_struct_matches_the_c_header(self) -> None:
+        self.assertEqual(_ffi.ctypes.sizeof(_ffi.OmniPayload), 8)
         self.assertEqual(_ffi.ctypes.sizeof(_ffi.OmniValue), 16)
-        self.assertEqual(_ffi.OmniValue.number.offset, 8)
         self.assertEqual(_ffi.OmniValue.tag.offset, 0)
+        self.assertEqual(_ffi.OmniValue.len.offset, 4)
+        self.assertEqual(_ffi.OmniValue.payload.offset, 8)
+
+    def test_stats_struct_matches_the_c_header(self) -> None:
+        self.assertEqual(_ffi.ctypes.sizeof(_ffi.OmniStats), 72)
+        self.assertEqual(_ffi.OmniStats.size.offset, 0)
+        self.assertEqual(_ffi.OmniStats.execs.offset, 8)
+        self.assertEqual(_ffi.OmniStats.egress_high_water.offset, 64)
+
+    def test_number_and_ptr_arms_share_the_same_eight_bytes(self) -> None:
+        raw = _ffi.OmniValue()
+        raw.number = 1.0
+        # The same eight bytes, read two ways -- which is why reading the wrong
+        # arm is a silent nonsense value rather than an error.
+        self.assertEqual(raw.ptr, int.from_bytes(struct.pack("<d", 1.0), "little"))
+        raw.ptr = None
+        self.assertEqual(raw.number, 0.0)
 
     def test_status_and_tag_names(self) -> None:
         self.assertEqual(omni.status_name(0), "ok")
@@ -264,14 +592,33 @@ class AbiLayout(unittest.TestCase):
         self.assertEqual(omni.status_name(99), "status-99")
         self.assertEqual(omni.tag_name(0), "number")
         self.assertEqual(omni.tag_name(3), "undef")
+        self.assertEqual(omni.tag_name(4), "string")
+        self.assertEqual(omni.tag_name(_ffi.OMNI_STRING), "string")
+        self.assertEqual(omni.tag_name(9), "tag-9")
 
     def test_bool_and_undef_values_convert(self) -> None:
-        # Phase 1 has no literals for these, so build the struct directly.
+        # The grammar has no literals for these, so build the struct directly.
         raw = _ffi.OmniValue()
         raw.tag, raw.number = _ffi.OMNI_BOOL, 1.0
         self.assertEqual(omni._convert(raw).value, True)
         raw.tag, raw.number = _ffi.OMNI_UNDEF, 0.0
         self.assertIsNone(omni._convert(raw).value)
+
+    def test_a_string_converts_with_its_copied_bytes(self) -> None:
+        raw = _ffi.OmniValue()
+        raw.tag, raw.len, raw.ptr = _ffi.OMNI_STRING, 5, 0x1000
+        result = omni._convert(raw, b"hello")
+        self.assertEqual(result.tag, "string")
+        self.assertEqual(result.value, "hello")
+        self.assertEqual(result.number, 0.0)  # never an address posing as a float
+
+    def test_a_string_that_is_not_valid_utf8_still_reports_its_bytes(self) -> None:
+        # `text` is always the exact bytes, so a caller can report an engine bug
+        # with evidence instead of only seeing replacement characters.
+        raw = _ffi.OmniValue()
+        raw.tag, raw.len = _ffi.OMNI_STRING, 2
+        self.assertEqual(omni._convert(raw, b"\xff\xfe").text, b"\xff\xfe")
+        self.assertTrue(omni._convert(raw, b"\xff\xfe").value)
 
 
 if __name__ == "__main__":

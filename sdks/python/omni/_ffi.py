@@ -2,15 +2,24 @@
 
 Private module. Import :mod:`omni`, not this.
 
-Two rules carry over from the C header, and both are the reason a hand-rolled
+Three rules carry over from the C header, and each is the reason a hand-rolled
 Python FFI usually breaks in production:
 
 1. **Every argument and return type is declared.** Without ``argtypes`` and
    ``restype``, ctypes assumes ``int`` and silently truncates a 64-bit engine
    handle to 32 bits -- which works on small heaps, then segfaults later.
-2. **Nothing outlives a call as a pointer.** The engine frees its arena at the
-   start of every evaluation, so results are converted into Python objects
-   before they leave this module.
+2. **Nothing outlives a call as a pointer.** A string result's ``payload.ptr``
+   addresses the engine's egress block, which is *rewound* at the start of the
+   next evaluation rather than freed. So a stale address still points at
+   mapped, engine-owned memory and reads that execution's bytes: a wrong read,
+   never a crash. This module refuses to let that happen by handing a Python
+   object an address at all -- :meth:`RawEngine.read_string` copies the bytes
+   out through ``omni_str_copy`` before the value leaves this file.
+3. **The ABI level is checked at load.** The value layout changed between
+   version 1 and 2; ``load_library`` compares ``omni_abi_version()`` with what
+   this module declares and refuses to return a library that disagrees, so a
+   stale ``omni.dll`` is one clear error at import instead of a wrong number
+   ten thousand calls later.
 """
 
 from __future__ import annotations
@@ -23,19 +32,28 @@ import sys
 from ctypes import (
     POINTER,
     Structure,
+    Union,
     byref,
     c_char_p,
     c_double,
     c_size_t,
     c_uint32,
+    c_uint64,
     c_void_p,
 )
+from dataclasses import dataclass
 
 __all__ = [
     "STATUS",
     "TAGS",
     "MAX_SOURCE_LEN",
+    "MAX_STRING_LEN",
+    "MAX_IDENTIFIER_LEN",
+    "OMNI_ABI_VERSION",
+    "OmniPayload",
     "OmniValue",
+    "OmniStats",
+    "Stats",
     "RawEngine",
     "OmniError",
     "OmniLibraryError",
@@ -64,37 +82,140 @@ OMNI_NUMBER = 0
 OMNI_NIL = 1
 OMNI_BOOL = 2
 OMNI_UNDEF = 3
+OMNI_STRING = 4
 
 TAGS = {
     OMNI_NUMBER: "number",
     OMNI_NIL: "nil",
     OMNI_BOOL: "bool",
     OMNI_UNDEF: "undef",
+    OMNI_STRING: "string",
 }
 
-#: The ABI rejects any ``len`` above this, so a huge value is an argument error
-#: rather than an out-of-bounds read.
+#: Wire format of the value struct this module reads. Checked against the
+#: library at load; see the module docstring's rule 3.
+OMNI_ABI_VERSION = 2
+
+#: The ABI rejects any source ``len`` above this, so a huge value is an argument
+#: error rather than an out-of-bounds read.
 MAX_SOURCE_LEN = 1 << 28
+
+#: Longest string the engine will build, and the most ``omni_str_copy`` can ever
+#: write. Mirrors ``OMNI_MAX_STRING_LEN``; these are ceilings a host sizes
+#: buffers with, so the cost of a mismatch is a resized buffer, not a fault.
+MAX_STRING_LEN = 16 * 1024 * 1024
+
+#: Longest name a host may bind, in *bytes* of UTF-8. Mirrors
+#: ``OMNI_MAX_IDENTIFIER_LEN``.
+MAX_IDENTIFIER_LEN = 32
+
+
+class OmniPayload(Union):
+    """Mirror of ``union OmniPayload``: ``{ double number; const char *ptr; }``."""
+
+    _fields_ = [("number", c_double), ("ptr", c_void_p)]
 
 
 class OmniValue(Structure):
-    """Mirror of ``OmniValue`` in omni.h: ``{ uint32_t tag; double number; }``."""
+    """Mirror of ``OmniValue``: ``{ uint32_t tag; uint32_t len; OmniPayload }``.
 
-    _fields_ = [("tag", c_uint32), ("number", c_double)]
+    ``len`` is the byte count of a string payload and zero for every other tag;
+    it fills the hole that padding already left between a 4-byte tag and an
+    8-byte payload, which is why strings cost no extra bytes.
+
+    For a string, ``len`` is a sizing hint. ``omni_str_copy`` uses the engine's
+    own header for the real count, so a stale ``len`` can read too few bytes but
+    can never read past the end of a block.
+    """
+
+    _fields_ = [("tag", c_uint32), ("len", c_uint32), ("payload", OmniPayload)]
+
+    @property
+    def number(self) -> float:
+        """The ``double`` arm. Only meaningful for the number and bool tags."""
+        return self.payload.number
+
+    @number.setter
+    def number(self, value: float) -> None:
+        self.payload.number = value
+
+    @property
+    def ptr(self) -> int | None:
+        """The pointer arm, as an integer. Read it; never dereference it."""
+        return self.payload.ptr
+
+    @ptr.setter
+    def ptr(self, value: int | None) -> None:
+        self.payload.ptr = value
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        tag = TAGS.get(self.tag, self.tag)
+        if self.tag == OMNI_STRING:
+            return f"<OmniValue {tag} len={self.len} ptr={self.ptr!r}>"
+        if self.tag in (OMNI_NUMBER, OMNI_BOOL):
+            return f"<OmniValue {tag} {self.payload.number}>"
+        return f"<OmniValue {tag}>"
+
+
+class OmniStats(Structure):
+    """Mirror of ``OmniStats``: a size word plus eight 64-bit counters."""
+
+    _fields_ = [
+        ("size", c_uint32),
+        ("execs", c_uint64),
+        ("strings", c_uint64),
+        ("arena_bytes_in_use", c_uint64),
+        ("arena_bytes_reserved", c_uint64),
+        ("arena_chunks", c_uint64),
+        ("egress_bytes_in_use", c_uint64),
+        ("egress_bytes_reserved", c_uint64),
+        ("egress_high_water", c_uint64),
+    ]
+
+
+@dataclass(frozen=True)
+class Stats:
+    """The engine's memory counters, copied out of :class:`OmniStats`.
+
+    ``arena_*`` is the per-execution scratch, bulk-freed at the start of every
+    evaluation. ``egress_*`` is the block string results are promoted into; it
+    rewinds instead of freeing, so ``egress_bytes_reserved`` is a high-water
+    mark of the *largest* result a host has asked for, not a leak.
+    """
+
+    execs: int
+    strings: int
+    arena_bytes_in_use: int
+    arena_bytes_reserved: int
+    arena_chunks: int
+    egress_bytes_in_use: int
+    egress_bytes_reserved: int
+    egress_high_water: int
 
 
 # Fail loudly at import time if the struct ever drifts from the Rust layout,
-# instead of returning garbage numbers at run time.
-if ctypes.sizeof(OmniValue) != 16:  # pragma: no cover - layout regression
-    raise RuntimeError(
-        f"OmniValue is {ctypes.sizeof(OmniValue)} bytes, expected 16. "
-        "The Python SDK and crates/omni-ffi disagree about the ABI."
-    )
-if OmniValue.number.offset != 8:  # pragma: no cover - layout regression
-    raise RuntimeError(
-        f"OmniValue.number is at offset {OmniValue.number.offset}, expected 8. "
-        "The Python SDK and crates/omni-ffi disagree about the ABI."
-    )
+# instead of returning garbage numbers at run time. These are the same eleven
+# facts the Rust side asserts and omni.h states with _Static_assert; a Python
+# that disagrees says the SDK and the compiled library are out of sync.
+_LAYOUT = [
+    ("ctypes.sizeof(OmniValue)", ctypes.sizeof(OmniValue), 16),
+    ("ctypes.sizeof(OmniPayload)", ctypes.sizeof(OmniPayload), 8),
+    ("OmniValue.tag.offset", OmniValue.tag.offset, 0),
+    ("OmniValue.len.offset", OmniValue.len.offset, 4),
+    ("OmniValue.payload.offset", OmniValue.payload.offset, 8),
+    ("ctypes.sizeof(OmniStats)", ctypes.sizeof(OmniStats), 72),
+    ("OmniStats.size.offset", OmniStats.size.offset, 0),
+    ("OmniStats.execs.offset", OmniStats.execs.offset, 8),
+    ("OmniStats.egress_high_water.offset", OmniStats.egress_high_water.offset, 64),
+]
+for _name, _actual, _expected in _LAYOUT:
+    if _actual != _expected:  # pragma: no cover - layout regression
+        raise RuntimeError(
+            f"{_name} is {_actual}, expected {_expected}. The Python SDK and "
+            "crates/omni-ffi disagree about the ABI; rebuild the library with "
+            "cargo build -p omni-ffi."
+        )
+del _LAYOUT, _name, _actual, _expected
 
 
 class OmniError(RuntimeError):
@@ -114,7 +235,8 @@ class OmniError(RuntimeError):
 
 
 class OmniLibraryError(OSError):
-    """The shared library could not be found. Raised with the fix in it."""
+    """The shared library could not be found, or is not this ABI. Raised with
+    the fix in it."""
 
 
 # ---------------------------------------------------------------------------
@@ -187,23 +309,24 @@ def _candidate_paths() -> list[str]:
 
 
 def load_library() -> ctypes.CDLL:
-    """Load OmniEngine and declare the whole ABI on it.
+    """Load OmniEngine, declare the whole ABI on it, and check its ABI level.
 
     Raises:
-        OmniLibraryError: if no artifact was found. The message carries the
-            build command, because every failure of this function so far has
-            been "you have not built the library yet".
+        OmniLibraryError: if no artifact was found, or the one found speaks a
+            different wire format. Every failure of this function so far has
+            been "you have not rebuilt the library yet", so the message carries
+            the build command.
     """
     tried = _candidate_paths()
     for path in tried:
         if path and os.path.isfile(path):
-            return _bind(_cdll(path))
+            return _checked(_bind(_cdll(path)), path)
 
     # Fall back to whatever the loader can resolve by bare name (a system-wide
     # install, or a directory on PATH).
     name = library_file_name()
     try:
-        return _bind(ctypes.CDLL(name))
+        lib = ctypes.CDLL(name)
     except OSError as exc:
         raise OmniLibraryError(
             f"could not find {name}.\n"
@@ -217,6 +340,33 @@ def load_library() -> ctypes.CDLL:
             f"Locations tried:\n{chr(10).join('  ' + p for p in tried)}\n"
             f"Loader said: {exc}"
         ) from exc
+    return _checked(_bind(lib), name)
+
+
+def _checked(lib: ctypes.CDLL, source: str) -> ctypes.CDLL:
+    """Refuse a library whose value layout this module cannot read.
+
+    A Phase 1 ``omni.dll`` has no ``omni_abi_version`` at all, so the lookup
+    itself fails; that is the same problem as a version mismatch and gets the
+    same answer, worded for the case the reader is most likely in.
+    """
+    try:
+        declared = lib.omni_abi_version()
+    except AttributeError as exc:  # pragma: no cover - stale artifact
+        raise OmniLibraryError(
+            f"{source} does not export omni_abi_version, so it predates the ABI "
+            f"level this SDK needs ({OMNI_ABI_VERSION}). Rebuild it:\n"
+            "    cargo build -p omni-ffi"
+        ) from exc
+    if declared != OMNI_ABI_VERSION:
+        raise OmniLibraryError(
+            f"{source} speaks ABI version {declared}; this SDK is written for "
+            f"ABI version {OMNI_ABI_VERSION}. The value layout differs, so "
+            "reading one as the other produces wrong numbers rather than an "
+            "error. Rebuild the library, or install the SDK version that "
+            "matches it:\n    cargo build -p omni-ffi"
+        )
+    return lib
 
 
 def _cdll(path: str) -> ctypes.CDLL:
@@ -234,8 +384,13 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
 
     This is the part that is easy to skip and impossible to debug once skipped:
     a missing ``restype`` on ``omni_engine_new`` returns a truncated 32-bit
-    handle that looks valid until the first call that dereferences it.
+    handle that looks valid until the first call that dereferences it, and a
+    missing ``argtypes`` on ``omni_str_copy`` lets ctypes pass a Python ``str``
+    where the ABI wants a writable buffer.
     """
+    lib.omni_abi_version.argtypes = []
+    lib.omni_abi_version.restype = c_uint32
+
     lib.omni_version.argtypes = []
     lib.omni_version.restype = c_char_p
 
@@ -251,7 +406,19 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     lib.omni_exec_number.argtypes = [c_void_p, c_char_p, c_size_t, POINTER(c_double)]
     lib.omni_exec_number.restype = c_uint32
 
-    lib.omni_last_error.argtypes = [c_void_p, c_char_p, c_size_t]
+    # buf is POINTER(c_char), not c_char_p: the ABI writes into it, and a
+    # one-way c_char_p would let ctypes hand out a read-only pointer to
+    # immutable Python bytes.
+    lib.omni_str_copy.argtypes = [c_void_p, POINTER(OmniValue), POINTER(ctypes.c_char), c_size_t]
+    lib.omni_str_copy.restype = c_size_t
+
+    lib.omni_define_string.argtypes = [c_void_p, c_char_p, c_size_t, c_char_p, c_size_t]
+    lib.omni_define_string.restype = c_uint32
+
+    lib.omni_debug_stats.argtypes = [c_void_p, POINTER(OmniStats)]
+    lib.omni_debug_stats.restype = c_uint32
+
+    lib.omni_last_error.argtypes = [c_void_p, POINTER(ctypes.c_char), c_size_t]
     lib.omni_last_error.restype = c_size_t
 
     lib.omni_debug_panic.argtypes = [c_void_p]
@@ -293,6 +460,10 @@ class RawEngine:
         raw = self._lib.omni_version()
         return raw.decode("utf-8", "replace") if raw else ""
 
+    def abi_version(self) -> int:
+        """Wire format the loaded library reports; :func:`load_library` checked it."""
+        return self._lib.omni_abi_version()
+
     def exec(self, source: str | bytes) -> tuple[int, OmniValue]:
         """Evaluate and return ``(status, value)``. Never raises on error."""
         data = self._encode(source)
@@ -305,6 +476,68 @@ class RawEngine:
         out = c_double(0.0)
         status = self._lib.omni_exec_number(self._handle, data, len(data), byref(out))
         return status, out.value
+
+    def read_string(self, value: OmniValue) -> bytes:
+        """Copy a string result into Python storage, through the ABI.
+
+        Returns ``b""`` for a value that is not a string, and for the empty
+        string -- the tag is what distinguishes those, and only this engine's
+        header decides how many bytes arrive. The buffer is sized from
+        ``value.len``, which is the hint the ABI offers; a short return means
+        the address was stale, not that the copy failed.
+        """
+        if value.tag != OMNI_STRING:
+            return b""
+        size = value.len
+        if size == 0:
+            return b""
+        # create_string_buffer(n) allocates n + 1 and zeroes it, so there is
+        # always a byte past the request to prove the ABI wrote no further.
+        buf = ctypes.create_string_buffer(size)
+        written = self._lib.omni_str_copy(self._handle, byref(value), buf, size)
+        return buf.raw[:written]
+
+    def define_string(self, name: str | bytes, payload: str | bytes) -> int:
+        """Bind a host string; returns the status. Never raises on error.
+
+        Both buffers are encoded and bounded here, before the ABI sees a
+        pointer, so an over-long name is a Python ``OmniError`` rather than a
+        rejection that has to be decoded from a status code. A name that is not
+        valid UTF-8 in *bytes* form still reaches the ABI, which reports it as
+        ``OMNI_ERR_ARG``.
+        """
+        encoded_name = self._encode_bound("name", name, MAX_IDENTIFIER_LEN)
+        encoded_payload = self._encode_bound("payload", payload, MAX_STRING_LEN)
+        return self._lib.omni_define_string(
+            self._handle,
+            encoded_name,
+            len(encoded_name),
+            encoded_payload,
+            len(encoded_payload),
+        )
+
+    def stats(self) -> Stats:
+        """Read the memory counters, verifying the layout the library wrote."""
+        out = OmniStats()
+        status = self._lib.omni_debug_stats(self._handle, byref(out))
+        if status != OMNI_OK:
+            raise OmniError(status, self.last_error())
+        if out.size != ctypes.sizeof(OmniStats):
+            raise OmniError(
+                OMNI_ERR_ARG,
+                f"the library says OmniStats is {out.size} bytes; this SDK reads "
+                f"{ctypes.sizeof(OmniStats)}",
+            )
+        return Stats(
+            execs=out.execs,
+            strings=out.strings,
+            arena_bytes_in_use=out.arena_bytes_in_use,
+            arena_bytes_reserved=out.arena_bytes_reserved,
+            arena_chunks=out.arena_chunks,
+            egress_bytes_in_use=out.egress_bytes_in_use,
+            egress_bytes_reserved=out.egress_bytes_reserved,
+            egress_high_water=out.egress_high_water,
+        )
 
     def last_error(self, cap: int = 4096) -> str:
         buf = ctypes.create_string_buffer(cap)
@@ -321,12 +554,33 @@ class RawEngine:
 
     @staticmethod
     def _encode(source: str | bytes) -> bytes:
-        """Encode to UTF-8 and bound the length the way the ABI does."""
+        """Encode to UTF-8 and bound the length the way the ABI does.
+
+        The bound is read from the module at call time, not captured as a
+        default argument, so a test can lower ``MAX_SOURCE_LEN`` and exercise
+        the guard without allocating 256 MiB of source.
+        """
         data = source.encode("utf-8") if isinstance(source, str) else bytes(source)
         if len(data) > MAX_SOURCE_LEN:
             raise OmniError(
                 OMNI_ERR_ARG,
                 f"source is {len(data)} bytes; the ABI accepts at most {MAX_SOURCE_LEN}",
+            )
+        return data
+
+    @staticmethod
+    def _encode_bound(name: str, value: str | bytes, limit: int) -> bytes:
+        """Encode one host-supplied buffer and bound it the way the ABI does.
+
+        Same call-time rule as :meth:`_encode`: the limit is read here, so a
+        test can lower :data:`MAX_IDENTIFIER_LEN` without a 16 MiB payload.
+        """
+        data = value.encode("utf-8") if isinstance(value, str) else bytes(value)
+        bound = limit
+        if len(data) > bound:
+            raise OmniError(
+                OMNI_ERR_ARG,
+                f"{name} is {len(data)} bytes; the ABI accepts at most {bound}",
             )
         return data
 

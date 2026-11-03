@@ -6,13 +6,29 @@
  *     const { Engine } = require('omniengine');
  *
  *     const engine = new Engine();
- *     engine.evaluate('let answer = 40 + 2');   // 42
- *     engine.run('20 / 3').value;               // 6.666666666666667
+ *     engine.evaluate('let answer = 40 + 2');            // 42
+ *     engine.run('20 / 3').value;                        // 6.666666666666667
+ *     engine.run('"omni" + " " + "engine"').value;       // 'omni engine'
  *     engine.close();
  *
  * Or let the handle clean itself up (Node 20.11+, 22, and later):
  *
  *     await using engine = new Engine();
+ *
+ * Everything this package hands back is JavaScript data. A string result is
+ * copied by `omni_str_copy` into a Buffer that belongs to the caller, so no
+ * object you can hold refers to the egress block the engine rewinds at the
+ * start of the next evaluation:
+ *
+ *     const kept = engine.run('"kept"').value;
+ *     engine.run('"overwritten"');      // `kept` is still 'kept'
+ *
+ * A host can also give the engine a string of its own, which lives as long as
+ * the binding rather than as long as one execution:
+ *
+ *     engine.defineString('greeting', 'hello');
+ *     engine.run('greeting + ", then some"').value;
+ *     engine.stats().egressBytesReserved;   // what the buffers cost
  *
  * Build the engine once and this package finds it:
  *
@@ -35,26 +51,35 @@ const ERROR_BUFFER_SIZE = 4096;
 
 /**
  * @typedef {object} Result
- * @property {string} tag   "number" | "bool" | "nil" | "undef"
- * @property {number} number the raw double; meaningful for number and bool
- * @property {*} value       the same thing as a JavaScript value
+ * @property {string} tag     "number" | "bool" | "string" | "nil" | "undef"
+ * @property {number} number  the raw double; meaningful for number and bool
+ * @property {Buffer} text    the exact bytes of a string result, else empty
+ * @property {*} value        the same thing as a JavaScript value
  */
 
-function toResult(raw) {
+function toResult(raw, text) {
   const tag = tagName(raw.tag);
+  // The eight payload bytes of a string are an address. Reporting them as a
+  // double would put meaningless noise in every log that prints a Result, so
+  // the wrapper reads that arm only for the tags that mean a number.
+  const number = tag === 'number' || tag === 'bool' ? raw.payload.number : 0;
   let value;
-  if (tag === 'number') value = raw.number;
-  else if (tag === 'bool') value = raw.number !== 0;
+  if (tag === 'number') value = number;
+  else if (tag === 'bool') value = number !== 0;
+  else if (tag === 'string') value = text.toString('utf8');
   else value = null; // nil and undef carry no payload
-  return { tag, number: raw.number, value };
+  return { tag, number, text, value };
 }
+
+const EMPTY = Buffer.alloc(0);
 
 class Engine {
   /**
    * Create an engine.
    *
    * @param {{ libraryPath?: string }} [options] point at an explicit artifact
-   * @throws {OmniLibraryError} if the library is missing or koffi is not installed
+   * @throws {OmniLibraryError} if the library is missing, is not this ABI level,
+   *   or koffi is not installed
    */
   constructor(options = {}) {
     this._b = loadBindings(options.libraryPath);
@@ -67,6 +92,7 @@ class Engine {
     // memory the caller owns, so close() must free it.
     this._valueOut = this._b.koffi.alloc(this._b.OmniValue, 1);
     this._numberOut = this._b.koffi.alloc('double', 1);
+    this._statsOut = this._b.koffi.alloc(this._b.OmniStats, 1);
     this._errorBuf = Buffer.alloc(ERROR_BUFFER_SIZE);
     this._lastStatus = STATUS.OK;
   }
@@ -79,6 +105,11 @@ class Engine {
   /** Version reported by the engine library, not by this SDK. */
   get version() {
     return this._require().version();
+  }
+
+  /** Wire format the loaded library reports. `loadBindings` refused otherwise. */
+  get abiVersion() {
+    return this._require().abiVersion();
   }
 
   /** Status code of the most recent call, for code that prefers data to exceptions. */
@@ -94,6 +125,9 @@ class Engine {
   /**
    * Evaluate `source`, returning a Result.
    *
+   * A string result arrives as `text` (the exact bytes, NULs included) and
+   * `value` (the same bytes decoded as UTF-8).
+   *
    * @param {string} source
    * @returns {Result}
    * @throws {OmniError} when the program or the call fails
@@ -104,7 +138,8 @@ class Engine {
     const status = b.exec(this._handle, bytes, bytes.length, this._valueOut);
     this._lastStatus = status;
     if (status !== STATUS.OK) throw new OmniError(status, this._error(b, status));
-    return toResult(this._b.koffi.decode(this._valueOut, this._b.OmniValue));
+    const raw = b.koffi.decode(this._valueOut, b.OmniValue);
+    return toResult(raw, this._copyString(raw));
   }
 
   /**
@@ -124,6 +159,24 @@ class Engine {
   }
 
   /**
+   * Evaluate `source` requiring a string.
+   *
+   * The mirror of `evaluate`, for the caller who would rather get an error than
+   * an `unknown` to type-check.
+   *
+   * @param {string} source
+   * @returns {string}
+   * @throws {OmniError} when the program produced anything but a string
+   */
+  string(source) {
+    const result = this.run(source);
+    if (result.tag !== 'string') {
+      throw new OmniError(STATUS.ERR_RUNTIME, `the program did not evaluate to a string (it produced a ${result.tag})`);
+    }
+    return result.value;
+  }
+
+  /**
    * Evaluate without throwing: `{ status, statusName, result, message }`.
    * For REPLs and editors, where a syntax error is a normal event.
    *
@@ -137,7 +190,83 @@ class Engine {
     if (status !== STATUS.OK) {
       return { status, statusName: statusName(status), result: null, message: this._error(b, status) };
     }
-    return { status, statusName: 'ok', result: toResult(b.koffi.decode(this._valueOut, b.OmniValue)), message: '' };
+    const raw = b.koffi.decode(this._valueOut, b.OmniValue);
+    return { status, statusName: 'ok', result: toResult(raw, this._copyString(raw)), message: '' };
+  }
+
+  /**
+   * Bind `name` to a string the host owns.
+   *
+   * The engine copies `value` into storage that lives as long as the binding,
+   * so the program can read it on any later call -- unlike a result string,
+   * which is only valid until the next evaluation. Redefining `name` replaces
+   * the binding, and a Result kept from before then copies out as zero bytes
+   * rather than as freed memory.
+   *
+   * `name` is at most `MAX_IDENTIFIER_LEN` UTF-8 bytes; `value` is at most
+   * `MAX_STRING_LEN`. Both limits are read from the bindings module at call
+   * time, so a test can lower them without allocating 16 MiB.
+   *
+   * @param {string} name
+   * @param {string|Buffer} value
+   * @throws {OmniError} when the name or payload is rejected
+   */
+  defineString(name, value) {
+    const b = this._require();
+    const nameBytes = encodeBytes(name, bindingsModule.MAX_IDENTIFIER_LEN, 'name');
+    const payload = Buffer.isBuffer(value) ? value : Buffer.from(String(value), 'utf8');
+    if (payload.length > bindingsModule.MAX_STRING_LEN) {
+      throw new OmniError(
+        STATUS.ERR_ARG,
+        `payload is ${payload.length} bytes; the ABI accepts at most ${bindingsModule.MAX_STRING_LEN}`
+      );
+    }
+    const status = b.defineString(this._handle, nameBytes, nameBytes.length, payload, payload.length);
+    this._lastStatus = status;
+    if (status !== STATUS.OK) {
+      throw new OmniError(status, this._error(b, status) || `the ABI rejected the binding ${JSON.stringify(String(name))}`);
+    }
+  }
+
+  /**
+   * The engine's memory counters: executions, strings built, bytes held.
+   *
+   * Read them after a benchmark to tell a high-water mark from a leak. The
+   * execution arena is bulk-freed per call and the egress block rewinds, so
+   * `*BytesReserved` only ever grows to the largest single request.
+   *
+   * @returns {{execs: number, strings: number, arenaBytesInUse: number,
+   *   arenaBytesReserved: number, arenaChunks: number, egressBytesInUse: number,
+   *   egressBytesReserved: number, egressHighWater: number}}
+   */
+  stats() {
+    const b = this._require();
+    const status = b.debugStats(this._handle, this._statsOut);
+    this._lastStatus = status;
+    if (status !== STATUS.OK) throw new OmniError(status, this._error(b, status));
+    const raw = b.koffi.decode(this._statsOut, b.OmniStats);
+    // The callee writes its own struct size first. A mismatch means the header
+    // this file was transcribed from and the library disagree about the field
+    // order, so every number below is untrustworthy.
+    if (raw.size !== b.koffi.sizeof(b.OmniStats)) {
+      throw new OmniError(
+        STATUS.ERR_ARG,
+        `the library says OmniStats is ${raw.size} bytes; this SDK reads ${b.koffi.sizeof(b.OmniStats)}`
+      );
+    }
+    // uint64 counters arrive as BigInt, which cannot be JSON.stringified or
+    // compared with a plain number. No counter approaches 2^53 in a process that
+    // has not allocated petabytes, so the conversion is lossless in practice.
+    return {
+      execs: Number(raw.execs),
+      strings: Number(raw.strings),
+      arenaBytesInUse: Number(raw.arena_bytes_in_use),
+      arenaBytesReserved: Number(raw.arena_bytes_reserved),
+      arenaChunks: Number(raw.arena_chunks),
+      egressBytesInUse: Number(raw.egress_bytes_in_use),
+      egressBytesReserved: Number(raw.egress_bytes_reserved),
+      egressHighWater: Number(raw.egress_high_water),
+    };
   }
 
   /**
@@ -156,13 +285,37 @@ class Engine {
     const b = this._b;
     if (this._handle) b.engineFree(this._handle);
     this._handle = null;
-    for (const ptr of [this._valueOut, this._numberOut]) {
+    for (const ptr of [this._valueOut, this._numberOut, this._statsOut]) {
       if (ptr) {
         b.koffi.free(ptr);
       }
     }
     this._valueOut = null;
     this._numberOut = null;
+    this._statsOut = null;
+  }
+
+  /**
+   * Copy a string result out of the engine, through the ABI.
+   *
+   * `omni_str_copy` takes the address of the value struct -- not the pointer
+   * inside it -- so this file never converts an engine address into a
+   * JavaScript value, and a wrapper cannot turn the documented staleness rule
+   * into a segfault.
+   */
+  _copyString(raw) {
+    if (raw.tag !== TAG.STRING) return EMPTY;
+    const needed = Number(raw.len);
+    if (needed === 0) return EMPTY;
+    // The engine writes at most `needed` bytes, so an unsafe allocation is safe
+    // here: every byte below the returned count was written by the copy. A short
+    // read is possible only when `len` was stale, and then the tail of the
+    // allocation was never touched -- so the tail goes with the allocation
+    // instead of into a Buffer a caller might read through `.buffer`.
+    const buf = Buffer.allocUnsafe(needed);
+    const written = Number(this._b.strCopy(this._handle, this._valueOut, buf, needed));
+    if (written === needed) return buf;
+    return Buffer.from(buf.subarray(0, written));
   }
 
   _error(b, status) {
@@ -198,12 +351,22 @@ if (Symbol.dispose) {
 
 /** @param {string|Buffer} source */
 function encode(source) {
-  const bytes = Buffer.isBuffer(source) ? source : Buffer.from(String(source), 'utf8');
+  return encodeBytes(source, bindingsModule.MAX_SOURCE_LEN, 'source');
+}
+
+/**
+ * Encode one host buffer and bound it the way the ABI does.
+ *
+ * @param {string|Buffer} value
+ * @param {number} limit read from the bindings module by the caller, at call time
+ * @param {string} label the word to use in the rejection
+ */
+function encodeBytes(value, limit, label) {
+  const bytes = Buffer.isBuffer(value) ? value : Buffer.from(String(value), 'utf8');
   // Read the bound from the module rather than a captured constant, so a test
   // can lower it and exercise the guard without allocating 256 MiB.
-  const limit = bindingsModule.MAX_SOURCE_LEN;
   if (bytes.length > limit) {
-    throw new OmniError(STATUS.ERR_ARG, `source is ${bytes.length} bytes; the ABI accepts at most ${limit}`);
+    throw new OmniError(STATUS.ERR_ARG, `${label} is ${bytes.length} bytes; the ABI accepts at most ${limit}`);
   }
   return bytes;
 }
@@ -219,8 +382,18 @@ module.exports = {
   libraryFileName,
   resolveLibrary,
   encode,
+  encodeBytes,
   get MAX_SOURCE_LEN() {
     return bindingsModule.MAX_SOURCE_LEN;
+  },
+  get MAX_STRING_LEN() {
+    return bindingsModule.MAX_STRING_LEN;
+  },
+  get MAX_IDENTIFIER_LEN() {
+    return bindingsModule.MAX_IDENTIFIER_LEN;
+  },
+  get ABI_VERSION() {
+    return bindingsModule.ABI_VERSION;
   },
   VERSION,
 };

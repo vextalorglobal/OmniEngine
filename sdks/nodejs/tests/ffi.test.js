@@ -328,9 +328,48 @@ test('a missing library names the build command', () => {
 
 test('the OmniValue layout matches omni.h', () => {
   const b = bindings.loadBindings();
+  assert.equal(b.koffi.sizeof(b.OmniPayload), 8);
   assert.equal(b.koffi.sizeof(b.OmniValue), 16);
-  assert.equal(b.koffi.offsetof(b.OmniValue, 'number'), 8);
   assert.equal(b.koffi.offsetof(b.OmniValue, 'tag'), 0);
+  assert.equal(b.koffi.offsetof(b.OmniValue, 'len'), 4);
+  assert.equal(b.koffi.offsetof(b.OmniValue, 'payload'), 8);
+});
+
+test('the OmniStats layout matches omni.h', () => {
+  const b = bindings.loadBindings();
+  assert.equal(b.koffi.sizeof(b.OmniStats), 72);
+  assert.equal(b.koffi.offsetof(b.OmniStats, 'size'), 0);
+  assert.equal(b.koffi.offsetof(b.OmniStats, 'execs'), 8);
+  assert.equal(b.koffi.offsetof(b.OmniStats, 'egress_high_water'), 64);
+});
+
+test('the ABI level is read from the library, not assumed', () => {
+  const engine = new Engine();
+  try {
+    assert.equal(engine.abiVersion, 2);
+    assert.equal(engine.abiVersion, bindings.ABI_VERSION);
+    assert.equal(omni.ABI_VERSION, 2);
+  } finally {
+    engine.close();
+  }
+});
+
+test('checkAbi refuses a library that speaks another wire format', () => {
+  // The case it exists for is a stale artifact, which a test cannot build
+  // without rebuilding the workspace twice -- so the comparison is driven
+  // directly. A v1 OmniValue has no `len` field, and reading one as the other
+  // yields wrong numbers rather than an error, which is why this is fatal.
+  assert.throws(
+    () => bindings.checkAbi(1, '/old/omni.dll'),
+    (err) => {
+      assert.equal(err.name, 'OmniLibraryError');
+      assert.match(err.message, /ABI version 1/);
+      assert.match(err.message, /ABI version 2/);
+      assert.match(err.message, /cargo build -p omni-ffi/);
+      return true;
+    }
+  );
+  assert.equal(bindings.checkAbi(2, '/current/omni.dll'), 2);
 });
 
 test('status and tag names', () => {
@@ -339,5 +378,439 @@ test('status and tag names', () => {
   assert.equal(omni.statusName(99), 'status-99');
   assert.equal(omni.tagName(0), 'number');
   assert.equal(omni.tagName(3), 'undef');
-  assert.equal(omni.TAG.NUMBER, 0);
+  assert.equal(omni.tagName(4), 'string');
+  assert.equal(omni.TAG.STRING, 4);
+  assert.equal(omni.tagName(9), 'tag-9');
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2: strings across the bridge
+// ---------------------------------------------------------------------------
+
+test('a string result crosses the boundary as text', () => {
+  const engine = new Engine();
+  try {
+    const result = engine.run('"omni" + " " + "engine"');
+    assert.equal(result.tag, 'string');
+    assert.equal(result.value, 'omni engine');
+    assert.ok(Buffer.isBuffer(result.text));
+    assert.equal(result.text.toString('utf8'), 'omni engine');
+    assert.equal(result.text.length, 11);
+  } finally {
+    engine.close();
+  }
+});
+
+test('a string result reports no number', () => {
+  const engine = new Engine();
+  try {
+    // The eight payload bytes of a string are an address; publishing them as a
+    // double would be meaningless noise in every log that prints a Result.
+    const result = engine.run('"x"');
+    assert.equal(result.number, 0);
+    assert.equal(result.tag, 'string');
+  } finally {
+    engine.close();
+  }
+});
+
+test('escapes survive the boundary byte for byte', () => {
+  const engine = new Engine();
+  const cases = [
+    ['"a\\nb"', 'a\nb'],
+    ['"a\\tb"', 'a\tb'],
+    ['"a\\rb"', 'a\rb'],
+    ['"a\\"b"', 'a"b'],
+    ['"a\\\\b"', 'a\\b'],
+    ['"\\u{41}\\u{42}"', 'AB'],
+    ['"\\u{1F600}"', '\u{1f600}'],
+  ];
+  try {
+    for (const [source, expected] of cases) {
+      const result = engine.run(source);
+      assert.equal(result.tag, 'string', source);
+      assert.equal(result.value, expected, source);
+      assert.equal(result.text.length, Buffer.byteLength(expected), source);
+    }
+  } finally {
+    engine.close();
+  }
+});
+
+test('a string may contain a NUL byte', () => {
+  const engine = new Engine();
+  try {
+    // Length-delimited, not C strings: `len` is the only end-of-string, so the
+    // bytes after a NUL must still arrive.
+    const result = engine.run('"a" + "\\u{0}" + "b"');
+    assert.deepEqual([...result.text], [97, 0, 98]);
+    assert.equal(result.value, 'a\x00b');
+  } finally {
+    engine.close();
+  }
+});
+
+test('a multiline string is a compile error, not a truncated result', () => {
+  const engine = new Engine();
+  try {
+    assert.throws(
+      () => engine.run('"a\nb"'),
+      (err) => err.kind === 'compile' && /cannot span lines/.test(err.message)
+    );
+  } finally {
+    engine.close();
+  }
+});
+
+test('non-ASCII text keeps its bytes', () => {
+  const engine = new Engine();
+  try {
+    const expected = 'নমস্কার!';
+    const result = engine.run('"নমস্কার" + "!"');
+    assert.equal(result.value, expected);
+    assert.equal(result.text.length, 22); // seven 3-byte code units plus "!"
+    assert.equal([...result.value].length, 8);
+    assert.equal(result.text.toString('utf8'), result.value);
+  } finally {
+    engine.close();
+  }
+});
+
+test('the empty string is a string, not undef', () => {
+  const engine = new Engine();
+  try {
+    const result = engine.run('""');
+    assert.equal(result.tag, 'string');
+    assert.equal(result.value, '');
+    assert.equal(result.text.length, 0);
+    assert.equal(engine.run('').tag, 'undef');
+  } finally {
+    engine.close();
+  }
+});
+
+test('equality compares content, not addresses', () => {
+  const engine = new Engine();
+  try {
+    assert.equal(engine.run('"ab" == "a" + "b"').value, true);
+    assert.equal(engine.run('"ab" == "ac"').value, false);
+    assert.equal(engine.run('"ab" != "a"').value, true);
+    assert.equal(engine.run('"ab" != "a" + "b"').value, false);
+  } finally {
+    engine.close();
+  }
+});
+
+test('mixing a string and a number names the rule', () => {
+  const engine = new Engine();
+  try {
+    assert.throws(
+      () => engine.run('"hi" + 42'),
+      (err) =>
+        err.kind === 'runtime' && err.message === 'line 1: cannot add string to number: "hi" + 42'
+    );
+  } finally {
+    engine.close();
+  }
+});
+
+test('a copied string is unaffected by the next execution', () => {
+  const engine = new Engine();
+  try {
+    // The egress block rewinds on the next call. `result` was built before that
+    // call and is still correct, because it holds JavaScript bytes rather than
+    // an address.
+    const result = engine.run('"kept"');
+    for (let i = 0; i < 20; i++) engine.run('"overwritten with other text entirely"');
+    assert.equal(result.value, 'kept');
+    assert.equal(result.text.toString('utf8'), 'kept');
+  } finally {
+    engine.close();
+  }
+});
+
+test('string() requires a string the way evaluate() requires a number', () => {
+  const engine = new Engine();
+  try {
+    assert.equal(engine.string('"fine"'), 'fine');
+    assert.throws(
+      () => engine.string('1 + 1'),
+      (err) => err.kind === 'runtime' && /did not evaluate to a string/.test(err.message)
+    );
+    assert.throws(() => engine.evaluate('"text"'), (err) => err.kind === 'runtime');
+  } finally {
+    engine.close();
+  }
+});
+
+test('tryRun copies a string the same way run does', () => {
+  const engine = new Engine();
+  try {
+    const ok = engine.tryRun('"no exceptions here"');
+    assert.equal(ok.status, STATUS.OK);
+    assert.equal(ok.result.value, 'no exceptions here');
+    assert.equal(ok.message, '');
+  } finally {
+    engine.close();
+  }
+});
+
+test('a stale value reads the bytes that are there now, not a crash', () => {
+  const b = bindings.loadBindings();
+  const handle = b.engineNew();
+  const stale = b.koffi.alloc(b.OmniValue, 1);
+  const fresh = b.koffi.alloc(b.OmniValue, 1);
+  try {
+    const first = Buffer.from('"first"', 'utf8');
+    assert.equal(b.exec(handle, first, first.length, stale), STATUS.OK);
+    const buf = Buffer.alloc(8);
+    assert.equal(Number(b.strCopy(handle, stale, buf, 5)), 5);
+    assert.equal(buf.subarray(0, 5).toString('utf8'), 'first');
+
+    const second = Buffer.from('"a much longer second"', 'utf8');
+    assert.equal(b.exec(handle, second, second.length, fresh), STATUS.OK);
+    // `stale` still resolves: it addresses live, engine-owned memory, and the
+    // copy is bounded by the five bytes this caller asked for. This is the
+    // documented consequence of a rewind, read here instead of hidden.
+    assert.equal(Number(b.strCopy(handle, stale, buf, 5)), 5);
+    assert.equal(buf.subarray(0, 5).toString('utf8'), 'a muc');
+    // The cap is the caller's bound, not the string's: with room for 32 the same
+    // value copies all 20 bytes, and only `value.len` says how many to expect.
+    const room = Buffer.alloc(32);
+    assert.equal(Number(b.strCopy(handle, fresh, room, room.length)), 20);
+    assert.equal(room.subarray(0, 20).toString('utf8'), 'a much longer second');
+  } finally {
+    b.koffi.free(stale);
+    b.koffi.free(fresh);
+    b.engineFree(handle);
+  }
+});
+
+test("a value owned by another engine copies nothing", () => {
+  const b = bindings.loadBindings();
+  const mine = b.engineNew();
+  const other = b.engineNew();
+  const out = b.koffi.alloc(b.OmniValue, 1);
+  try {
+    const text = Buffer.from('owned by the other engine', 'utf8');
+    const src = Buffer.concat([Buffer.from('"', 'utf8'), text, Buffer.from('"', 'utf8')]);
+    assert.equal(b.exec(other, src, src.length, out), STATUS.OK);
+    const buf = Buffer.alloc(64);
+    assert.equal(Number(b.strCopy(other, out, buf, buf.length)), text.length);
+    // Same bytes, same struct, wrong engine: the address is real but belongs to
+    // another arena, and `omni_str_copy` is the function that checks ownership.
+    // A host that memcpy'd from `payload.ptr` instead would be reading another
+    // subsystem's memory.
+    assert.equal(Number(b.strCopy(mine, out, buf, buf.length)), 0);
+  } finally {
+    b.koffi.free(out);
+    b.engineFree(other);
+    b.engineFree(mine);
+  }
+});
+
+test('a short copy hands back exact bytes, never an untouched tail', () => {
+  const engine = new Engine();
+  try {
+    engine.run('"a much longer second"');
+    const short = engine.run('"shorter"'); // 7 bytes now live at the egress address
+    assert.equal(short.value, 'shorter');
+    // A caller that sized its buffer from a stale `len` gets the 7 bytes the
+    // engine actually had, and the 20-byte allocation's untouched tail stays
+    // with the allocation instead of reaching the caller through `.buffer`.
+    const copy = engine._copyString({ tag: 4, len: 20 });
+    assert.equal(copy.length, 7);
+    assert.equal(copy.toString('utf8'), 'shorter');
+  } finally {
+    engine.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2: strings the host owns
+// ---------------------------------------------------------------------------
+
+test('defineString binds a host string the program can read', () => {
+  const engine = new Engine();
+  try {
+    engine.defineString('greeting', 'hello wörld');
+    const result = engine.run('greeting + "!"');
+    assert.equal(result.value, 'hello wörld!');
+    assert.equal(result.text.length, 13); // 12 UTF-8 bytes of payload plus "!"
+  } finally {
+    engine.close();
+  }
+});
+
+test('a host string survives executions a result does not', () => {
+  const engine = new Engine();
+  try {
+    engine.defineString('stable', 'still here');
+    for (let i = 0; i < 50; i++) engine.run('"unrelated work"');
+    assert.equal(engine.run('stable').value, 'still here');
+  } finally {
+    engine.close();
+  }
+});
+
+test('redefining a name replaces the binding', () => {
+  const engine = new Engine();
+  try {
+    engine.defineString('name', 'before');
+    engine.defineString('name', 'after');
+    assert.equal(engine.run('name').value, 'after');
+  } finally {
+    engine.close();
+  }
+});
+
+test('an old value of a redefined name copies nothing', () => {
+  const b = bindings.loadBindings();
+  const handle = b.engineNew();
+  const out = b.koffi.alloc(b.OmniValue, 1);
+  const buf = Buffer.alloc(64);
+  try {
+    const name = Buffer.from('name', 'utf8');
+    const before = Buffer.from('before', 'utf8');
+    assert.equal(b.defineString(handle, name, name.length, before, before.length), STATUS.OK);
+    const read = Buffer.from('name', 'utf8');
+    assert.equal(b.exec(handle, read, read.length, out), STATUS.OK);
+    assert.equal(Number(b.strCopy(handle, out, buf, buf.length)), 6);
+    assert.equal(buf.subarray(0, 6).toString('utf8'), 'before');
+
+    const after = Buffer.from('a longer replacement', 'utf8');
+    assert.equal(b.defineString(handle, name, name.length, after, after.length), STATUS.OK);
+    // The previous bytes were released and the engine no longer recognises the
+    // address: zero bytes, not freed memory.
+    assert.equal(Number(b.strCopy(handle, out, buf, buf.length)), 0);
+  } finally {
+    b.koffi.free(out);
+    b.engineFree(handle);
+  }
+});
+
+test('a name or payload that is too long is rejected before the call', () => {
+  const engine = new Engine();
+  const originalName = bindings.MAX_IDENTIFIER_LEN;
+  const originalPayload = bindings.MAX_STRING_LEN;
+  try {
+    bindings.MAX_IDENTIFIER_LEN = 8;
+    assert.throws(
+      () => engine.defineString('name'.repeat(3), 'value'),
+      (err) => err.kind === 'argument' && /at most 8/.test(err.message)
+    );
+    bindings.MAX_STRING_LEN = 16;
+    assert.throws(
+      () => engine.defineString('ok', 'y'.repeat(17)),
+      (err) => err.kind === 'argument' && /payload is 17 bytes/.test(err.message)
+    );
+  } finally {
+    bindings.MAX_IDENTIFIER_LEN = originalName;
+    bindings.MAX_STRING_LEN = originalPayload;
+  }
+  // And the ABI's own ceilings are the numbers this file declares, so what
+  // passes here is what the library will accept.
+  assert.equal(bindings.MAX_IDENTIFIER_LEN, 32);
+  assert.equal(bindings.MAX_STRING_LEN, 16 * 1024 * 1024);
+});
+
+test('an empty name and a non-UTF-8 payload are rejected by the library', () => {
+  const engine = new Engine();
+  try {
+    assert.throws(() => engine.defineString('', 'value'), (err) => err.kind === 'argument');
+    assert.throws(
+      () => engine.defineString('bad', Buffer.from([0xff, 0xfe])),
+      (err) => err.kind === 'argument' && err.message.length > 0
+    );
+  } finally {
+    engine.close();
+  }
+});
+
+test('a string longer than the engine allows is a runtime error', () => {
+  const engine = new Engine();
+  try {
+    const payload = 'y'.repeat(omni.MAX_STRING_LEN + 1);
+    assert.throws(
+      () => engine.run(`"${payload}"`),
+      (err) => err.kind === 'runtime' && /MiB/.test(err.message)
+    );
+    assert.throws(() => engine.defineString('s', payload), (err) => err.kind === 'argument');
+  } finally {
+    engine.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2: the memory story, told in numbers a host can read
+// ---------------------------------------------------------------------------
+
+test('stats reports the counters', () => {
+  const engine = new Engine();
+  try {
+    assert.equal(engine.stats().execs, 0);
+    assert.equal(engine.stats().egressHighWater, 0);
+    engine.run('"one"');
+    engine.run('"two"');
+    const stats = engine.stats();
+    assert.equal(stats.execs, 2);
+    assert.ok(stats.strings >= 2, `strings was ${stats.strings}`);
+    assert.ok(stats.egressHighWater >= 3, `high water was ${stats.egressHighWater}`);
+    assert.ok(stats.arenaBytesReserved >= 1);
+    for (const [key, value] of Object.entries(stats)) {
+      assert.equal(typeof value, 'number', `${key} leaked a BigInt into a host-visible field`);
+    }
+  } finally {
+    engine.close();
+  }
+});
+
+test('repeated string executions reserve no more memory', () => {
+  const engine = new Engine();
+  try {
+    const program = '"a string long enough to be interesting"';
+    engine.run(program);
+    const before = engine.stats();
+    for (let i = 0; i < 5000; i++) assert.equal(engine.run(program).value, 'a string long enough to be interesting');
+    const after = engine.stats();
+    assert.equal(after.execs, before.execs + 5000);
+    assert.equal(after.arenaBytesReserved, before.arenaBytesReserved);
+    assert.equal(after.egressBytesReserved, before.egressBytesReserved);
+    assert.equal(after.egressHighWater, before.egressHighWater);
+  } finally {
+    engine.close();
+  }
+});
+
+test('a larger result grows the egress once and then stops', () => {
+  const engine = new Engine();
+  try {
+    engine.defineString('chunk', 'x'.repeat(256 * 1024));
+    engine.run('"small"');
+    const small = engine.stats();
+    const first = engine.run('chunk + chunk');
+    assert.equal(first.text.length, 512 * 1024);
+    const grown = engine.stats();
+    assert.ok(grown.egressBytesReserved > small.egressBytesReserved, JSON.stringify({ small, grown }));
+    // Every later call of the same size reuses the reservation: rewind, not
+    // free-then-re-map.
+    for (let i = 0; i < 10; i++) engine.run('chunk + chunk');
+    const again = engine.stats();
+    assert.equal(again.egressBytesReserved, grown.egressBytesReserved);
+    assert.equal(again.egressHighWater, grown.egressHighWater);
+  } finally {
+    engine.close();
+  }
+});
+
+test('a Rust panic leaves a string result working', () => {
+  const engine = new Engine();
+  try {
+    const before = engine.run('"alive"');
+    assert.equal(before.value, 'alive');
+    assert.equal(engine.debugPanic(), STATUS.ERR_PANIC);
+    assert.equal(engine.run('"still alive"').value, 'still alive');
+  } finally {
+    engine.close();
+  }
 });

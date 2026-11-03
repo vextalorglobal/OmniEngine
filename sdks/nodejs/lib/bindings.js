@@ -6,15 +6,26 @@
  * The prototypes below are transcribed from crates/omni-ffi/include/omni.h and
  * are the reason that header exists: koffi compiles the signature string, so a
  * mismatch between the SDK and the library shows up as garbage numbers or a
- * crash instead of a type error. Two guards make the risk visible at load time:
+ * crash instead of a type error. Three guards make the risk visible at load time:
  *
- *   - the struct size and field offsets are asserted against the ABI, and
+ *   - the ABI level is read from the library and compared with what this file
+ *     declares, and a mismatch refuses to load,
+ *   - the struct and union sizes and every field offset are asserted against the
+ *     ABI, and
  *   - every pointer parameter is declared explicitly, so a handle is never
  *     rounded through a JavaScript number.
  *
  * Handles come back from koffi as BigInt. That is deliberate and load-bearing:
  * BigInt keeps all 64 bits. Converting one with Number() would truncate any
  * address above 2^53, which works in a demo and corrupts memory in production.
+ * The one address this SDK could read -- a string result's `payload.ptr` -- is
+ * never converted at all: `omni_str_copy` takes the value struct, not the
+ * pointer, so the bytes cross into a Buffer and the host never holds an address.
+ *
+ * Type names must be declared before they appear in a signature string. Passing
+ * an undeclared name (the opaque `OmniEngine *`, for instance) is not a type
+ * error koffi throws -- it aborts the process. Hence `void *` for the handle,
+ * which is also exactly what an opaque pointer is to C.
  */
 
 const path = require('node:path');
@@ -47,6 +58,7 @@ const TAG = Object.freeze({
   NIL: 1,
   BOOL: 2,
   UNDEF: 3,
+  STRING: 4,
 });
 
 const TAG_NAMES = Object.freeze({
@@ -54,10 +66,22 @@ const TAG_NAMES = Object.freeze({
   1: 'nil',
   2: 'bool',
   3: 'undef',
+  4: 'string',
 });
 
-/** The ABI rejects any length above this, before reading a single byte. */
+/**
+ * Wire format of the value struct this file reads.
+ *
+ * Version 1 had no `len` field and no string arm, so a v1 library read through
+ * these declarations yields `len` as padding -- wrong numbers, not an error.
+ * `loadBindings` compares the library's own answer with this constant.
+ */
+const ABI_VERSION = 2;
+
+/** The ABI rejects any length above these, before reading a single byte. */
 const MAX_SOURCE_LEN = 2 ** 28;
+const MAX_STRING_LEN = 16 * 1024 * 1024;
+const MAX_IDENTIFIER_LEN = 32;
 
 function statusName(status) {
   return STATUS_NAMES[status] || `status-${status}`;
@@ -96,7 +120,7 @@ class OmniError extends Error {
 const cache = new Map();
 
 /**
- * Load the library and attach every signature to it.
+ * Load the library, attach every signature to it, and verify its ABI level.
  *
  * @param {string} [libraryPath] absolute path; resolved from the environment by default
  * @returns {Bindings}
@@ -124,51 +148,127 @@ function loadBindings(libraryPath) {
 
 /** Register types and prototypes against one loaded library. */
 function declare(koffi, lib, resolvedPath) {
+  // Declared in dependency order: a signature string may only name types that
+  // already exist.
+  const OmniPayload = koffi.union('OmniPayload', {
+    number: 'double',
+    ptr: 'void *',
+  });
+
   const OmniValue = koffi.struct('OmniValue', {
     tag: 'uint32_t',
-    number: 'double',
+    len: 'uint32_t',
+    payload: 'OmniPayload',
+  });
+
+  const OmniStats = koffi.struct('OmniStats', {
+    size: 'uint32_t',
+    execs: 'uint64_t',
+    strings: 'uint64_t',
+    arena_bytes_in_use: 'uint64_t',
+    arena_bytes_reserved: 'uint64_t',
+    arena_chunks: 'uint64_t',
+    egress_bytes_in_use: 'uint64_t',
+    egress_bytes_reserved: 'uint64_t',
+    egress_high_water: 'uint64_t',
   });
 
   // Fail here rather than returning wrong numbers later if the two sides drift.
-  if (koffi.sizeof && koffi.sizeof(OmniValue) !== 16) {
-    throw new OmniError(
-      STATUS.ERR_ARG,
-      `koffi sees OmniValue as ${koffi.sizeof(OmniValue)} bytes, expected 16; the SDK and the library disagree about the ABI`
-    );
+  // koffi reports sizes and offsets for its own type system, which is the only
+  // way to compare a header written in Rust with a struct declared in JS.
+  const layout = [
+    ['koffi.sizeof(OmniPayload)', koffi.sizeof(OmniPayload), 8],
+    ['koffi.sizeof(OmniValue)', koffi.sizeof(OmniValue), 16],
+    ['koffi.offsetof(OmniValue, tag)', koffi.offsetof(OmniValue, 'tag'), 0],
+    ['koffi.offsetof(OmniValue, len)', koffi.offsetof(OmniValue, 'len'), 4],
+    ['koffi.offsetof(OmniValue, payload)', koffi.offsetof(OmniValue, 'payload'), 8],
+    ['koffi.sizeof(OmniStats)', koffi.sizeof(OmniStats), 72],
+    ['koffi.offsetof(OmniStats, size)', koffi.offsetof(OmniStats, 'size'), 0],
+    ['koffi.offsetof(OmniStats, execs)', koffi.offsetof(OmniStats, 'execs'), 8],
+    ['koffi.offsetof(OmniStats, egress_high_water)', koffi.offsetof(OmniStats, 'egress_high_water'), 64],
+  ];
+  for (const [name, actual, expected] of layout) {
+    if (actual !== expected) {
+      throw new OmniError(
+        STATUS.ERR_ARG,
+        `${name} is ${actual}, expected ${expected}; the SDK and the library disagree about the ABI`
+      );
+    }
   }
-  if (koffi.offsetof && koffi.offsetof(OmniValue, 'number') !== 8) {
-    throw new OmniError(
-      STATUS.ERR_ARG,
-      `koffi sees OmniValue.number at offset ${koffi.offsetof(OmniValue, 'number')}, expected 8`
+
+  // Resolved first, and on its own, because this is the one export whose absence
+  // has an explanation a host can act on. koffi throws when a function is
+  // declared rather than when it is called, so a pre-Phase-2 artifact fails here
+  // -- and an error thrown from a `lib.func` inside the object literal below
+  // would arrive as koffi's own text, with no hint that the fix is a rebuild.
+  let abiVersion;
+  try {
+    abiVersion = lib.func('uint32_t omni_abi_version()');
+  } catch (err) {
+    throw new OmniLibraryError(
+      `${resolvedPath} does not export omni_abi_version, so it predates the ABI level this SDK needs ` +
+        `(${ABI_VERSION}). Rebuild it:\n    cargo build -p omni-ffi\n(${err.message})`
     );
   }
 
-  // `const void *` for source, not `const char *`: the ABI takes an explicit
-  // length and reads UTF-8 bytes, and a Buffer is exactly those. Declaring a
-  // string type would add a NUL-termination assumption the ABI does not have.
-  return {
+  const bindings = {
     koffi,
     lib,
     path: resolvedPath,
+    OmniPayload,
     OmniValue,
+    OmniStats,
     statusName,
     tagName,
     STATUS,
     TAG,
+    ABI_VERSION,
     MAX_SOURCE_LEN,
+    MAX_STRING_LEN,
+    MAX_IDENTIFIER_LEN,
+    abiVersion,
     version: lib.func('const char *omni_version()'),
     engineNew: lib.func('void *omni_engine_new()'),
     engineFree: lib.func('void omni_engine_free(void *engine)'),
     exec: lib.func('uint32_t omni_exec(void *engine, const void *src, size_t len, OmniValue *out)'),
     execNumber: lib.func('uint32_t omni_exec_number(void *engine, const void *src, size_t len, double *out)'),
+    // `char *` for the destination: koffi needs to know it is writable, and a
+    // Buffer is what the caller owns. The ABI writes no NUL and reads no NUL --
+    // `cap` and the return value are the whole contract.
+    strCopy: lib.func('size_t omni_str_copy(const void *engine, const OmniValue *value, char *buf, size_t cap)'),
+    // Both inputs are `const void *`, not `const char *`: the ABI takes an
+    // explicit length for each buffer and may be handed bytes with a NUL in
+    // them, which a string type would silently cut short.
+    defineString: lib.func('uint32_t omni_define_string(void *engine, const void *name, size_t nameLen, const void *bytes, size_t bytesLen)'),
+    debugStats: lib.func('uint32_t omni_debug_stats(void *engine, OmniStats *out)'),
     lastError: lib.func('size_t omni_last_error(void *engine, void *buf, size_t cap)'),
     debugPanic: lib.func('uint32_t omni_debug_panic(void *engine)'),
   };
+
+  checkAbi(abiVersion(), resolvedPath);
+  return bindings;
+}
+
+/**
+ * Refuse a library whose value layout this file cannot read.
+ *
+ * Split out from `declare` so a test can drive it with any number: the case it
+ * exists for -- an artifact built from an older commit -- is not one a test
+ * suite can produce without rebuilding the workspace twice.
+ */
+function checkAbi(declared, source) {
+  if (declared === ABI_VERSION) return declared;
+  throw new OmniLibraryError(
+    `${source} speaks ABI version ${declared}; this SDK is written for ABI version ${ABI_VERSION}. ` +
+      'The value layout differs, so reading one as the other produces wrong numbers rather than an ' +
+      'error. Rebuild the library, or install the SDK version that matches it:\n    cargo build -p omni-ffi'
+  );
 }
 
 module.exports = {
   loadBindings,
   declare,
+  checkAbi,
   OmniError,
   OmniLibraryError,
   STATUS,
@@ -177,5 +277,8 @@ module.exports = {
   TAG_NAMES,
   statusName,
   tagName,
+  ABI_VERSION,
   MAX_SOURCE_LEN,
+  MAX_STRING_LEN,
+  MAX_IDENTIFIER_LEN,
 };
