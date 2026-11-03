@@ -1,0 +1,4 @@
+// OmniEngine vertical slice: bindings, arithmetic, precedence.
+// Run with:  cargo run -q -p omni-cli -- run examples/hello.omni
+let answer = 40 + 2
+answer

@@ -1,0 +1,17 @@
+[package]
+name = "omni-wasm"
+description = "Scaffolded WebAssembly surface for OmniEngine. Not a default workspace member."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+omni-core.workspace = true
+# wasm-bindgen is intentionally absent until Phase 2. Declaring it now would put
+# an uncompilable-on-this-machine dependency in Cargo.lock while the crate stays
+# out of default-members, and the wasm32-unknown-unknown target is not installed.

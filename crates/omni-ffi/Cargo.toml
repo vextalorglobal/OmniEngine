@@ -1,0 +1,25 @@
+[package]
+name = "omni-ffi"
+description = "The C ABI for OmniEngine: the only crate that names a #[repr(C)] type or an extern \"C\" function."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# The library is named `omni`, not `omni_ffi`, so the artifact a host loads is
+# `omni.dll` / `libomni.so` / `libomni.dylib` — the public name the SDKs and
+# `include/omni.h` promise. Verified against the x86_64-pc-windows-gnu output:
+#   cdylib    -> omni.dll          (what ctypes and koffi load)
+#   staticlib -> libomni.a         (GNU archiving; MSVC would emit omni.dll.lib)
+#   import lib-> libomni.dll.a    (GNU, for link-time resolution)
+#   rlib      -> libomni.rlib     (lets Rust tests call the same surface)
+name = "omni"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+omni-core.workspace = true
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

@@ -1,0 +1,5 @@
+// A slightly larger slice: shadowing, floats, and the remainder operator.
+let base = 7
+let scaled = base * base - 1
+let ratio = 22 / 7
+scaled % 10

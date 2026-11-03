@@ -1,0 +1,16 @@
+[package]
+name = "omni-core"
+description = "OmniEngine language core: NaN-boxed values, a bump arena, and the expression evaluator."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Zero dependencies is a load-bearing property, not minimalism for its own sake:
+# it keeps the audit surface empty, the compile graph small, and the disk
+# footprint on C: (7.5 GB free) from growing every time the core changes.
+[dependencies]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

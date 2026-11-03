@@ -1,0 +1,17 @@
+# Checked in, so every clone gets the same build behaviour.
+#
+# Deliberately NOT setting build.target-dir: the workspace already gets a single
+# shared target/ at the repo root, which lives on D: because the repo does. An
+# absolute path here would leak this machine into CI and other clones.
+
+[alias]
+# The three commands worth typing: build the cdylib the SDKs load, lint
+# everything, and test everything.
+build-ffi = ["build", "-p", "omni-ffi"]
+build-ffi-release = ["build", "--release", "-p", "omni-ffi", "-p", "omni-cli"]
+lint = ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
+check-all = ["check", "--workspace", "--all-targets"]
+
+# x86-64 Windows has a single calling convention, so extern "C" is unambiguous.
+# This is here to make the fallback discoverable when the MSVC link is missing:
+#   cargo build -p omni-ffi --target x86_64-pc-windows-gnu

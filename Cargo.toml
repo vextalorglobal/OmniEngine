@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = ["crates/omni-core", "crates/omni-ffi", "crates/omni-cli", "crates/omni-wasm"]
+
+# omni-wasm is a member but not a default member: cargo build must not require
+# the wasm32-unknown-unknown target, which is not installed on this machine.
+# Build it explicitly with `cargo build -p omni-wasm` once that target lands.
+default-members = ["crates/omni-core", "crates/omni-ffi", "crates/omni-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+authors = ["Tamzid Abdur Rahman <fahim5536>"]
+repository = "https://github.com/fahim5536/omniengine"
+description = "OmniEngine: a high-performance custom language with a zero-dependency core and a C ABI for every host."
+
+[workspace.dependencies]
+omni-core = { path = "crates/omni-core", version = "0.1.0" }
+
+# Dev is tuned for two things at once: compile speed, and the fact that C: has
+# 7.5 GB free and holds CARGO_HOME. Full debug info on MSVC emits a multi-GB PDB
+# per crate; line tables keep panic backtraces readable without paying for that.
+[profile.dev]
+opt-level = 0
+debug = "line-tables-only"
+incremental = true
+codegen-units = 256
+# Load-bearing, not stylistic: omni-ffi converts panics to error codes with
+# catch_unwind. panic = "abort" would turn every host-facing error into a crash.
+panic = "unwind"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+strip = "debuginfo"

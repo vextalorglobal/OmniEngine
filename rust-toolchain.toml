@@ -1,0 +1,23 @@
+# Pinned to the GNU ABI on purpose, and not by preference.
+#
+# The default host toolchain is windows-msvc, and its link.exe IS installed
+# (D:\VS\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64) — but Git for Windows ships a
+# coreutils `link.exe` (hard-link utility) at
+# C:\Users\m7004\.qoder\bin\git\usr\bin\link.exe that wins the PATH lookup. The
+# resulting failure is not a Rust error at all:
+#
+#   link: missing operand after '■'
+#   Try 'link --help' for more information.
+#
+# Two ways out: put the VS bin directory ahead of Git's usr\bin on PATH
+# (machine-wide, affects every project, and breaks again whenever Git updates),
+# or use the windows-gnu toolchain, where MinGW `ld` is unambiguous. GNU is the
+# smaller and more honest fix, so it is pinned here for this workspace only.
+#
+# To switch back to MSVC without touching PATH, use the documented override in
+# docs/GUIDE.md (a per-shell PATH prepend).
+[toolchain]
+channel = "stable-x86_64-pc-windows-gnu"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-pc-windows-gnu"]
+profile = "default"

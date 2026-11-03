@@ -1,0 +1,40 @@
+# Configuration for regenerating crates/omni-ffi/include/omni.h with cbindgen.
+#
+#   cargo install cbindgen            # one time
+#   cbindgen --config crates/omni-ffi/cbindgen.toml crates/omni-ffi \
+#            --output crates/omni-ffi/include/omni.h
+#
+# The header is hand-written today, because cbindgen cannot emit the
+# OMNI_API / OMNI_CALL macros, the ABI asserts, or the caller contract that
+# makes this surface safe to use from C. This config exists so regeneration is
+# a single reviewed command instead of a guess. Diff before you commit:
+# regeneration will drop the prose and the linkage notes above.
+language = "C"
+include_guard = "OMNI_H"
+tab_width = 2
+style = "both"
+autogen_warning = "Parts of this header are machine-generated from crates/omni-ffi/src/lib.rs. The caller contract, OMNI_API, and OMNI_CALL are hand-written; keep them."
+
+# Only this crate. omni-core types must not leak into a C header.
+[parse]
+parse_deps = false
+
+[export]
+# The handle is forward-declared and never exposed; everything else public is
+# part of the ABI.
+include = ["OmniValue", "OmniEngine"]
+
+[export.rename]
+"OmniEngine" = "OmniEngine"
+
+[enum]
+prefix_with_name = true
+rename_variants = "ScreamingSnakeCase"
+
+[fn]
+# Rust already puts omni_ on every name; do not add another prefix.
+args = "transparent"
+
+[constant]
+# `#define OMNI_OK 0` is what C callers and every SDK constant block expect.
+style = "both"
