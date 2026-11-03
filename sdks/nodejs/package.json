@@ -1,0 +1,49 @@
+{
+  "name": "omniengine",
+  "version": "0.1.0",
+  "description": "Node.js bindings for OmniEngine: a NaN-boxed, garbage-collection-free expression engine behind a C ABI, reached through koffi.",
+  "keywords": [
+    "omni",
+    "omniengine",
+    "language",
+    "interpreter",
+    "ffi",
+    "embed",
+    "koffi",
+    "native"
+  ],
+  "license": "MIT",
+  "author": "Tamzid Abdur Rahman (fahim5536)",
+  "homepage": "https://github.com/fahim5536/OmniEngine#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fahim5536/OmniEngine.git",
+    "directory": "sdks/nodejs"
+  },
+  "bugs": "https://github.com/fahim5536/OmniEngine/issues",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./bindings": "./lib/bindings.js",
+    "./discover": "./lib/discover.js"
+  },
+  "files": [
+    "index.js",
+    "lib/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build:engine": "cargo build -p omni-ffi",
+    "test": "node --test tests/",
+    "test:verbose": "node --test --test-reporter=spec tests/"
+  },
+  "optionalDependencies": {
+    "koffi": "^3.3.6"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}

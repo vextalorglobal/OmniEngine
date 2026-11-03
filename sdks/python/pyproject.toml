@@ -1,0 +1,38 @@
+[build-system]
+# 77 is the first release that understands `license = "MIT"` (PEP 639). Pinning
+# higher than that would needlessly break older, perfectly good toolchains.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omniengine"
+version = "0.1.0"
+description = "Python bindings for OmniEngine, using only the standard library's ctypes."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["omni", "omniengine", "language", "interpreter", "ffi", "embed"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Software Development :: Interpreters",
+]
+
+# Deliberately empty, and load-bearing: the whole point of this SDK is that
+# adding OmniEngine to a project cannot change that project's dependency tree.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/fahim5536/OmniEngine"
+Repository = "https://github.com/fahim5536/OmniEngine"
+
+[tool.setuptools.packages.find]
+include = ["omni*"]
+
+# The engine itself is a native artifact built by cargo. It is not vendored
+# into the wheel here, so `pip install` never needs a Rust toolchain and never
+# silently ships a stale binary. Set OMNI_ENGINE_LIBRARY to point at one.
