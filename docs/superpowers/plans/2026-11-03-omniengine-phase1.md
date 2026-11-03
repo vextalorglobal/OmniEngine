@@ -2,6 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Status: executed on 2026-11-03.** Every step below was completed and the
+> result is verified by `scripts/verify-all.sh` (Rust, C, Python, and Node all
+> print 42). Two kinds of deviation are recorded in the spec's
+> "Implementation outcome" section rather than silently applied here: design
+> changes (`OmniValue` is a struct, not a union; the toolchain pin moved to
+> `windows-gnu`), and process changes (this plan's per-step commits were batched
+> into a small number of coherent commits, so the history reads as deliverables
+> rather than as steps).
+
 **Goal:** Stand up the OmniEngine repository at `D:\OmniEngine` and prove one `.omni` source file evaluates to `42` through a Rust CLI, a C ABI cdylib consumed by Python `ctypes`, and the same cdylib consumed by Node `koffi`.
 
 **Architecture:** A Cargo workspace whose `omni-core` crate owns a NaN-boxed 8-byte `Value` and a bump `Arena`, and whose `omni-ffi` crate is the only place naming a `#[repr(C)]` type or an `extern "C"` function. `omni-cli` and `omni-wasm` are thin consumers of `omni-core`, so the core cannot accidentally become FFI-shaped. No arena pointer crosses the C boundary; results return by value and every entry point runs inside `catch_unwind`.
@@ -12,7 +21,7 @@
 
 ## Global Constraints
 
-- Toolchain pinned `stable-x86_64-pc-windows-msvc`; `x86_64-pc-windows-gnu` is the documented fallback if the MSVC link fails.
+- Toolchain pinned `stable-x86_64-pc-windows-msvc`; `x86_64-pc-windows-gnu` is the documented fallback if the MSVC link fails. **(What happened: it did fail — Git's `link.exe` shadows MSVC's — so `rust-toolchain.toml` pins `x86_64-pc-windows-gnu`.)**
 - `omni-core` has zero external crate dependencies. Standard library only.
 - `omni-ffi` is the only crate permitted to declare `extern "C"` or `#[repr(C)]`.
 - `unsafe` is confined to `omni-core/src/arena.rs` and `omni-ffi/src/lib.rs`.
@@ -67,7 +76,7 @@
 **Interfaces:**
 - Produces: workspace members `omni-core`, `omni-ffi`, `omni-cli`, `omni-wasm`; crate versions `0.1.0`; edition `2024`.
 
-- [ ] **Step 1: Write the workspace manifest.** `default-members` excludes `omni-wasm` so `cargo build` never needs the missing `wasm32-unknown-unknown` target.
+- [x] **Step 1: Write the workspace manifest.** `default-members` excludes `omni-wasm` so `cargo build` never needs the missing `wasm32-unknown-unknown` target.
 
 ```toml
 [workspace]
@@ -102,7 +111,7 @@ panic = "unwind"          # never "abort" — it would bypass catch_unwind
 strip = "debuginfo"
 ```
 
-- [ ] **Step 2: Pin the toolchain and add the four crate manifests.**
+- [x] **Step 2: Pin the toolchain and add the four crate manifests.**
 
 `rust-toolchain.toml`:
 ```toml
@@ -181,9 +190,9 @@ omni-core.workspace = true
 # wasm32 target is installed. Add wasm-bindgen in Phase 2 when it is needed.
 ```
 
-- [ ] **Step 3: Write minimal stub sources** so the workspace compiles: `omni-core/src/lib.rs` with `pub mod value;` etc. added in later tasks and a temporary `//! OmniEngine core.` doc header; `omni-ffi/src/lib.rs` with `//! C ABI surface.`; `omni-cli/src/main.rs` printing `omni: not yet implemented` and exiting 2; `omni-wasm/src/lib.rs` with `//! Scaffolded wasm surface. Built only via default-members opt-out.`
+- [x] **Step 3: Write minimal stub sources** so the workspace compiles: `omni-core/src/lib.rs` with `pub mod value;` etc. added in later tasks and a temporary `//! OmniEngine core.` doc header; `omni-ffi/src/lib.rs` with `//! C ABI surface.`; `omni-cli/src/main.rs` printing `omni: not yet implemented` and exiting 2; `omni-wasm/src/lib.rs` with `//! Scaffolded wasm surface. Built only via default-members opt-out.`
 
-- [ ] **Step 4: Verify the workspace resolves and wasm stays out of the default build.**
+- [x] **Step 4: Verify the workspace resolves and wasm stays out of the default build.**
 
 Run: `cargo metadata --format-version 1 --no-deps | python -c "import json,sys; m=json.load(sys.stdin); print(sorted(m['packages'][0]['name'] for _ in [0]) if False else sorted(p['name'] for p in m['packages']))"`
 Expected: `['omni-cli', 'omni-core', 'omni-ffi', 'omni-wasm']`
@@ -191,7 +200,7 @@ Expected: `['omni-cli', 'omni-core', 'omni-ffi', 'omni-wasm']`
 Run: `cargo build 2>&1 | tail -5`
 Expected: builds `omni-core`, `omni-ffi`, `omni-cli` only — `omni-wasm` absent, and no wasm32 target error.
 
-- [ ] **Step 5: Write `.gitattributes` implementing Linguist tier 1 plus EOL policy.** Later rules win, so the path-scoped rules come last.
+- [x] **Step 5: Write `.gitattributes` implementing Linguist tier 1 plus EOL policy.** Later rules win, so the path-scoped rules come last.
 
 ```gitattributes
 # --- Line endings: normalize the repo, protect the Windows build ---
@@ -225,7 +234,7 @@ Cargo.lock text eol=lf
 /docs/** linguist-documentation=true
 ```
 
-- [ ] **Step 6: Verify the attributes actually take effect.**
+- [x] **Step 6: Verify the attributes actually take effect.**
 
 Run: `git add .gitattributes Cargo.toml rust-toolchain.toml .cargo/config.toml crates/ Cargo.lock 2>&1 | grep -i "warning: in the working copy" || echo "no CRLF warnings"`
 Expected: `no CRLF warnings` — this is the proof the EOL policy fixed the warning the spec commit produced.
@@ -233,7 +242,7 @@ Expected: `no CRLF warnings` — this is the proof the EOL policy fixed the warn
 Run: `git check-attr linguist-language linguist-vendored -- examples/x.omni sdks/python/setup.py docs/y.md`
 Expected: `.omni` -> `Rust`, `sdks/python/setup.py` -> `vendored: true`, `docs/y.md` -> `documentation: true`.
 
-- [ ] **Step 7: Commit.**
+- [x] **Step 7: Commit.**
 
 ```bash
 git add -A
@@ -256,7 +265,7 @@ wasm32 target. line-tables-only debug is chosen specifically against the
 - Consumes: nothing.
 - Produces: `Value` (`Copy`, 8 bytes), `Value::from_f64(f64) -> Value`, `Value::as_f64(self) -> Option<f64>`, `Value::is_double/is_pointer/is_singleton/is_number/is_nan(self) -> bool`, `Value::bool(bool) -> Value`, `Value::NIL`, `Value::UNDEF`, `Value::TRUE`, `Value::FALSE`, `Value::to_string(self) -> String`, `Value::as_bool(self) -> Option<bool>`, `Value::from_ptr(*const u8) -> Value`, `Value::as_ptr(self) -> Option<*const u8>`.
 
-- [ ] **Step 1: Write the failing tests, including the two that catch real encoding bugs.**
+- [x] **Step 1: Write the failing tests, including the two that catch real encoding bugs.**
 
 ```rust
 #[cfg(test)]
@@ -335,9 +344,9 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run and confirm failure.** `cargo test -p omni-core` → expected: compile error, `value` module missing.
+- [x] **Step 2: Run and confirm failure.** `cargo test -p omni-core` → expected: compile error, `value` module missing.
 
-- [ ] **Step 3: Implement `value.rs`.**
+- [x] **Step 3: Implement `value.rs`.**
 
 ```rust
 //! The NaN-boxed OmniEngine value.
@@ -459,9 +468,9 @@ impl fmt::Display for Value {
 
 Note for the implementer: `as_bool` above compares via `PartialEq`, which recurses into `as_f64`. Both arms take the `(None, None)` path, so it terminates, but write it as `self.0 == Value::TRUE.0` instead — cheaper and obviously non-recursive. Do that.
 
-- [ ] **Step 4: `cargo test -p omni-core value::` → all pass. `cargo clippy -p omni-core -D warnings` → clean.**
+- [x] **Step 4: `cargo test -p omni-core value::` → all pass. `cargo clippy -p omni-core -D warnings` → clean.**
 
-- [ ] **Step 5: Commit** `git commit -m "feat(core): NaN-boxed 8-byte Value with sNaN pointer row"`
+- [x] **Step 5: Commit** `git commit -m "feat(core): NaN-boxed 8-byte Value with sNaN pointer row"`
 
 ---
 
@@ -474,7 +483,7 @@ Note for the implementer: `as_bool` above compares via `PartialEq`, which recurs
 **Interfaces:**
 - Produces: `Arena::new() -> Arena`, `Arena::with_chunk_size(usize) -> Arena`, `alloc_raw(&mut self, size: usize, align: usize) -> *mut u8`, `alloc<T>(&mut self, T) -> *mut T`, `reset(&mut self)`, `allocations(&self) -> usize`, `bytes_in_use(&self) -> usize`, `chunk_count(&self) -> usize`.
 
-- [ ] **Step 1: Write the failing tests.** The `Layout` test is the one that matters: `Box<[u8]>` reconstructed from a 16-aligned allocation deallocates with align 1, which is UB and only shows up as a heap-corruption crash under a different allocator.
+- [x] **Step 1: Write the failing tests.** The `Layout` test is the one that matters: `Box<[u8]>` reconstructed from a 16-aligned allocation deallocates with align 1, which is UB and only shows up as a heap-corruption crash under a different allocator.
 
 ```rust
 #[cfg(test)]
@@ -531,9 +540,9 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: `cargo test -p omni-core arena::` → confirm compile failure.**
+- [x] **Step 2: `cargo test -p omni-core arena::` → confirm compile failure.**
 
-- [ ] **Step 3: Implement.** Chunks are raw `Layout` allocations with a matching dealloc; `Box<[u8]>` is deliberately not used because its `Drop` would dealloc with align 1.
+- [x] **Step 3: Implement.** Chunks are raw `Layout` allocations with a matching dealloc; `Box<[u8]>` is deliberately not used because its `Drop` would dealloc with align 1.
 
 ```rust
 //! Deterministic chunked bump allocator. No GC, no refcounting: memory is
@@ -632,9 +641,9 @@ impl Arena {
 impl Default for Arena { fn default() -> Self { Self::new() } }
 ```
 
-- [ ] **Step 4: Fix the two latent bugs in the code above before running tests.** (a) `bytes_in_use` reports 0 after `reset()` only if `used` is `usize::MAX`-guarded — return `0` when `used == usize::MAX`. (b) `reset()` truncates to one chunk but then sets `used = 0` while that surviving chunk is still allocated; a following `alloc_raw` sees `fits == true` and reuses it, which is the intent — confirm the `crosses_into_a_new_chunk` and `reset_is_deterministic` tests both pass together, because a wrong `used` reset makes them contradict.
-- [ ] **Step 5: `cargo test -p omni-core` → pass. `cargo clippy -p omni-core -- -D warnings` → clean.**
-- [ ] **Step 6: Commit** `git commit -m "feat(core): chunked bump arena with layout-matched dealloc"`
+- [x] **Step 4: Fix the two latent bugs in the code above before running tests.** (a) `bytes_in_use` reports 0 after `reset()` only if `used` is `usize::MAX`-guarded — return `0` when `used == usize::MAX`. (b) `reset()` truncates to one chunk but then sets `used = 0` while that surviving chunk is still allocated; a following `alloc_raw` sees `fits == true` and reuses it, which is the intent — confirm the `crosses_into_a_new_chunk` and `reset_is_deterministic` tests both pass together, because a wrong `used` reset makes them contradict.
+- [x] **Step 5: `cargo test -p omni-core` → pass. `cargo clippy -p omni-core -- -D warnings` → clean.**
+- [x] **Step 6: Commit** `git commit -m "feat(core): chunked bump arena with layout-matched dealloc"`
 
 ---
 
@@ -647,7 +656,7 @@ impl Default for Arena { fn default() -> Self { Self::new() } }
 **Interfaces:**
 - Produces: `enum TokenKind { Let, Ident, Number, BinOp(BinOp), Eq, LParen, RParen, Semi, Newline, Eof }`, `struct Token<'a> { kind: TokenKind, text: &'a str, line: u32 }`, `lex(&str) -> Result<Vec<Token<'_>>, LexError>`, `enum BinOp { Add, Sub, Mul, Div, Mod }`, `struct LexError { line: u32, column: u32, message: String }`.
 
-- [ ] **Step 1: Write the failing tests.** `tokens_borrow_the_source` is the zero-allocation claim, so it must be a compile-level test, not a comment.
+- [x] **Step 1: Write the failing tests.** `tokens_borrow_the_source` is the zero-allocation claim, so it must be a compile-level test, not a comment.
 
 ```rust
 #[cfg(test)]
@@ -700,9 +709,9 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Confirm failure, then implement** a byte-walking lexer over `&[u8]` that slices `&str` by byte offset using `src.get(start..end).expect("valid UTF-8 boundary")`. Track `line` by incrementing on `b'\n'`, and compute `column` as `pos - line_start + 1`. Keywords match the exact bytes `let`. Identifiers are `[A-Za-z_][A-Za-z0-9_]*`. Numbers are `[0-9]` then optional `.` then digits, then optional `e|E` with optional sign and digits — reject a trailing `.` with a clear message rather than silently yielding `1`.
+- [x] **Step 2: Confirm failure, then implement** a byte-walking lexer over `&[u8]` that slices `&str` by byte offset using `src.get(start..end).expect("valid UTF-8 boundary")`. Track `line` by incrementing on `b'\n'`, and compute `column` as `pos - line_start + 1`. Keywords match the exact bytes `let`. Identifiers are `[A-Za-z_][A-Za-z0-9_]*`. Numbers are `[0-9]` then optional `.` then digits, then optional `e|E` with optional sign and digits — reject a trailing `.` with a clear message rather than silently yielding `1`.
 
-- [ ] **Step 3: `cargo test -p omni-core lexer::` → pass. Commit** `git commit -m "feat(core): zero-allocation lexer borrowing source slices"`
+- [x] **Step 3: `cargo test -p omni-core lexer::` → pass. Commit** `git commit -m "feat(core): zero-allocation lexer borrowing source slices"`
 
 ---
 
@@ -716,7 +725,7 @@ mod tests {
 - Consumes: `lex`, `Token`, `TokenKind`, `BinOp`, `Value`, `Arena`.
 - Produces: `Engine::new() -> Engine`, `Engine::exec(&mut self, source: &str) -> Result<Value, OmniError>`, `Engine::last_error(&self) -> Option<&OmniError>`, `Engine::last_value(&self) -> Value`, `Engine::arena(&self) -> &Arena`, `Engine::define(&mut self, name: &str, value: Value)`, `struct OmniError { kind: ErrorKind, line: u32, message: String }`, `enum ErrorKind { Lex, Parse, Runtime, Panic }`.
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
 
 ```rust
 #[cfg(test)]
@@ -805,7 +814,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Confirm failure, then implement** a recursive-descent parser fused with evaluation. No AST type is introduced — that is Phase 2 and inventing one now would be throwaway. Grammar:
+- [x] **Step 2: Confirm failure, then implement** a recursive-descent parser fused with evaluation. No AST type is introduced — that is Phase 2 and inventing one now would be throwaway. Grammar:
 
 ```
 program := ( stmt )*           stmt := 'let' IDENT '=' expr | expr
@@ -819,8 +828,8 @@ primary := NUMBER | IDENT | '(' expr ')'
 
 Divide-by-zero returns `Err(Runtime)` and never reaches a float infinity, because an `inf` leaking back through the FFI would look like a successful computation.
 
-- [ ] **Step 3: `cargo test -p omni-core` → all pass. `cargo clippy --workspace --all-targets -- -D warnings` → clean.**
-- [ ] **Step 4: Commit** `git commit -m "feat(core): fused parser and evaluator for the expression slice"`
+- [x] **Step 3: `cargo test -p omni-core` → all pass. `cargo clippy --workspace --all-targets -- -D warnings` → clean.**
+- [x] **Step 4: Commit** `git commit -m "feat(core): fused parser and evaluator for the expression slice"`
 
 ---
 
@@ -835,7 +844,7 @@ Divide-by-zero returns `Err(Runtime)` and never reaches a float infinity, becaus
 - Consumes: `omni_core::{Engine, Value, OmniError, ErrorKind}`.
 - Produces (exact C names, all `extern "C", no_mangle`): `omni_version`, `omni_engine_new`, `omni_engine_free`, `omni_exec`, `omni_exec_number`, `omni_last_error`, `omni_debug_panic`. Status constants `OMNI_OK=0`, `OMNI_ERR_COMPILE=1`, `OMNI_ERR_RUNTIME=2`, `OMNI_ERR_PANIC=3`, `OMNI_ERR_ARG=4`. Value tags `OMNI_NUMBER=0`, `OMNI_NIL=1`, `OMNI_BOOL=2`, `OMNI_UNDEF=3`. `OmniValue { tag: u32, number: f64 }`.
 
-- [ ] **Step 1: Write the failing integration tests.** These are the real proof of the panic boundary — an unwinding Rust panic landing in a C stack frame is UB, and it is the single most common defect in hand-rolled FFI.
+- [x] **Step 1: Write the failing integration tests.** These are the real proof of the panic boundary — an unwinding Rust panic landing in a C stack frame is UB, and it is the single most common defect in hand-rolled FFI.
 
 ```rust
 use omni_ffi::*;
@@ -917,7 +926,7 @@ fn version_is_stable_and_nul_terminated() {
 }
 ```
 
-- [ ] **Step 2: Implement `omni-ffi/src/lib.rs`.** Every body inside `catch_unwind(AssertUnwindSafe(..))`, null-checked args, by-value results, and no Rust type at the boundary.
+- [x] **Step 2: Implement `omni-ffi/src/lib.rs`.** Every body inside `catch_unwind(AssertUnwindSafe(..))`, null-checked args, by-value results, and no Rust type at the boundary.
 
 ```rust
 //! The only crate allowed to name `#[repr(C)]` or `extern "C"`.
@@ -1057,14 +1066,14 @@ fn encode(v: omni_core::Value) -> OmniValue {
 
 `len > 1 << 28` bounds a hostile length before `from_raw_parts`, so a bad `len` from a host cannot fabricate an out-of-bounds slice. Add `pub use` re-exports of the constants so `tests/ffi_contract.rs` compiles against `omni_ffi::*`, and drop `c_void` if unused.
 
-- [ ] **Step 3: Write `include/omni.h`** mirroring the ABI by hand — `#ifdef _WIN32` `__declspec(dllexport)` vs `__attribute__((visibility("default")))`, `typedef struct OmniEngine OmniEngine;` opaque, the six prototypes with matching parameter types, `#define OMNI_OK 0` etc., and `#ifdef __cplusplus extern "C" {` guards.
-- [ ] **Step 4: Write `cbindgen.toml`** with `language = "C"`, `include_guard = "OMNI_H"`, `autogen_warning`, `[parse] parse_deps = false`, `header = comment pointing at the hand-written file` so `cbindgen --config crates/omni-ffi/cbindgen.toml crates/omni-ffi -o crates/omni-ffi/include/omni.h` is a documented one-command upgrade rather than a guess.
-- [ ] **Step 5: Amend the spec** FFI section to the `{ tag, number }` struct with a one-line reason, so the docs do not describe a union that does not exist.
-- [ ] **Step 6: Run `cargo test -p omni-ffi`.** Then run the link check that the spec promised was unverified:
+- [x] **Step 3: Write `include/omni.h`** mirroring the ABI by hand — `#ifdef _WIN32` `__declspec(dllexport)` vs `__attribute__((visibility("default")))`, `typedef struct OmniEngine OmniEngine;` opaque, the six prototypes with matching parameter types, `#define OMNI_OK 0` etc., and `#ifdef __cplusplus extern "C" {` guards.
+- [x] **Step 4: Write `cbindgen.toml`** with `language = "C"`, `include_guard = "OMNI_H"`, `autogen_warning`, `[parse] parse_deps = false`, `header = comment pointing at the hand-written file` so `cbindgen --config crates/omni-ffi/cbindgen.toml crates/omni-ffi -o crates/omni-ffi/include/omni.h` is a documented one-command upgrade rather than a guess.
+- [x] **Step 5: Amend the spec** FFI section to the `{ tag, number }` struct with a one-line reason, so the docs do not describe a union that does not exist.
+- [x] **Step 6: Run `cargo test -p omni-ffi`.** Then run the link check that the spec promised was unverified:
 
 Run: `cargo build -p omni-ffi 2>&1 | tail -20 && ls -la target/debug/omni*`
 Expected: `omni.dll` + `omni.dll.lib` present. If the MSVC link fails with `link.exe not found` or `LNK1181`, re-run with `cargo build -p omni-ffi --target x86_64-pc-windows-gnu` and record which toolchain won in `docs/GUIDE.md`.
-- [ ] **Step 7: Commit** `git commit -m "feat(ffi): C ABI surface with panic boundary and caller-owned error copy"`
+- [x] **Step 7: Commit** `git commit -m "feat(ffi): C ABI surface with panic boundary and caller-owned error copy"`
 
 ---
 
@@ -1075,7 +1084,7 @@ Expected: `omni.dll` + `omni.dll.lib` present. If the MSVC link fails with `link
 
 **Interfaces:** Consumes `omni_core::Engine`. Produces `omni run <file>`, `omni eval <expr>`, `omni --version`; exit 0 on success, 1 on engine error, 2 on usage/IO error.
 
-- [ ] **Step 1: `examples/hello.omni`** — the file that must produce `42`:
+- [x] **Step 1: `examples/hello.omni`** — the file that must produce `42`:
 
 ```omni
 // OmniEngine vertical slice: bindings, arithmetic, precedence.
@@ -1083,13 +1092,13 @@ let answer = 40 + 2
 answer
 ```
 
-- [ ] **Step 2: Implement `main.rs`** with hand-rolled arg parsing (no `clap` — `omni-core`'s zero-dependency rule and the disk budget both argue against it), `read_to_string`, `Engine::new()`, print `result` to stdout and `omni: line N: message` to stderr, plus `--quiet` for the tests.
-- [ ] **Step 3: Verify.**
+- [x] **Step 2: Implement `main.rs`** with hand-rolled arg parsing (no `clap` — `omni-core`'s zero-dependency rule and the disk budget both argue against it), `read_to_string`, `Engine::new()`, print `result` to stdout and `omni: line N: message` to stderr, plus `--quiet` for the tests.
+- [x] **Step 3: Verify.**
 
 Run: `cargo run -q -p omni-cli -- run examples/hello.omni` → expected stdout `42`.
 Run: `cargo run -q -p omni-cli -- eval "2 + 3 * 4"` → `14`.
 Run: `cargo run -q -p omni-cli -- eval "1 / 0"`; then `echo $?` → expected `1` and a message naming division by zero.
-- [ ] **Step 4: Commit** `git commit -m "feat(cli): omni run/eval with engine exit codes"`
+- [x] **Step 4: Commit** `git commit -m "feat(cli): omni run/eval with engine exit codes"`
 
 ---
 
@@ -1097,10 +1106,10 @@ Run: `cargo run -q -p omni-cli -- eval "1 / 0"`; then `echo $?` → expected `1`
 
 **Files:** `crates/omni-wasm/src/lib.rs`, `crates/omni-wasm/Cargo.toml`
 
-- [ ] **Step 1: Write the scaffold** mirroring the C ABI shape with plain `f64` in and `String` errors out, so the eventual `wasm-bindgen` addition is a decorator rather than a rewrite. No `wasm-bindgen` dependency yet — the crate is not in `default-members`, so adding it now would put an uncompilable dependency in `Cargo.lock` for no benefit.
-- [ ] **Step 2: Verify it compiles on the host without the wasm target:** `cargo check -p omni-wasm 2>&1 | tail -5` → expected `Finished`.
-- [ ] **Step 3: Record the deferred setup** in `docs/GUIDE.md`: `rustup target add wasm32-unknown-unknown`, then `cargo install wasm-pack` or the prebuilt-binary route, with the note that the CLI build costs ~300 crate compilations against the 7.5 GB on C:.
-- [ ] **Step 4: Commit** `git commit -m "feat(wasm): scaffolded engine surface, deferred behind default-members"`
+- [x] **Step 1: Write the scaffold** mirroring the C ABI shape with plain `f64` in and `String` errors out, so the eventual `wasm-bindgen` addition is a decorator rather than a rewrite. No `wasm-bindgen` dependency yet — the crate is not in `default-members`, so adding it now would put an uncompilable dependency in `Cargo.lock` for no benefit.
+- [x] **Step 2: Verify it compiles on the host without the wasm target:** `cargo check -p omni-wasm 2>&1 | tail -5` → expected `Finished`.
+- [x] **Step 3: Record the deferred setup** in `docs/GUIDE.md`: `rustup target add wasm32-unknown-unknown`, then `cargo install wasm-pack` or the prebuilt-binary route, with the note that the CLI build costs ~300 crate compilations against the 7.5 GB on C:.
+- [x] **Step 4: Commit** `git commit -m "feat(wasm): scaffolded engine surface, deferred behind default-members"`
 
 ---
 
@@ -1110,7 +1119,7 @@ Run: `cargo run -q -p omni-cli -- eval "1 / 0"`; then `echo $?` → expected `1`
 
 **Interfaces:** Consumes the `omni_*` symbols. Produces `omni.Engine()` with `.eval_number(src) -> float`, `.eval(src) -> OmniValue`, `.close()`, context-manager support, and `omni.OmniError(code, message)`.
 
-- [ ] **Step 1: Write `tests/test_ffi.py` first.**
+- [x] **Step 1: Write `tests/test_ffi.py` first.**
 
 ```python
 import pathlib, sys
@@ -1140,11 +1149,11 @@ if __name__ == "__main__":
     print("python FFI: all pass")
 ```
 
-- [ ] **Step 2: Implement `_ffi.py`** with stdlib `ctypes` only. An `OmniValue` `ctypes.Structure` with fields in declared order `("tag", c_uint32), ("number", c_double)`, matching `#[repr(C)]`: `tag` at offset 0, four bytes of tail padding, `number` at offset 8, `sizeof == 16`. Assert `ctypes.sizeof(OmniValue) == 16` at import time and cross-check it against a Rust `const _: () = assert!(size_of::<OmniValue>() == 16)` so the two sides cannot drift silently. Set `argtypes`/`restype` on every symbol; without `argtypes` ctypes passes pointers as `int` and a 64-bit handle is truncated, which is the classic silent-corruption bug on Windows x64.
-- [ ] **Step 3: Library discovery** in this order: `$OMNI_ENGINE_HOME`, `OMNI_ENGINE_LIBRARY`, then the workspace-relative `target/{debug,release}/omni.{dll,so,dylib}` resolved from `__file__`, then the bare platform name on `PATH`. Raise `OmniLibraryError` naming `cargo build -p omni-ffi` when nothing is found.
-- [ ] **Step 4: `pyproject.toml`** with `name = "omni-engine"`, `requires-python = ">=3.10"`, and **no `dependencies`** — that zero-dependency property is the reason `ctypes` was chosen.
-- [ ] **Step 5: Verify:** `python tests/test_ffi.py` → expected `42` then `python FFI: all pass`.
-- [ ] **Step 6: Commit** `git commit -m "feat(sdk-python): ctypes binding with explicit argtypes and library discovery"`
+- [x] **Step 2: Implement `_ffi.py`** with stdlib `ctypes` only. An `OmniValue` `ctypes.Structure` with fields in declared order `("tag", c_uint32), ("number", c_double)`, matching `#[repr(C)]`: `tag` at offset 0, four bytes of tail padding, `number` at offset 8, `sizeof == 16`. Assert `ctypes.sizeof(OmniValue) == 16` at import time and cross-check it against a Rust `const _: () = assert!(size_of::<OmniValue>() == 16)` so the two sides cannot drift silently. Set `argtypes`/`restype` on every symbol; without `argtypes` ctypes passes pointers as `int` and a 64-bit handle is truncated, which is the classic silent-corruption bug on Windows x64.
+- [x] **Step 3: Library discovery** in this order: `$OMNI_ENGINE_HOME`, `OMNI_ENGINE_LIBRARY`, then the workspace-relative `target/{debug,release}/omni.{dll,so,dylib}` resolved from `__file__`, then the bare platform name on `PATH`. Raise `OmniLibraryError` naming `cargo build -p omni-ffi` when nothing is found.
+- [x] **Step 4: `pyproject.toml`** with `name = "omni-engine"`, `requires-python = ">=3.10"`, and **no `dependencies`** — that zero-dependency property is the reason `ctypes` was chosen.
+- [x] **Step 5: Verify:** `python tests/test_ffi.py` → expected `42` then `python FFI: all pass`.
+- [x] **Step 6: Commit** `git commit -m "feat(sdk-python): ctypes binding with explicit argtypes and library discovery"`
 
 ---
 
@@ -1154,7 +1163,7 @@ if __name__ == "__main__":
 
 **Interfaces:** Produces `const { Engine, OmniError } = require('omni-engine')`; `engine.evalNumber(src): number`, `engine.exec(src): {tag, number}`, `engine.close()`.
 
-- [ ] **Step 1: Write `tests/test_ffi.js` first.**
+- [x] **Step 1: Write `tests/test_ffi.js` first.**
 
 ```js
 const path = require("node:path");
@@ -1172,10 +1181,10 @@ try {
 } finally { e.close(); }
 ```
 
-- [ ] **Step 2: `koffi`, not `ffi-napi`.** `ffi-napi` is unmaintained and fails to compile against Node 26's V8/ABI, so installing it needs node-gyp and a compiler chain. `koffi` ships prebuilt binaries. Declare it as `optionalDependencies` so `npm install` never hard-fails, and raise a named `Error` with the exact remedy when `require("koffi")` throws.
-- [ ] **Step 3: Implement `bindings.js`** — `koffi.load(libPath)`, `koffi.struct("OmniValue", { tag: "uint32_t", number: "double" })`, prototypes declared with explicit types, and source passed as a `Buffer.from(src, "utf8")` with its byte length rather than a JS string, so `len` matches Rust's byte count for non-ASCII input.
-- [ ] **Step 4: Verify.** `npm --prefix sdks/nodejs install 2>&1 | tail -3` then `node tests/test_ffi.js` → expected `42` then `node FFI: all pass`. If the registry is unreachable, do not fake it: report the failure verbatim and record `koffi` install as the unmet prerequisite for acceptance criterion 4.
-- [ ] **Step 5: Commit** `git commit -m "feat(sdk-node): koffi binding sized for Node 26"`
+- [x] **Step 2: `koffi`, not `ffi-napi`.** `ffi-napi` is unmaintained and fails to compile against Node 26's V8/ABI, so installing it needs node-gyp and a compiler chain. `koffi` ships prebuilt binaries. Declare it as `optionalDependencies` so `npm install` never hard-fails, and raise a named `Error` with the exact remedy when `require("koffi")` throws.
+- [x] **Step 3: Implement `bindings.js`** — `koffi.load(libPath)`, `koffi.struct("OmniValue", { tag: "uint32_t", number: "double" })`, prototypes declared with explicit types, and source passed as a `Buffer.from(src, "utf8")` with its byte length rather than a JS string, so `len` matches Rust's byte count for non-ASCII input.
+- [x] **Step 4: Verify.** `npm --prefix sdks/nodejs install 2>&1 | tail -3` then `node tests/test_ffi.js` → expected `42` then `node FFI: all pass`. If the registry is unreachable, do not fake it: report the failure verbatim and record `koffi` install as the unmet prerequisite for acceptance criterion 4.
+- [x] **Step 5: Commit** `git commit -m "feat(sdk-node): koffi binding sized for Node 26"`
 
 ---
 
@@ -1183,9 +1192,9 @@ try {
 
 **Files:** Create `docs/GUIDE.md`, `README.md`
 
-- [ ] **Step 1: Write `docs/GUIDE.md`** with the five phases as the user framed them, corrected where the premise was wrong: environment commands; workspace layout and why `default-members` excludes wasm; the storage section stating C: at 93% and the `line-tables-only` choice, with the `CARGO_HOME` relocation given as explicit opt-in commands and the note that it was declined for now; the FFI contract including the no-arena-pointer rule and `catch_unwind`; the Linguist section stating plainly that `.gitattributes` cannot mint a language and the tier 2 PR checklist; and the exact verification command list with expected output.
-- [ ] **Step 2: Add the `.ox` alias** to `.gitattributes` so the alternative extension the user mentioned works without a rebuild.
-- [ ] **Step 3: Full verification sweep**, capturing real output for each:
+- [x] **Step 1: Write `docs/GUIDE.md`** with the five phases as the user framed them, corrected where the premise was wrong: environment commands; workspace layout and why `default-members` excludes wasm; the storage section stating C: at 93% and the `line-tables-only` choice, with the `CARGO_HOME` relocation given as explicit opt-in commands and the note that it was declined for now; the FFI contract including the no-arena-pointer rule and `catch_unwind`; the Linguist section stating plainly that `.gitattributes` cannot mint a language and the tier 2 PR checklist; and the exact verification command list with expected output.
+- [x] **Step 2: Add the `.ox` alias** to `.gitattributes` so the alternative extension the user mentioned works without a rebuild.
+- [x] **Step 3: Full verification sweep**, capturing real output for each:
 
 ```bash
 cargo test --workspace
@@ -1197,8 +1206,8 @@ git check-attr linguist-language -- examples/hello.omni
 git status --porcelain
 ```
 
-- [ ] **Step 4: `du -sh target` and `df -h /c /d`** — record the actual footprint so the storage claim is measured, not asserted.
-- [ ] **Step 5: Commit** `git commit -m "docs: Phase 1 initialization and execution guide"`
+- [x] **Step 4: `du -sh target` and `df -h /c /d`** — record the actual footprint so the storage claim is measured, not asserted.
+- [x] **Step 5: Commit** `git commit -m "docs: Phase 1 initialization and execution guide"`
 
 ## Out of Scope
 

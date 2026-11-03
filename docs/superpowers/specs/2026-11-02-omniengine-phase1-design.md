@@ -19,9 +19,9 @@ memory model that Phase 2 cannot extend.
 | `D:\OmniEngine` | existed, empty, no git | clean slate, `git init` safe |
 | D: free | 76 GB of 138 GB | the stated 20 GB budget is not binding on D: |
 | C: free | **7.5 GB, 93 % used** | the real constraint; `CARGO_HOME` growth lands here |
-| rustc / cargo | 1.99.0 / 1.99.0 | current stable features available |
-| default toolchain | `stable-x86_64-pc-windows-msvc` | plus `windows-gnu` installed |
-| `link.exe` on PATH | false positive — Git's hard-link utility | MSVC link must be verified empirically |
+| rustc / cargo | 1.99.0 / 1.99.0 at review, **1.99.1** at implementation | current stable features available |
+| default toolchain | `stable-x86_64-pc-windows-msvc` | plus `windows-gnu` installed — **outcome: the workspace is pinned to `windows-gnu`, see the linker note below** |
+| `link.exe` on PATH | false positive — Git's hard-link utility | verified empirically: it shadows MSVC's linker, so the workspace pins GNU |
 | Visual Studio | `D:\VS` | rustc self-locates VS; fallback to GNU is available |
 | gcc | MinGW-W64 16.2.0 on PATH | `windows-gnu` cdylib path works without VS |
 | `wasm32-unknown-unknown` | not installed | wasm crate must be excluded from default build |
@@ -39,7 +39,7 @@ relocation as an opt-in and does not perform it.
 ```
 D:\OmniEngine\
 ├── Cargo.toml              workspace, resolver = "3", default-members
-├── rust-toolchain.toml     pin stable windows-msvc
+├── rust-toolchain.toml     pin stable windows-gnu (amended: MSVC was tried first)
 ├── .cargo/config.toml      build policy, checked in
 ├── .gitattributes          two-tier linguist strategy
 ├── .gitignore              target/, CARGO_HOME escape hatch
@@ -142,8 +142,33 @@ omni_last_error(eng, buf, cap)       → usize
 
 `OmniStatus` is `OMNI_OK`, `OMNI_ERR_COMPILE`, `OMNI_ERR_RUNTIME`,
 `OMNI_ERR_PANIC`, `OMNI_ERR_ARG`. `OmniValue` is `#[repr(C)]` with a tag and a
-union of `{ double number; const char *string; }`, so a host never has to
-reimplement NaN boxing to read a result.
+payload, so a host never has to reimplement NaN boxing to read a result.
+
+**Amended during implementation: the payload is a `double`, not a union.** The
+design said `union { double number; const char *string; }`. Phase 1 has no
+string values, so the pointer arm would be a variant nothing populates that every
+host still has to read unsafely, and a union makes the read a correctness hazard
+in six languages instead of a documented tag check in one. The shipped type is
+
+```c
+typedef struct OmniValue { uint32_t tag; double number; } OmniValue;
+```
+
+size 16, `number` at offset 8 — pinned by a Rust `const _: () = assert!(..)` pair,
+`_Static_assert` in `omni.h`, `ctypes.sizeof` at Python import, and `koffi.sizeof`
+at Node load. It becomes a union when strings arrive, which is the point where a
+pointer arm earns its keep.
+
+Two further ABI rules, both found by testing rather than by design:
+
+- `omni_last_error` copies the **rendered** error (`line 1: expected a name,
+  found '='`), not `error.message`. Dropping the location across the boundary
+  leaves a host unable to point a user at their source.
+- `omni_exec(eng, NULL, 0, out)` is a legal empty program: it returns `OMNI_OK`
+  with `out.tag == OMNI_UNDEF`, while `omni_exec(eng, NULL, n, out)` for `n > 0`
+  is `OMNI_ERR_ARG`. Node hands an empty `Buffer` over as a null pointer, and
+  `slice::from_raw_parts(null, 0)` is undefined behaviour even though it reads
+  nothing.
 
 Every entry point body runs inside `std::panic::catch_unwind`. A Rust panic
 unwinding into Python or native code is undefined behaviour and is the most common
@@ -215,6 +240,25 @@ Linker strategy: attempt the default `windows-msvc` cdylib build first and recor
 the real result; fall back to `--target x86_64-pc-windows-gnu` using the installed
 MinGW GCC if the MSVC link fails. Neither path is asserted without testing.
 
+**Outcome, recorded 2026-11-03: the MSVC attempt failed and the workspace is
+pinned to `windows-gnu`.** `cargo build --target x86_64-pc-windows-msvc` reported
+`link: missing operand after '■'`, which is not a Rust error: `where link`
+resolves to `C:\Users\m7004\.qoder\bin\git\usr\bin\link.exe`, Git for Windows'
+coreutils hard-link utility, which shadows MSVC's
+`D:\VS\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64\link.exe` and takes unrelated
+arguments. Fixing it properly means reordering `PATH` machine-wide or always
+building from a Developer Command Prompt; pinning the workspace to GNU changes
+this project only, and its `ld` is unambiguous. The machine was not authorised
+for `PATH` surgery, so `rust-toolchain.toml` pins
+`stable-x86_64-pc-windows-gnu` with the diagnosis in its comments.
+
+The MSVC route remains documented in the guide and is **not tested**, because
+installing an MSVC Rust toolchain to check would cost several hundred megabytes on
+the drive the build policy exists to protect. Nothing in the workspace depends on
+the ABI: no build script, no C compilation, and the SDKs look for `omni.dll`,
+which both toolchains emit. What differs is the import-library naming —
+`libomni.dll.a` / `libomni.a` on GNU versus `omni.lib` / `omni.dll.lib` on MSVC.
+
 ## Acceptance criteria
 
 1. `cargo test` passes for value round-trip, NaN normalisation, arena determinism,
@@ -234,3 +278,40 @@ and will be reported honestly if it cannot be met.
 Full grammar, AST and resolver; bytecode compiler and VM; stdlib and strings
 beyond the FFI copy path; Smi tagging; garbage-collected cycles; the actual wasm
 build; the Linguist pull request; publishing to PyPI or npm.
+
+## Implementation outcome (2026-11-03)
+
+Every acceptance criterion was met, measured rather than asserted.
+
+| # | Criterion | Result |
+|---|---|---|
+| 1 | `cargo test` for value round-trip, NaN normalisation, arena determinism, evaluator | met — 74 tests across four crates |
+| 2 | CLI prints `42` | met — `omni run examples/hello.omni` → `42` |
+| 3 | ctypes prints `42` | met — 29 Python tests plus the smoke check |
+| 4 | koffi prints `42` | **met** — `npm install koffi` succeeded (26 Node tests), and koffi 3.3.6 loads on Node 26 from its bundled prebuild with no install script |
+| 5 | `git check-attr` maps `.omni` to Rust and `/sdks` to vendored | met |
+| 6 | a deliberate panic returns `OMNI_ERR_PANIC` | met — asserted from Rust, C, Python, and Node, and the same engine still evaluates `1 + 1` afterwards |
+
+Deviations from this document, each recorded where it is load-bearing:
+
+1. **`OmniValue` is a struct, not a union** (amended above). It becomes a union
+   with strings.
+2. **The toolchain is pinned to `windows-gnu`, not MSVC** (amended above).
+3. **The library target is named `omni`**, not `omni_ffi`, so the artifact a host
+   loads is `omni.dll` — which is what `omni.h` and both SDKs promised from the
+   start. The manifest comment and the built file disagreed until this was fixed.
+4. **`debug = "line-tables-only"` was kept**, and it did what the design said it
+   would: `target/` measures 175 MB (114 MB `deps`, 58 MB `incremental`). Because
+   the workspace has no dependencies, nothing was fetched into `CARGO_HOME` — the
+   only file under it touched during the whole build is cargo's own
+   `.global-cache` metadata, and the 982 MB total is unchanged.
+5. **Two SDK API names changed under review.** Python's `eval` became `evaluate`
+   — shadowing the builtin in a review surface invites `exec`-adjacent confusion —
+   and Node's `OmniError` now matches Python's `.message` semantics, after a
+   constructor bug where assigning `this.message` discarded the status prefix.
+6. **Library discovery had to be reworked twice.** An installed wheel sits in
+   `site-packages`, nowhere near `target/debug`, so both SDKs walk upward from the
+   package *and* from the working directory, and each walk checks its starting
+   directory before ascending. The measured matrix is in the guide, section 6.3.
+
+Nothing in the "out of scope" list above moved into Phase 1.
