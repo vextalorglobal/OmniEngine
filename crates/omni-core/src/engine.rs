@@ -1,25 +1,38 @@
-//! The engine: a fused parse-and-evaluate pass over the Phase 1 grammar.
+//! The engine: a fused parse-and-evaluate pass over the grammar.
 //!
 //! There is no AST type here. That is deliberate rather than an oversight: an
-//! AST invented now would be discarded when the bytecode VM lands in Phase 2,
-//! and inventing it would also freeze a node shape before the resolver knows
-//! what it needs. The parser evaluates while descending, which is enough for
-//! expressions and `let`, and nothing more.
+//! AST invented now would be discarded when the bytecode VM lands, and inventing
+//! it would also freeze a node shape before the resolver knows what it needs. The
+//! parser evaluates while descending, which is enough for expressions, `let`,
+//! strings, and comparison, and nothing more.
 //!
 //! ## Memory model in this file
 //!
-//! `let` bindings are allocated in the arena and dropped wholesale at the start
-//! of the next `exec`, because a language whose top-level scope is per-execution
-//! has no reason to track them individually. Host bindings injected with
-//! [`Engine::define`] live in a plain vector instead, since they must outlive a
-//! single execution. NaN-boxed [`Value`]s are copied, so neither kind needs a
-//! pointer to the value itself.
+//! Three blocks, three lifetimes — see `docs/superpowers/specs` for the reasoning:
+//!
+//! | block | holds | reclaimed |
+//! | --- | --- | --- |
+//! | [`Engine::arena`] | `let` cells and every string built during one evaluation | `reset()` per `exec`: bulk-freed, pointers die |
+//! | [`Engine::egress`] | the promoted copy of the *result* string | `rewind()` per `exec`: cursor resets, nothing unmaps |
+//! | a host `Box<[u8]>` per [`Engine::globals`] entry | strings injected by a host | only when that name is redefined or the engine drops |
+//!
+//! The pivot is promotion: [`Engine::exec`] copies a string result out of the
+//! arena and into egress before returning, so the `Value` a caller receives — and
+//! the one kept in [`Engine::last_value`] — addresses the rewound block and never
+//! the bulk-freed one. That is what makes "valid until your next `exec`" a
+//! documentable promise instead of a use-after-free, and the failure mode when a
+//! host ignores it is a stale read rather than a crash.
+//!
+//! Reading a string's bytes is the one dereference in the crate, so it lives in
+//! [`crate::object`]; [`Engine::string_of`] is the safe door to it, and it is safe
+//! because taking `&self` means no `exec` can run while the bytes are borrowed.
 
 use std::fmt;
 
 use crate::Value;
 use crate::arena::{Arena, Slot};
 use crate::lexer::{BinOp, LexError, Token, TokenKind, lex};
+use crate::object::{self, MAX_STRING_LEN, StrRef};
 
 /// Longest identifier the arena binding cell can hold inline. A bump allocator
 /// wants fixed-size cells, so the limit is stated as a language rule rather than
@@ -31,7 +44,7 @@ pub const MAX_IDENTIFIER_LEN: usize = 32;
 pub enum ErrorKind {
     /// Source text the lexer could not read.
     Lex,
-    /// Well-formed tokens in a shape the grammar rejects.
+    /// Well-formed tokens in a shape the grammar rejects, including a bad escape.
     Parse,
     /// A program that parsed but could not be carried out.
     Runtime,
@@ -70,6 +83,42 @@ impl From<LexError> for OmniError {
     }
 }
 
+/// Why a host call was rejected. Every variant is the *caller's* fault, which is
+/// what the FFI maps onto `OMNI_ERR_ARG` rather than a compile or runtime status;
+/// a program that builds too long a string is a different failure entirely and
+/// stays a runtime error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostError {
+    /// A binding needs a name, and `""` is not one.
+    EmptyName,
+    /// Longer than [`MAX_IDENTIFIER_LEN`].
+    NameTooLong,
+    /// The payload is not UTF-8, so no host could read it back as text.
+    NotUtf8,
+    /// Longer than [`MAX_STRING_LEN`].
+    TooLong,
+}
+
+impl fmt::Display for HostError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HostError::EmptyName => f.write_str("a binding needs a non-empty name"),
+            HostError::NameTooLong => write!(
+                f,
+                "name is longer than the {MAX_IDENTIFIER_LEN}-character limit"
+            ),
+            HostError::NotUtf8 => f.write_str("string bytes are not valid UTF-8"),
+            HostError::TooLong => write!(
+                f,
+                "string is longer than the {} MiB limit",
+                MAX_STRING_LEN / (1024 * 1024)
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HostError {}
+
 /// A `let` binding stored in the arena: fixed-size inline name plus the value.
 #[derive(Debug, Clone, Copy)]
 struct Binding {
@@ -103,6 +152,38 @@ impl Binding {
     }
 }
 
+/// One persistent host-injected binding.
+///
+/// The `owned` field exists so a value and the bytes it addresses can never
+/// disagree: a string global carries its own allocation, and replacing the
+/// binding replaces both at once. That pairing is what makes the FFI's ownership
+/// check decidable — a superseded value addresses memory this engine no longer
+/// claims, so copying it out returns 0 rather than reading what used to be there.
+struct Global {
+    name: String,
+    value: Value,
+    owned: Option<Box<[u8]>>,
+}
+
+/// Counters a host reads to prove the memory story from outside Rust.
+///
+/// Fixed-width and `Copy` because the FFI hands it across the boundary as a
+/// `#[repr(C)]` struct; the field order is the wire order and is pinned there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// `exec` calls started, successful or not.
+    pub execs: u64,
+    /// String blocks built, cumulative. The one counter that is *supposed* to grow.
+    pub strings_built: u64,
+    pub arena_bytes_in_use: u64,
+    pub arena_bytes_reserved: u64,
+    pub arena_chunks: u64,
+    pub egress_bytes_in_use: u64,
+    pub egress_bytes_reserved: u64,
+    /// The largest single execution's egress demand — the bound on a rewinding block.
+    pub egress_high_water: u64,
+}
+
 /// An OmniEngine execution context.
 ///
 /// Owns its identifier strings so it carries no lifetime: a borrowed engine
@@ -110,31 +191,43 @@ impl Binding {
 /// opaque FFI handle unsound.
 pub struct Engine {
     arena: Arena,
+    egress: Arena,
     /// Arena-resident `let` bindings for the current execution.
     bindings: Vec<Slot<Binding>>,
     /// Persistent host-injected bindings.
-    globals: Vec<(String, Value)>,
+    globals: Vec<Global>,
     last_value: Value,
     last_error: Option<OmniError>,
+    execs: u64,
+    strings_built: u64,
 }
 
 impl Engine {
     pub fn new() -> Engine {
         Engine {
             arena: Arena::new(),
+            egress: Arena::new(),
             bindings: Vec::new(),
             globals: Vec::new(),
             last_value: Value::UNDEF,
             last_error: None,
+            execs: 0,
+            strings_built: 0,
         }
     }
 
     /// Run a program, returning the value of its last statement.
+    ///
+    /// A string result is promoted to the egress block on the way out, so what a
+    /// caller holds after this returns is addressed in memory that `exec` rewinds
+    /// rather than frees. Everything else this function hands back is eight bytes
+    /// with no memory behind it.
     pub fn exec(&mut self, source: &str) -> Result<Value, OmniError> {
         self.begin_execution();
         let result = self.run(source);
         match result {
             Ok(v) => {
+                let v = self.promote(v);
                 self.last_value = v;
                 self.last_error = None;
                 Ok(v)
@@ -146,12 +239,34 @@ impl Engine {
         }
     }
 
-    /// Begin a fresh execution. Clears the arena and the binding list together:
-    /// that pairing is the invariant [`Slot`] relies on, so neither may happen
-    /// without the other.
+    /// Begin a fresh execution.
+    ///
+    /// Clears the arena and the binding list together: that pairing is the
+    /// invariant [`Slot`] relies on, so neither may happen without the other. The
+    /// egress block rewinds rather than resets, because pointers into it are the
+    /// ones a host is allowed to still be holding.
     fn begin_execution(&mut self) {
         self.arena.reset();
         self.bindings.clear();
+        self.egress.rewind();
+        self.execs += 1;
+    }
+
+    /// Copy an arena-resident string result into the egress block.
+    ///
+    /// Three cases pass through untouched: not a string (nothing to promote), a
+    /// host string (already outside every block that resets), and a string already
+    /// in egress (which cannot happen mid-`exec`, but is cheap to be sure of).
+    fn promote(&mut self, value: Value) -> Value {
+        let Some(bytes) = StrRef::checked(value, &self.arena).map(|r| r.as_bytes()) else {
+            return value;
+        };
+        // Safety-free copy: `build` takes `&mut self.egress` while `bytes` borrows
+        // `self.arena`, and those are different fields, so the borrow checker
+        // allows exactly the aliasing this needs and none more.
+        let p = object::build(&mut self.egress, bytes);
+        self.strings_built += 1;
+        Value::from_ptr(p)
     }
 
     /// The most recent failure, if the last `exec` failed.
@@ -164,15 +279,152 @@ impl Engine {
         self.last_value
     }
 
-    /// Read-only view of the arena, for accounting and tests.
+    /// Read-only view of the execution arena, for accounting and tests.
     pub fn arena(&self) -> &Arena {
         &self.arena
     }
 
+    /// Read-only view of the host-facing egress block.
+    pub fn egress(&self) -> &Arena {
+        &self.egress
+    }
+
     /// Inject a binding that survives across executions. This is how a host
     /// exposes its own functions and constants to scripts.
+    ///
+    /// Redefining a name replaces the binding rather than shadowing it, so a host
+    /// that defines the same constant in a loop does not grow a vector forever —
+    /// and releasing the old allocation here is what turns the stale value a host
+    /// might still hold into an unreadable one, which is the safe answer.
     pub fn define(&mut self, name: &str, value: Value) {
-        self.globals.push((name.to_string(), value));
+        self.set_global(name, value, None);
+    }
+
+    /// Inject a string a host owns, readable by scripts as `name`.
+    ///
+    /// The bytes are copied, so the caller's buffer may be freed or reused the
+    /// moment this returns. Rejects a bad name, a non-UTF-8 payload, and an
+    /// over-long string — all of them the host's mistake, none of them a program's.
+    pub fn define_string(&mut self, name: &str, bytes: &[u8]) -> Result<(), HostError> {
+        if name.is_empty() {
+            return Err(HostError::EmptyName);
+        }
+        if name.len() > MAX_IDENTIFIER_LEN {
+            return Err(HostError::NameTooLong);
+        }
+        if bytes.len() > MAX_STRING_LEN {
+            return Err(HostError::TooLong);
+        }
+        std::str::from_utf8(bytes).map_err(|_| HostError::NotUtf8)?;
+        let owned = object::build_boxed(bytes);
+        // The box's own address is the value, so the binding and its bytes are
+        // installed by the same write and cannot be seen apart.
+        let value = Value::from_ptr(owned.as_ptr());
+        self.set_global(name, value, Some(owned));
+        self.strings_built += 1;
+        Ok(())
+    }
+
+    fn set_global(&mut self, name: &str, value: Value, owned: Option<Box<[u8]>>) {
+        match self.globals.iter_mut().find(|g| g.name == name) {
+            Some(existing) => {
+                existing.value = value;
+                existing.owned = owned;
+            }
+            None => self.globals.push(Global {
+                name: name.to_string(),
+                value,
+                owned,
+            }),
+        }
+    }
+
+    /// The language's own equality, which `Value`'s `PartialEq` cannot implement:
+    /// strings compare by content, and that needs the engine's proof that the
+    /// bytes are still on hand.
+    ///
+    /// Across types this is `false` — including `undefined == null`, because they
+    /// are different values and pretending otherwise is someone else's mistake.
+    /// Numbers keep IEEE rules, so `NaN == NaN` stays false and `0.0 == -0.0`
+    /// stays true. A string box whose bytes cannot be read equals nothing, since
+    /// the alternative is inventing a comparison against garbage.
+    pub fn eq_values(&self, lhs: Value, rhs: Value) -> bool {
+        if lhs.is_string() && rhs.is_string() {
+            return match (self.string_of(lhs), self.string_of(rhs)) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            };
+        }
+        lhs == rhs
+    }
+
+    /// The language's truthiness, complete: scalars as `Value::truthy` defines
+    /// them, plus the string rule that lives behind an address.
+    ///
+    /// A non-empty string is true, an empty one false. A box whose bytes cannot be
+    /// read is false rather than a panic — a stale pointer is a wrong answer, and
+    /// a wrong answer from a diagnostic path beats a crash in one.
+    pub fn truthy(&self, value: Value) -> bool {
+        if value.is_string() {
+            return self.string_of(value).is_some_and(|b| !b.is_empty());
+        }
+        value.truthy()
+    }
+
+    /// The bytes of a string value, wherever this engine keeps them: the
+    /// execution arena, the egress block, or a host binding's allocation.
+    ///
+    /// `None` for a non-string and for a string this engine cannot prove it owns,
+    /// which is the whole expiry rule expressed as a type.
+    pub fn string_of(&self, value: Value) -> Option<&[u8]> {
+        if let Some(r) = StrRef::checked(value, &self.arena) {
+            return Some(r.as_bytes());
+        }
+        if let Some(r) = StrRef::checked(value, &self.egress) {
+            return Some(r.as_bytes());
+        }
+        let addr = value.as_ptr()? as usize;
+        self.globals
+            .iter()
+            .find_map(|g| g.owned.as_deref().and_then(|b| object::read_boxed(b, addr)))
+    }
+
+    /// Text a program or a diagnostic should show: the *content* of a string,
+    /// unquoted, and the ordinary rendering of everything else.
+    ///
+    /// Invalid UTF-8 cannot come out of a string this engine built, so the lossy
+    /// conversion is a replacement for a panic that would otherwise fire inside
+    /// error reporting.
+    pub fn render(&self, value: Value) -> String {
+        match self.string_of(value) {
+            Some(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+            None => value.to_string(),
+        }
+    }
+
+    /// The same value the way a *literal* is written, quotes and escapes intact,
+    /// which is what a type error needs to point at: `"hi" + 42` is unambiguous
+    /// where `hi + 42` is not.
+    fn show(&self, value: Value) -> String {
+        match self.string_of(value) {
+            Some(bytes) => object::quote(bytes),
+            None => value.to_string(),
+        }
+    }
+
+    /// Counters for `omni_debug_stats` and for the tests that use the claim.
+    pub fn stats(&self) -> Stats {
+        let u64_from = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+        Stats {
+            execs: self.execs,
+            strings_built: self.strings_built,
+            arena_bytes_in_use: u64_from(self.arena.bytes_in_use()),
+            arena_bytes_reserved: u64_from(self.arena.bytes_reserved()),
+            arena_chunks: u64_from(self.arena.chunk_count()),
+            egress_bytes_in_use: u64_from(self.egress.bytes_in_use()),
+            egress_bytes_reserved: u64_from(self.egress.bytes_reserved()),
+            egress_high_water: u64_from(self.egress.high_water()),
+        }
     }
 
     fn run(&mut self, source: &str) -> Result<Value, OmniError> {
@@ -232,12 +484,31 @@ impl Engine {
                 self.globals
                     .iter()
                     .rev()
-                    .find(|(n, _)| n == name)
-                    .map(|(_, v)| *v)
+                    .find(|g| g.name == name)
+                    .map(|g| g.value)
             })
     }
 
+    /// Comparison sits one level below `+`, so `"a" + "b" == "ab"` parses as
+    /// `("a" + "b") == "ab"` and not as the nonsense the old two-level grammar
+    /// would have made of it.
     fn parse_expr(&mut self, t: &[Token<'_>], i: &mut usize) -> Result<Value, OmniError> {
+        let mut acc = self.parse_additive(t, i)?;
+        loop {
+            let want_equal = match self.peek_kind(t, *i) {
+                Some(TokenKind::EqEq) => true,
+                Some(TokenKind::NotEq) => false,
+                _ => break,
+            };
+            self.advance(i);
+            let rhs = self.parse_additive(t, i)?;
+            let same = self.eq_values(acc, rhs);
+            acc = Value::bool(if want_equal { same } else { !same });
+        }
+        Ok(acc)
+    }
+
+    fn parse_additive(&mut self, t: &[Token<'_>], i: &mut usize) -> Result<Value, OmniError> {
         let mut acc = self.parse_term(t, i)?;
         loop {
             let op = match self.peek_kind(t, *i) {
@@ -286,9 +557,17 @@ impl Engine {
         }
         let value = self.parse_primary(t, i)?;
         if negate {
-            let n = value
-                .as_f64()
-                .ok_or_else(|| self.parse_error(t, *i, "cannot apply unary '-' to a non-number"))?;
+            let n = value.as_f64().ok_or_else(|| {
+                OmniError::new(
+                    ErrorKind::Runtime,
+                    self.peek_line(t, *i),
+                    format!(
+                        "cannot apply unary '-' to {}: {}",
+                        kind_of(value),
+                        self.show(value)
+                    ),
+                )
+            })?;
             return Ok(Value::from_f64(-n));
         }
         Ok(value)
@@ -313,6 +592,14 @@ impl Engine {
                     )
                 })
             }
+            TokenKind::Str => {
+                self.advance(i);
+                // Decoding happens here, not in the lexer, so a token stays a
+                // borrowed slice and lexing allocates nothing. The line number
+                // survives the deferral because the token carries it.
+                let bytes = decode_literal(token.text, token.line)?;
+                self.new_string(&bytes, token.line, ErrorKind::Runtime)
+            }
             TokenKind::Ident => {
                 self.advance(i);
                 self.lookup(token.text).ok_or_else(|| {
@@ -334,23 +621,102 @@ impl Engine {
                 token.line,
                 "unexpected end of input",
             )),
-            other => Err(self.parse_error_kind(t, *i, other, "expected a number, a name, or '('")),
+            other => Err(self.parse_error_kind(t, *i, other, "expected a value")),
         }
     }
 
-    /// One arithmetic site, so the divide-by-zero rule is stated once.
+    /// The one place a string block enters the execution arena, and so the one
+    /// place the length limit is enforced.
+    fn new_string(&mut self, bytes: &[u8], line: u32, kind: ErrorKind) -> Result<Value, OmniError> {
+        if bytes.len() > MAX_STRING_LEN {
+            return Err(OmniError::new(
+                kind,
+                line,
+                format!(
+                    "string is {} bytes, over the {} MiB limit",
+                    bytes.len(),
+                    MAX_STRING_LEN / (1024 * 1024)
+                ),
+            ));
+        }
+        let p = object::build(&mut self.arena, bytes);
+        self.strings_built += 1;
+        Ok(Value::from_ptr(p))
+    }
+
+    /// One arithmetic site, so the divide-by-zero rule and the typed-`+` rule are
+    /// each stated once.
     ///
     /// Zero division is an error rather than IEEE infinity, because an `inf`
     /// returning through the FFI would be indistinguishable from a successful
     /// computation, and a silent wrong answer is worse than a loud failure.
-    fn arith(&self, lhs: Value, op: BinOp, rhs: Value, line: u32) -> Result<Value, OmniError> {
+    fn arith(&mut self, lhs: Value, op: BinOp, rhs: Value, line: u32) -> Result<Value, OmniError> {
+        if op == BinOp::Add {
+            return match (lhs.is_string(), rhs.is_string()) {
+                (true, true) => self.concat(lhs, rhs, line),
+                (false, false) => self.numeric(lhs, op, rhs, line),
+                _ => Err(OmniError::new(
+                    ErrorKind::Runtime,
+                    line,
+                    format!(
+                        "cannot add {} to {}: {} + {}",
+                        kind_of(lhs),
+                        kind_of(rhs),
+                        self.show(lhs),
+                        self.show(rhs)
+                    ),
+                )),
+            };
+        }
+        self.numeric(lhs, op, rhs, line)
+    }
+
+    /// `string + string`, newly allocated in the execution arena.
+    ///
+    /// A copy, not a rope: the cost of `let s = s + "x"` in a loop is quadratic
+    /// and that is a known property rather than a surprise. The bytes are gathered
+    /// into an owned buffer first so the arena borrow and the arena allocation do
+    /// not have to overlap.
+    fn concat(&mut self, lhs: Value, rhs: Value, line: u32) -> Result<Value, OmniError> {
+        let joined = {
+            let Some(a) = self.string_of(lhs) else {
+                return Err(unreadable_string(line, lhs));
+            };
+            let Some(b) = self.string_of(rhs) else {
+                return Err(unreadable_string(line, rhs));
+            };
+            let total = a.len() + b.len();
+            if total > MAX_STRING_LEN {
+                return Err(OmniError::new(
+                    ErrorKind::Runtime,
+                    line,
+                    format!(
+                        "concatenation would make a {total}-byte string, over the {} MiB limit",
+                        MAX_STRING_LEN / (1024 * 1024)
+                    ),
+                ));
+            }
+            let mut buf = Vec::with_capacity(total);
+            buf.extend_from_slice(a);
+            buf.extend_from_slice(b);
+            buf
+        };
+        self.new_string(&joined, line, ErrorKind::Runtime)
+    }
+
+    fn numeric(&self, lhs: Value, op: BinOp, rhs: Value, line: u32) -> Result<Value, OmniError> {
         let (a, b) = match (lhs.as_f64(), rhs.as_f64()) {
             (Some(a), Some(b)) => (a, b),
             _ => {
                 return Err(OmniError::new(
                     ErrorKind::Runtime,
                     line,
-                    format!("'{}' needs numbers on both sides", op.symbol()),
+                    format!(
+                        "'{}' needs numbers on both sides (found {} and {})",
+                        op.symbol(),
+                        kind_of(lhs),
+                        kind_of(rhs)
+                    ),
                 ));
             }
         };
@@ -433,10 +799,6 @@ impl Engine {
         }
     }
 
-    fn parse_error(&self, t: &[Token<'_>], i: usize, msg: &str) -> OmniError {
-        OmniError::new(ErrorKind::Parse, self.peek_line(t, i), msg.to_string())
-    }
-
     fn parse_error_kind(
         &self,
         t: &[Token<'_>],
@@ -458,12 +820,162 @@ impl Default for Engine {
     }
 }
 
+/// The name a type error uses for one value's kind. Written on `Value`'s tags
+/// rather than on the engine so it needs no bytes behind an address: a message
+/// about a stale string must not depend on reading it.
+fn kind_of(value: Value) -> &'static str {
+    if value.is_string() {
+        "string"
+    } else if value.as_bool().is_some() {
+        "boolean"
+    } else if value.is_number() {
+        "number"
+    } else if value == Value::NIL {
+        "null"
+    } else if value == Value::UNDEF {
+        "undefined"
+    } else {
+        "unknown"
+    }
+}
+
+/// The error for a string box this engine cannot read: reported as the type
+/// problem it looks like, because from the caller's side that is what it is.
+fn unreadable_string(line: u32, value: Value) -> OmniError {
+    OmniError::new(
+        ErrorKind::Runtime,
+        line,
+        format!(
+            "this string was produced by an earlier execution and its bytes are gone; \
+             re-run to get a readable one ({value})"
+        ),
+    )
+}
+
+/// Decode a string literal's escapes.
+///
+/// `\n`, `\r`, `\t`, `\"`, `\\`, and `\u{...}` with one to six hex digits. Every
+/// other byte after a backslash is an error that quotes what it found, because
+/// the two mistakes people actually make — `"\d"` for a digit and `"\x41"` from
+/// another language — are both invisible in a message that only says "bad escape".
+///
+/// `\u{...}` accepts scalars only: `0xD800..=0xDFFF` is refused as a lone
+/// surrogate and anything above `0x10FFFF` as out of range. There is no
+/// surrogate-pair joining, because these strings are UTF-8 and a code-unit escape
+/// would be a second encoding rule nobody asked for — write `"😀"` or `"\u{1F600}"`.
+fn decode_literal(raw: &str, line: u32) -> Result<Vec<u8>, OmniError> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let b = bytes[pos];
+        if b != b'\\' {
+            out.push(b);
+            pos += 1;
+            continue;
+        }
+        let Some(&esc) = bytes.get(pos + 1) else {
+            // The lexer rejects a literal that ends mid-escape; this is the
+            // cross-module assumption, checked instead of trusted.
+            return Err(OmniError::new(
+                ErrorKind::Parse,
+                line,
+                "a string literal ends with a backslash",
+            ));
+        };
+        match esc {
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'"' => out.push(b'"'),
+            b'\\' => out.push(b'\\'),
+            b'u' => {
+                // `end` is an index into `bytes`, so the caller lands on the first
+                // byte after the closing brace.
+                let (end, cp) = decode_unicode_escape(bytes, pos + 2, line)?;
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(cp.encode_utf8(&mut buf).as_bytes());
+                pos = end;
+                continue;
+            }
+            other => {
+                // Safe: the byte after an ASCII backslash starts a character, so
+                // this slice begins on a UTF-8 boundary.
+                let shown = raw[pos + 1..].chars().next().unwrap_or(other as char);
+                return Err(OmniError::new(
+                    ErrorKind::Parse,
+                    line,
+                    format!("unknown escape '\\{shown}' in a string literal"),
+                ));
+            }
+        }
+        pos += 2;
+    }
+    Ok(out)
+}
+
+/// Parse `\u{...}` starting at the byte after `u`.
+///
+/// Returns the index one past the closing brace and the scalar the braces name.
+/// Only scalars are accepted: a surrogate or an over-large value is a parse error
+/// that quotes the digits it found, because "invalid unicode escape" tells a
+/// reader nothing they can act on.
+fn decode_unicode_escape(bytes: &[u8], pos: usize, line: u32) -> Result<(usize, char), OmniError> {
+    let parse_error = |message: String| OmniError::new(ErrorKind::Parse, line, message);
+    if bytes.get(pos) != Some(&b'{') {
+        return Err(parse_error(
+            "expected '{' after '\\u' — the form is \\u{1F600}".to_string(),
+        ));
+    }
+    let digits_start = pos + 1;
+    let mut digits_end = digits_start;
+    while digits_end < bytes.len()
+        && digits_end - digits_start < 6
+        && bytes[digits_end].is_ascii_hexdigit()
+    {
+        digits_end += 1;
+    }
+    let digits = &bytes[digits_start..digits_end];
+    if digits.is_empty() {
+        return Err(parse_error(
+            "'\\u{}' needs at least one hex digit".to_string(),
+        ));
+    }
+    if bytes.get(digits_end) != Some(&b'}') {
+        let reason = if digits.len() == 6 {
+            "'\\u{...}' takes at most six hex digits".to_string()
+        } else {
+            "a hex escape must end with '}'".to_string()
+        };
+        return Err(parse_error(reason));
+    }
+    let hex = std::str::from_utf8(digits)
+        .map_err(|_| parse_error("internal: hex digits are ASCII".to_string()))?;
+    let value = u32::from_str_radix(hex, 16)
+        .map_err(|_| parse_error(format!("'\\u{{{hex}}}' is not a Unicode code point")))?;
+    let end = digits_end + 1; // one past the closing brace
+    let ch = char::from_u32(value).ok_or_else(|| {
+        parse_error(if (0xD800..=0xDFFF).contains(&value) {
+            format!(
+                "'\\u{{{hex}}}' is a lone surrogate; OmniEngine strings are UTF-8, so \
+                 write the character itself or its scalar value"
+            )
+        } else {
+            format!("'\\u{{{hex}}}' is above the last Unicode scalar (U+10FFFF)")
+        })
+    })?;
+    Ok((end, ch))
+}
+
 fn display_kind(kind: TokenKind) -> &'static str {
     match kind {
         TokenKind::Let => "'let'",
         TokenKind::Ident => "a name",
         TokenKind::Number => "a number",
+        TokenKind::Str => "a string",
         TokenKind::Eq => "'='",
+        TokenKind::EqEq => "'=='",
+        TokenKind::NotEq => "'!='",
         TokenKind::LParen => "'('",
         TokenKind::RParen => "')'",
         TokenKind::Semi => "';'",
@@ -484,6 +996,14 @@ mod tests {
 
     fn num(n: f64) -> Value {
         Value::from_f64(n)
+    }
+
+    /// Evaluate `src` and render the result, which is the only way a test can see
+    /// a string's content — the box itself prints as `<string>` by design.
+    fn text(src: &str) -> String {
+        let mut e = Engine::new();
+        let v = e.exec(src).unwrap_or_else(|e| panic!("{src} failed: {e}"));
+        e.render(v)
     }
 
     #[test]
@@ -672,5 +1192,445 @@ mod tests {
     fn errors_render_with_a_line_prefix() {
         let e = Engine::new().exec("1 / 0").unwrap_err();
         assert_eq!(e.to_string(), "line 1: division by zero");
+    }
+
+    // -- strings --------------------------------------------------------------
+
+    #[test]
+    fn a_literal_is_a_string_value_with_its_content() {
+        let mut e = Engine::new();
+        let v = e.exec("\"hello\"").unwrap();
+        assert!(v.is_string(), "the result must be in the pointer row");
+        assert_eq!(e.string_of(v).unwrap(), b"hello");
+        assert_eq!(e.render(v), "hello");
+    }
+
+    #[test]
+    fn an_empty_literal_is_a_string_not_nothing() {
+        let mut e = Engine::new();
+        let v = e.exec("\"\"").unwrap();
+        assert!(v.is_string());
+        assert_eq!(e.string_of(v).unwrap(), b"");
+        assert!(!e.truthy(v), "empty is falsy");
+    }
+
+    #[test]
+    fn a_literal_can_be_bound_and_read_back() {
+        assert_eq!(text("let greeting = \"নম্বর\"\ngreeting"), "নম্বর");
+    }
+
+    #[test]
+    fn escapes_decode_to_what_they_name() {
+        assert_eq!(text(r#""a\nb""#), "a\nb");
+        assert_eq!(text(r#""a\tb""#), "a\tb");
+        assert_eq!(text(r#""a\rb""#), "a\rb");
+        assert_eq!(text(r#""a\"b""#), "a\"b");
+        assert_eq!(text(r#""a\\b""#), "a\\b");
+        assert_eq!(text(r#""\u{41}\u{42}\u{43}""#), "ABC");
+        assert_eq!(text(r#""\u{1F600}""#), "😀");
+        assert_eq!(text("\"😀\""), "😀");
+    }
+
+    #[test]
+    fn a_lone_surrogate_escape_is_refused_and_says_why() {
+        for src in [r#""\u{D800}""#, r#""\u{dFFF}""#, r#""\u{D83D}\u{DE00}""#] {
+            let e = Engine::new().exec(src).unwrap_err();
+            assert_eq!(e.kind, ErrorKind::Parse, "{src} gave {e}");
+            assert!(
+                e.message.contains("surrogate"),
+                "{src} message was {}",
+                e.message
+            );
+        }
+    }
+
+    #[test]
+    fn a_code_point_above_the_unicode_limit_is_refused() {
+        let e = Engine::new().exec(r#""\u{110000}""#).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Parse);
+        assert!(e.message.contains("10FFFF"), "message was {e}");
+    }
+
+    #[test]
+    fn a_malformed_hex_escape_names_the_form_it_wanted() {
+        let e = Engine::new().exec(r#""\u41""#).unwrap_err();
+        assert!(e.message.contains("\\u{1F600}"), "message was {e}");
+        let e = Engine::new().exec(r#""\u{}""#).unwrap_err();
+        assert!(e.message.contains("at least one"), "message was {e}");
+        let e = Engine::new().exec(r#""\u{1234567}""#).unwrap_err();
+        assert!(e.message.contains("at most six"), "message was {e}");
+        let e = Engine::new().exec(r#""\q""#).unwrap_err();
+        assert!(
+            e.message.contains("unknown escape '\\q'"),
+            "message was {e}"
+        );
+        let e = Engine::new().exec(r#""\x41""#).unwrap_err();
+        assert!(
+            e.message.contains("unknown escape '\\x'"),
+            "message was {e}"
+        );
+    }
+
+    #[test]
+    fn a_bad_escape_is_reported_on_the_line_the_literal_starts() {
+        let e = Engine::new().exec("1 + 2\n\"ok\"\n\"bad\\q\"").unwrap_err();
+        assert_eq!((e.kind, e.line), (ErrorKind::Parse, 3), "got {e}");
+    }
+
+    #[test]
+    fn plus_concatenates_two_strings() {
+        assert_eq!(text(r#""omni" + "field""#), "omnifield");
+        assert_eq!(text(r#""a" + "b" + "c""#), "abc");
+        // Escaped rather than raw: the program here starts with two quotes, and
+        // `r###"" + "x"###` reads the content as `" + "x` — the closing delimiter
+        // is found before the empty literal it was meant to express. A plain
+        // string with `\"` says exactly which characters the lexer gets.
+        assert_eq!(text("\"\" + \"x\""), "x");
+        assert_eq!(text("\"x\" + \"\""), "x");
+        assert_eq!(text(r#""\n" + "x""#), "\nx");
+    }
+
+    #[test]
+    fn plus_still_adds_two_numbers() {
+        assert_eq!(ev("1 + 2"), num(3.0));
+        assert_eq!(ev("let a = 1\na + 1"), num(2.0));
+    }
+
+    #[test]
+    fn mixing_a_string_and_a_number_in_addition_names_both_operands() {
+        let e = Engine::new().exec(r#""hi" + 42"#).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Runtime);
+        assert_eq!(
+            e.message, r#"cannot add string to number: "hi" + 42"#,
+            "the message the requester asked for, verbatim"
+        );
+        let e = Engine::new().exec(r#"42 + "hi""#).unwrap_err();
+        assert_eq!(e.message, r#"cannot add number to string: 42 + "hi""#);
+        // A boolean operand reaches the same arm. `("a" == "b")` rather than a
+        // `true` literal, because the grammar has no boolean literals yet — the
+        // only booleans a program can write come out of a comparison.
+        let e = Engine::new().exec(r#"("a" == "b") + "hi""#).unwrap_err();
+        assert_eq!(e.message, r#"cannot add boolean to string: false + "hi""#);
+    }
+
+    #[test]
+    fn other_operators_report_the_types_they_found() {
+        let e = Engine::new().exec(r#""a" - "b""#).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Runtime);
+        assert_eq!(
+            e.message,
+            "'-' needs numbers on both sides (found string and string)"
+        );
+        let e = Engine::new().exec(r#"6 / "b""#).unwrap_err();
+        assert_eq!(
+            e.message,
+            "'/' needs numbers on both sides (found number and string)"
+        );
+    }
+
+    #[test]
+    fn equality_compares_string_content_not_addresses() {
+        // Two separately built blocks in one execution holding the same bytes:
+        // `Value`'s PartialEq says different boxes, the language says equal. They
+        // have to come from the same arena, because a fresh engine starts its bump
+        // cursor at the same address every time and two identical boxes would then
+        // compare equal by accident rather than by design.
+        let mut e = Engine::new();
+        let one = e.new_string(b"ab", 1, ErrorKind::Runtime).unwrap();
+        let two = e.new_string(b"ab", 1, ErrorKind::Runtime).unwrap();
+        assert_ne!(one, two, "the boxes are different allocations");
+        assert!(e.eq_values(one, two), "and the language calls them equal");
+        assert_eq!(e.exec(r#""ab" == "a" + "b""#).unwrap(), Value::TRUE);
+        assert_eq!(e.exec(r#""ab" != "a" + "b""#).unwrap(), Value::FALSE);
+        assert_eq!(e.exec(r#""ab" == "ba""#).unwrap(), Value::FALSE);
+        assert_eq!(e.exec(r#""ab" != "ba""#).unwrap(), Value::TRUE);
+    }
+
+    /// The grammar has no `null` or `true` literal yet — that is a line in the
+    /// roadmap, not a gap here — so the cross-type rules are tested where they are
+    /// implemented, on values the FFI can produce even if a script cannot.
+    #[test]
+    fn equality_across_types_is_false_and_inequality_is_true() {
+        let mut e = Engine::new();
+        let s = e.exec(r#""1""#).unwrap();
+        let n = e.exec("1").unwrap();
+        for (lhs, rhs) in [
+            (s, n),
+            (n, s),
+            (n, Value::NIL),
+            (Value::NIL, Value::UNDEF),
+            (Value::TRUE, s),
+            (Value::UNDEF, s),
+        ] {
+            assert!(
+                !e.eq_values(lhs, rhs),
+                "{} and {} must not be equal",
+                kind_of(lhs),
+                kind_of(rhs)
+            );
+        }
+        // And the parser agrees, for the one cross-type pair a program can write.
+        assert_eq!(e.exec(r#""1" == 1"#).unwrap(), Value::FALSE);
+        assert_eq!(e.exec(r#""1" != 1"#).unwrap(), Value::TRUE);
+    }
+
+    #[test]
+    fn number_equality_keeps_ieee_rules() {
+        let mut e = Engine::new();
+        assert_eq!(e.exec("1 == 1").unwrap(), Value::TRUE);
+        assert_eq!(e.exec("0 == -0").unwrap(), Value::TRUE);
+        assert_eq!(
+            e.exec("0.1 + 0.2 == 0.3").unwrap(),
+            Value::FALSE,
+            "IEEE, honestly: the classic rounding miss is not equal"
+        );
+        assert_eq!(e.exec("0.1 + 0.2 != 0.3").unwrap(), Value::TRUE);
+        assert_eq!(e.exec("1 + 0.1 + 0.2 == 1.3").unwrap(), Value::TRUE);
+        // Singletons compare by tag, so identical ones are equal and distinct ones
+        // are not — reachable through the engine even without literals for them.
+        assert!(e.eq_values(Value::TRUE, Value::TRUE));
+        assert!(!e.eq_values(Value::TRUE, Value::FALSE));
+        assert!(!e.eq_values(Value::NIL, Value::UNDEF));
+        // A NaN is not equal to itself, and `Value::from_f64` normalises every NaN
+        // to the canonical box — so two NaNs of different payloads arrive as the
+        // same bits and still compare unequal. That is the IEEE rule surviving the
+        // normalisation, not an artefact of it.
+        let nan = num(f64::NAN);
+        assert!(!e.eq_values(nan, nan));
+        assert_eq!(
+            num(f64::NAN / 2.0).bits(),
+            nan.bits(),
+            "a payload-carrying NaN normalises to the canonical box"
+        );
+        assert!(
+            !e.eq_values(nan, num(f64::NAN / 2.0)),
+            "identical NaN boxes must still be unequal, or `NaN != NaN` is broken"
+        );
+    }
+
+    #[test]
+    fn comparison_is_looser_than_addition() {
+        assert_eq!(ev(r#""a" + "b" == "ab""#), Value::TRUE);
+        assert_eq!(ev(r#"1 + 2 == 3"#), Value::TRUE);
+        assert_eq!(ev(r#"1 + 2 == "3""#), Value::FALSE);
+    }
+
+    #[test]
+    fn truthiness_of_a_string_is_emptiness() {
+        let mut e = Engine::new();
+        // One value per exec, read before the next exec rewinds egress: the stale
+        // rule applies to these too, so the assertions are sequenced rather than
+        // nested.
+        let filled = e.exec("\"x\"").unwrap();
+        assert!(e.truthy(filled));
+        let empty = e.exec("\"\"").unwrap();
+        assert!(!e.truthy(empty));
+        assert!(e.truthy(num(1.0)));
+        assert!(!e.truthy(num(0.0)));
+        assert!(!e.truthy(Value::UNDEF));
+    }
+
+    #[test]
+    fn a_stale_string_is_readable_until_overwritten_and_never_crashes() {
+        // The documented expiry rule, tested rather than asserted in a comment:
+        // the block rewinds, so the bytes stay mapped and the address stays
+        // owned. What a caller loses is the content, not the process.
+        let mut e = Engine::new();
+        let first = e.exec("\"first\"").unwrap();
+        assert_eq!(e.string_of(first).unwrap(), b"first");
+        let _ = e.exec("\"second\"").unwrap();
+        let read = e.string_of(first);
+        assert!(read.is_some(), "a rewind unmaps nothing");
+        assert_ne!(read.unwrap(), b"first", "and the same slot was reused");
+    }
+
+    #[test]
+    fn a_result_string_lives_in_egress_not_the_execution_arena() {
+        let mut e = Engine::new();
+        let v = e.exec(r#""a" + "b""#).unwrap();
+        let addr = v.as_ptr().unwrap() as usize;
+        assert!(
+            e.egress().owns(addr),
+            "the value a host holds must address the rewinding block"
+        );
+        assert!(
+            StrRef::checked(v, e.arena()).is_none(),
+            "and never the block that resets"
+        );
+    }
+
+    #[test]
+    fn the_result_survives_a_reset_of_the_execution_arena() {
+        let mut e = Engine::new();
+        let v = e.exec("let x = \"keep me\"\nx + \"\"").unwrap();
+        let before = e.string_of(v).unwrap().to_vec();
+        // An execution that allocates heavily and fails must not disturb egress.
+        let _ = e.exec("1 +").unwrap_err();
+        assert_eq!(e.string_of(v).map(|b| b.to_vec()), Some(before));
+    }
+
+    #[test]
+    fn define_string_injects_a_host_string_a_program_can_read() {
+        let mut e = Engine::new();
+        e.define_string("who", b"world").unwrap();
+        assert_eq!(text_of(&mut e, r#""hello, " + who"#), "hello, world");
+        // And it survives an execution boundary, which is why it is not in the arena.
+        assert_eq!(text_of(&mut e, "who"), "world");
+    }
+
+    #[test]
+    fn a_host_string_can_be_compared_for_content() {
+        let mut e = Engine::new();
+        e.define_string("greeting", b"hi").unwrap();
+        assert_eq!(e.exec("greeting == \"hi\"").unwrap(), Value::TRUE);
+        assert_eq!(e.exec("greeting == \"hi\" + \"\"").unwrap(), Value::TRUE);
+    }
+
+    #[test]
+    fn redefining_a_host_name_replaces_it_rather_than_accumulating() {
+        let mut e = Engine::new();
+        for _ in 0..500 {
+            e.define_string("x", b"value").unwrap();
+        }
+        assert_eq!(e.globals.len(), 1, "a loop must not grow the binding list");
+        e.define_string("x", b"other").unwrap();
+        assert_eq!(text_of(&mut e, "x"), "other");
+    }
+
+    #[test]
+    fn a_superseded_host_string_is_not_readable_as_a_string() {
+        let mut e = Engine::new();
+        e.define_string("x", b"first").unwrap();
+        let stale = e.exec("x").unwrap();
+        e.define_string("x", b"second").unwrap();
+        // The allocation behind `stale` is gone; the engine must not read it.
+        assert!(e.string_of(stale).is_none());
+        assert_eq!(text_of(&mut e, "x"), "second");
+    }
+
+    #[test]
+    fn define_string_rejects_bad_arguments_with_a_distinct_reason() {
+        let mut e = Engine::new();
+        assert_eq!(e.define_string("", b"x").unwrap_err(), HostError::EmptyName);
+        assert_eq!(
+            e.define_string(&"a".repeat(MAX_IDENTIFIER_LEN + 1), b"x")
+                .unwrap_err(),
+            HostError::NameTooLong
+        );
+        assert_eq!(
+            e.define_string("x", &[0xFF, 0xFE]).unwrap_err(),
+            HostError::NotUtf8
+        );
+        assert_eq!(
+            e.define_string("x", b"").unwrap(),
+            (),
+            "an empty payload is a legitimate string"
+        );
+        assert_eq!(
+            e.define_string("y", &vec![b'a'; MAX_STRING_LEN + 1])
+                .unwrap_err(),
+            HostError::TooLong
+        );
+    }
+
+    #[test]
+    fn a_program_cannot_build_a_string_over_the_limit() {
+        // A *program* doing it is a runtime error, not an argument error: the
+        // distinction the ABI's status codes are built on. The limit is 16 MiB of
+        // payload, so the block at exactly the limit is accepted and one byte more
+        // is refused at the one place that enforces it.
+        let mut engine = Engine::new();
+        let src = format!("let big = \"{}\"", "x".repeat(1024));
+        assert_eq!(
+            text_of(&mut engine, &src).len(),
+            1024,
+            "under the limit works"
+        );
+        let at_the_limit = engine.new_string(&vec![b'x'; MAX_STRING_LEN], 1, ErrorKind::Runtime);
+        assert!(at_the_limit.is_ok(), "the limit is inclusive");
+        let over = engine
+            .new_string(&vec![b'x'; MAX_STRING_LEN + 1], 1, ErrorKind::Runtime)
+            .unwrap_err();
+        assert_eq!(over.kind, ErrorKind::Runtime);
+        assert!(over.message.contains("16 MiB"), "message was {over}");
+    }
+
+    #[test]
+    fn string_stats_stay_flat_across_many_executions() {
+        let mut e = Engine::new();
+        let _ = e.exec(r#"let a = "x" + "y""#);
+        let warm = e.stats();
+        for _ in 0..2000 {
+            let _ = e.exec(r#"let a = "x" + "yy"; a + "z" == "xyyz""#);
+        }
+        let after = e.stats();
+        assert_eq!(after.execs, warm.execs + 2000);
+        assert!(after.strings_built > warm.strings_built, "work happened");
+        assert_eq!(after.arena_chunks, warm.arena_chunks, "no new chunks");
+        assert_eq!(
+            after.arena_bytes_reserved, warm.arena_bytes_reserved,
+            "the arena stopped growing"
+        );
+        assert_eq!(
+            after.egress_bytes_reserved, warm.egress_bytes_reserved,
+            "the egress block stopped growing"
+        );
+    }
+
+    #[test]
+    fn a_large_string_result_reuses_one_egress_block() {
+        // The case that would otherwise break the model: 100 KiB does not fit a
+        // 64 KiB chunk, so every promotion wants an oversize block, and a rewind
+        // that cannot reuse one would grow forever.
+        let mut e = Engine::new();
+        let big = "\"".to_string() + &"x".repeat(100_000) + "\"";
+        let _ = e.exec(&big).unwrap();
+        let warm = e.stats();
+        for _ in 0..50 {
+            let _ = e.exec(&big).unwrap();
+        }
+        let after = e.stats();
+        assert_eq!(after.egress_bytes_reserved, warm.egress_bytes_reserved);
+        assert_eq!(text_of(&mut e, &big).len(), 100_000);
+    }
+
+    #[test]
+    fn a_non_string_result_is_not_promoted_or_copied() {
+        let mut e = Engine::new();
+        let v = e.exec("1 + 2").unwrap();
+        assert_eq!(v, num(3.0));
+        assert_eq!(e.stats().strings_built, 0, "no string was built at all");
+    }
+
+    /// The claim "zero-overhead performance", made checkable. `live()` counts this
+    /// thread's bytes in the global allocator, so anything the engine fails to free
+    /// shows up as a positive delta over 100,000 executions.
+    #[test]
+    fn a_hundred_thousand_string_executions_leak_nothing() {
+        let mut e = Engine::new();
+        let src = r#"let a = "hello"; a + ", " + "world" == "hello, world""#;
+        for _ in 0..200 {
+            let _ = e.exec(src);
+        }
+        let before = crate::counted::live();
+        for _ in 0..100_000 {
+            let v = e.exec(src).unwrap();
+            assert_eq!(v, Value::TRUE);
+        }
+        let after = crate::counted::live();
+        assert_eq!(
+            after - before,
+            0,
+            "{} bytes left behind by 100,000 executions",
+            after - before
+        );
+        assert_eq!(e.stats().execs, 100_200);
+    }
+
+    fn text_of(e: &mut Engine, src: &str) -> String {
+        let v = e
+            .exec(src)
+            .unwrap_or_else(|err| panic!("{src} failed: {err}"));
+        e.render(v)
     }
 }

@@ -7,7 +7,7 @@
 use std::io::{Read, Write};
 use std::process::ExitCode;
 
-use omni_core::{Engine, Value};
+use omni_core::Engine;
 
 const USAGE: &str = "\
 omni — the OmniEngine command
@@ -97,16 +97,17 @@ fn read_file(path: &str) -> Result<String, String> {
 fn evaluate(source: &str, path: Option<&str>) -> Result<Option<String>, String> {
     let mut engine = Engine::new();
     match engine.exec(source) {
-        Ok(value) => Ok(Some(render(value))),
+        // Rendered through the engine, not `Value`'s own `Display`: a string box
+        // prints as `<string>` on purpose, because following its address is
+        // something only the engine that owns the bytes may do. A CLI is exactly
+        // where a program's string result should be readable, so it asks the
+        // owner.
+        Ok(value) => Ok(Some(engine.render(value))),
         Err(error) => Err(match path {
             Some(p) => format!("{p}: {error}"),
             None => error.to_string(),
         }),
     }
-}
-
-fn render(value: Value) -> String {
-    value.to_string()
 }
 
 #[cfg(test)]
@@ -173,7 +174,26 @@ mod tests {
 
     #[test]
     fn integral_values_render_without_a_trailing_zero() {
-        assert_eq!(render(Value::from_f64(42.0)), "42");
-        assert_eq!(render(Value::from_f64(2.5)), "2.5");
+        assert_eq!(evaluate("40 + 2", None).unwrap().as_deref(), Some("42"));
+        assert_eq!(evaluate("2.5", None).unwrap().as_deref(), Some("2.5"));
+        assert_eq!(evaluate("-0.0", None).unwrap().as_deref(), Some("0"));
+    }
+
+    /// The point of routing through `Engine::render`: a string result is the
+    /// text, not the placeholder `Value`'s own `Display` prints for a box it
+    /// cannot prove is live.
+    #[test]
+    fn a_string_result_prints_its_content() {
+        assert_eq!(
+            evaluate(r#"let who = "world"; "hello, " + who"#, None)
+                .unwrap()
+                .as_deref(),
+            Some("hello, world")
+        );
+        assert_eq!(evaluate(r#""""#, None).unwrap().as_deref(), Some(""));
+        assert_eq!(
+            evaluate(r#""tab\there""#, None).unwrap().as_deref(),
+            Some("tab\there")
+        );
     }
 }

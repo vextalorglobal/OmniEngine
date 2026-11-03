@@ -35,8 +35,21 @@ pub enum TokenKind {
     Let,
     Ident,
     Number,
+    /// A string literal's *contents*, quotes removed, escapes not yet decoded.
+    ///
+    /// Two decisions live in that one variant. Keeping the raw slice means lexing
+    /// still allocates nothing but the token vector, which is the whole reason the
+    /// lexer is allocation-free. And deferring decoding means a bad escape is
+    /// reported where the value and the line number are both at hand — evaluation
+    /// — rather than in a second pass over text that has already been accepted.
+    Str,
     BinOp(BinOp),
     Eq,
+    /// `==`, folded into one token for the same reason `BinOp` is: the parser
+    /// tests for an operator, not for two punctuation marks.
+    EqEq,
+    /// `!=`.
+    NotEq,
     LParen,
     RParen,
     /// Accepted and ignored. Optional in OmniEngine, present so a C-style
@@ -62,11 +75,14 @@ pub struct LexError {
 }
 
 impl LexError {
-    fn new(line: u32, column: u32, message: String) -> LexError {
+    /// `impl Into<String>` rather than `String`, so a caller writing a literal
+    /// does not have to say `.to_string()` five times for the same effect — and
+    /// the one caller with a `format!` still compiles.
+    fn new(line: u32, column: u32, message: impl Into<String>) -> LexError {
         LexError {
             line,
             column,
-            message,
+            message: message.into(),
         }
     }
 }
@@ -110,6 +126,16 @@ pub fn lex(source: &str) -> Result<Vec<Token<'_>>, LexError> {
                     pos += 1;
                 }
             }
+            // `==` before `=`: match arms are tried in order, so the two-byte
+            // guard has to come first or `a == b` lexes as two binding operators.
+            b'=' if bytes.get(pos + 1) == Some(&b'=') => {
+                tokens.push(Token {
+                    kind: TokenKind::EqEq,
+                    text: "==",
+                    line,
+                });
+                pos += 2;
+            }
             b'=' => {
                 tokens.push(Token {
                     kind: TokenKind::Eq,
@@ -117,6 +143,88 @@ pub fn lex(source: &str) -> Result<Vec<Token<'_>>, LexError> {
                     line,
                 });
                 pos += 1;
+            }
+            b'!' if bytes.get(pos + 1) == Some(&b'=') => {
+                tokens.push(Token {
+                    kind: TokenKind::NotEq,
+                    text: "!=",
+                    line,
+                });
+                pos += 2;
+            }
+            // A bare `!` reaches the catch-all only when it is not `!=`, and the
+            // catch-all's message would be "unexpected character '!'" — true, but
+            // the useful one names the operator the reader probably meant.
+            b'!' => {
+                return Err(LexError::new(
+                    line,
+                    column,
+                    "unexpected character '!'; OmniEngine has '!=' but no unary '!'",
+                ));
+            }
+            b'"' => {
+                // The opening quote owns the position of every error raised here,
+                // because "unterminated" points at the string, not at the byte
+                // where the scan gave up.
+                let open_line = line;
+                let open_column = column;
+                pos += 1;
+                let start = pos;
+                loop {
+                    if pos >= bytes.len() {
+                        return Err(LexError::new(
+                            open_line,
+                            open_column,
+                            "unterminated string literal",
+                        ));
+                    }
+                    match bytes[pos] {
+                        b'"' => break,
+                        b'\n' | b'\r' => {
+                            // Multi-line literals are not in the grammar, so the
+                            // error says so rather than echoing "unterminated"
+                            // about a quote the reader can plainly see closed.
+                            return Err(LexError::new(
+                                open_line,
+                                open_column,
+                                "a string literal cannot span lines",
+                            ));
+                        }
+                        b'\\' => {
+                            // Skip the escape's body so `\"` does not close the
+                            // literal. Which escapes are legal is decided on
+                            // decoding; the lexer only has to find the end.
+                            if pos + 1 >= bytes.len() {
+                                return Err(LexError::new(
+                                    open_line,
+                                    open_column,
+                                    "unterminated string literal",
+                                ));
+                            }
+                            if matches!(bytes[pos + 1], b'\n' | b'\r') {
+                                return Err(LexError::new(
+                                    open_line,
+                                    open_column,
+                                    "a backslash before a newline is not a line continuation",
+                                ));
+                            }
+                            pos += 2;
+                        }
+                        // Any other byte, including every continuation byte of a
+                        // multi-byte character, is payload: `"` and `\` are ASCII,
+                        // and UTF-8 never uses a byte >= 0x80 to imitate one.
+                        _ => pos += 1,
+                    }
+                }
+                let text = source
+                    .get(start..pos)
+                    .ok_or_else(|| LexError::new(open_line, open_column, "invalid UTF-8"))?;
+                tokens.push(Token {
+                    kind: TokenKind::Str,
+                    text,
+                    line: open_line,
+                });
+                pos += 1; // step over the closing quote
             }
             b'+' => {
                 tokens.push(Token {
@@ -461,5 +569,121 @@ mod tests {
         let toks = lex("1\n2\n\n3").unwrap();
         let lines: Vec<u32> = toks.iter().map(|t| t.line).collect();
         assert_eq!(lines, vec![1, 2, 4, 4]);
+    }
+
+    fn body(src: &str) -> String {
+        lex(src)
+            .unwrap()
+            .iter()
+            .find(|t| t.kind == TokenKind::Str)
+            .map(|t| t.text.to_string())
+            .expect("no string token")
+    }
+
+    #[test]
+    fn a_string_literal_is_one_token_holding_its_contents() {
+        assert_eq!(kinds(r#""hi""#), vec![TokenKind::Str, TokenKind::Eof]);
+        assert_eq!(body(r#""hi""#), "hi");
+        assert_eq!(body("\"\""), "");
+        assert_eq!(body("\"two words\""), "two words");
+    }
+
+    /// The lexer finds the end of a literal; it does not interpret it. That is
+    /// what lets a token stay a borrowed slice, and it means the raw backslashes
+    /// survive to be decoded by the evaluator, where the line number is known.
+    #[test]
+    fn escapes_are_scanned_over_not_decoded() {
+        assert_eq!(body(r#""a\"b""#), r#"a\"b"#);
+        assert_eq!(body(r#""\\""#), r#"\\"#);
+        assert_eq!(body(r#""tab\there""#), r"tab\there");
+        assert_eq!(body(r#""\u{41}A""#), r"\u{41}A");
+        // An escape the grammar does not have still lexes, because only
+        // evaluation can say which escapes are legal and report the line.
+        assert_eq!(body(r#""\q""#), r"\q");
+    }
+
+    #[test]
+    fn a_literal_never_spans_lines_and_says_where_it_opened() {
+        let e = lex("\"a\nb\"").unwrap_err();
+        assert_eq!((e.line, e.column), (1, 1), "position is the opening quote");
+        assert!(e.message.contains("cannot span lines"), "{e}");
+
+        let e = lex("1 +\n  \"oops\n").unwrap_err();
+        assert_eq!((e.line, e.column), (2, 3), "the opening quote of line 2");
+
+        let e = lex("\"unterminated").unwrap_err();
+        assert!(e.message.contains("unterminated"), "{e}");
+
+        let e = lex("\"trailing backslash\\").unwrap_err();
+        assert!(e.message.contains("unterminated"), "{e}");
+
+        // A backslash-newline would otherwise swallow the newline and lose the
+        // line count, so it is refused rather than half-supported.
+        let e = lex("\"a\\\nb\"").unwrap_err();
+        assert!(e.message.contains("line continuation"), "{e}");
+    }
+
+    #[test]
+    fn double_equals_is_one_token_and_a_single_equals_still_binds() {
+        assert_eq!(
+            kinds("1 == 2"),
+            vec![
+                TokenKind::Number,
+                TokenKind::EqEq,
+                TokenKind::Number,
+                TokenKind::Eof
+            ]
+        );
+        assert_eq!(
+            kinds("x = 1"),
+            vec![
+                TokenKind::Ident,
+                TokenKind::Eq,
+                TokenKind::Number,
+                TokenKind::Eof
+            ]
+        );
+        assert_eq!(
+            kinds("1 != 2"),
+            vec![
+                TokenKind::Number,
+                TokenKind::NotEq,
+                TokenKind::Number,
+                TokenKind::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bare_bang_explains_what_it_wanted_to_be() {
+        let e = lex("1 ! 2").unwrap_err();
+        assert!(e.message.contains("!='"), "message was {e}");
+        assert_eq!((e.line, e.column), (1, 3));
+    }
+
+    #[test]
+    fn non_ascii_bytes_inside_a_literal_are_payload() {
+        assert_eq!(body("\"✄ ok\""), "✄ ok");
+        assert_eq!(body("\"নম্বর\""), "নম্বর");
+        // And the token after a multi-byte literal is still on the right line.
+        let toks = lex("\"✄\"\n\"🎯\"").unwrap();
+        assert_eq!(toks.len(), 3, "two literals and an Eof");
+        assert_eq!(toks[0].line, 1);
+        assert_eq!(toks[1].line, 2);
+        assert_eq!(toks[2].line, 2, "Eof carries the last line");
+    }
+
+    #[test]
+    fn a_string_token_borrows_the_source_like_every_other_token() {
+        let src = String::from("let s = \"hi\"");
+        let toks = lex(&src).unwrap();
+        let s = toks.iter().find(|t| t.kind == TokenKind::Str).unwrap();
+        // Safety: byte offset 9 is the `h` inside the literal — `let s = "` is
+        // nine bytes — so the pointer is in bounds, and the claim under test is
+        // that the token *is* that pointer rather than a copy of it.
+        assert!(std::ptr::eq(s.text.as_ptr(), unsafe {
+            src.as_ptr().add(9)
+        }));
+        assert_eq!(s.text, "hi");
     }
 }

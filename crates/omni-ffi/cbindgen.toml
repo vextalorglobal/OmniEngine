@@ -21,8 +21,10 @@ parse_deps = false
 
 [export]
 # The handle is forward-declared and never exposed; everything else public is
-# part of the ABI.
-include = ["OmniValue", "OmniEngine"]
+# part of the ABI. `OmniPayload` is the union inside `OmniValue` and `OmniStats`
+# is what `omni_debug_stats` writes: both arrived with ABI v2 and both must be
+# listed, or regeneration silently omits a type the header needs.
+include = ["OmniValue", "OmniPayload", "OmniStats", "OmniEngine"]
 
 [export.rename]
 "OmniEngine" = "OmniEngine"

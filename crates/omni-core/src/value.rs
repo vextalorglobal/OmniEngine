@@ -73,6 +73,18 @@ impl Value {
         self.0 >> 48 == PTR_ROW_SHIFTED
     }
 
+    /// The pointer row's one tenant: a string block.
+    ///
+    /// This is an alias for [`Value::is_pointer`] today, and that is the point of
+    /// naming it: the row carries no type tag, so adding a second compound type
+    /// means splitting the row — a nibble for the kind, 44 bits of address — not
+    /// overloading it a second time. The two functions are separate so that change
+    /// has to be made in a place that is asking the question.
+    #[inline]
+    pub fn is_string(self) -> bool {
+        self.is_pointer()
+    }
+
     /// True for the reserved singleton slots 1..=15 of the canonical-NaN row.
     /// Slot 0 is the double NaN itself and must remain a number.
     #[inline]
@@ -120,13 +132,17 @@ impl Value {
         }
     }
 
-    /// Box a heap address.
+    /// Box a heap address, which is to say: box a string.
     ///
     /// # Safety
     ///
     /// Callers must pass an address whose top 16 bits are zero. A kernel or
     /// tagged pointer would be silently truncated to 48 bits; the debug build
-    /// asserts it, the release build does not.
+    /// asserts it, the release build does not. The address must then hold a
+    /// block written by [`crate::object::build`], because nothing here can check
+    /// what a box points at — that check is [`StrRef::checked`].
+    ///
+    /// [`StrRef::checked`]: crate::object::StrRef::checked
     #[inline]
     pub fn from_ptr(ptr: *const u8) -> Value {
         let raw = ptr as u64;
@@ -142,8 +158,16 @@ impl Value {
             .then_some((self.0 & ADDR_MASK) as *const u8)
     }
 
-    /// OmniEngine truthiness: false for `null`, `undefined`, `false`, `0`, and
-    /// `NaN`; true otherwise.
+    /// OmniEngine truthiness **for scalars**: false for `null`, `undefined`,
+    /// `false`, `0`, and `NaN`; true otherwise.
+    ///
+    /// A string box answers `false` here, and that is *not* the language rule —
+    /// the rule is "empty is falsy, anything else is truthy" — because the length
+    /// that decides it lives behind the address, and this method has no proof the
+    /// bytes are still mapped. [`Engine::truthy`](crate::engine::Engine::truthy)
+    /// is the complete rule. This stays as a scalar-only helper so the tag
+    /// semantics are tested where the tags are defined, and the pointer arm is
+    /// written down rather than left to fall through by accident.
     #[inline]
     pub fn truthy(self) -> bool {
         match self.as_bool() {
@@ -160,6 +184,15 @@ impl Value {
 }
 
 impl PartialEq for Value {
+    /// Rust equality, which is **not** the language's `==`.
+    ///
+    /// Numbers follow IEEE, so `NaN != NaN` and `0.0 == -0.0`. Everything else
+    /// compares by tag bits, which for two strings means *identity*: two boxes
+    /// holding `"ab"` built by two different concatenations are different values
+    /// here. That is deliberate. Content equality needs the bytes, and the bytes
+    /// are the engine's to prove live, so `==` is implemented by
+    /// [`Engine::eq_values`](crate::engine::Engine::eq_values) and this impl stays
+    /// infallible, safe, and pointer-blind.
     fn eq(&self, other: &Value) -> bool {
         match (self.as_f64(), other.as_f64()) {
             // Both numbers: follow IEEE, so NaN != NaN and 0.0 == -0.0.
@@ -186,6 +219,14 @@ impl From<bool> for Value {
 }
 
 impl fmt::Display for Value {
+    /// Textual form of the *box*, not of the value.
+    ///
+    /// A string prints as `<string>` because following its address here would put
+    /// an unbounded dereference inside a `fmt` call — reachable from a `panic!`,
+    /// from a `dbg!`, from anywhere — which is exactly the kind of unsafe-in-
+    /// disguise this crate confines to [`crate::object`]. The form a program or a
+    /// diagnostic should use is [`Engine::render`](crate::engine::Engine::render),
+    /// which borrows the engine that owns the bytes and prints the real text.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.as_f64() {
             Some(n) if n.is_nan() => f.write_str("NaN"),
@@ -202,7 +243,8 @@ impl fmt::Display for Value {
             None if self.as_bool() == Some(false) => f.write_str("false"),
             None if self.0 == Value::NIL.0 => f.write_str("null"),
             None if self.0 == Value::UNDEF.0 => f.write_str("undefined"),
-            None => f.write_str("<object>"),
+            None if self.is_string() => f.write_str("<string>"),
+            None => f.write_str("<unknown>"),
         }
     }
 }
@@ -288,6 +330,21 @@ mod tests {
         assert!(!v.is_double());
         assert!(!v.is_number());
         assert_eq!(v.as_ptr(), Some(p.cast_const()));
+    }
+
+    #[test]
+    fn a_string_box_is_a_string_and_prints_as_one() {
+        let mut x: u64 = 7;
+        let p = std::ptr::addr_of_mut!(x).cast::<u8>();
+        let v = Value::from_ptr(p);
+        assert!(v.is_string(), "the pointer row has exactly one tenant");
+        assert_eq!(v.is_string(), v.is_pointer());
+        assert!(!v.is_number());
+        // Display must not follow the address. This is the whole point: the box
+        // prints a placeholder even though the bytes it addresses are readable.
+        assert_eq!(v.to_string(), "<string>");
+        // And truthiness here is a documented scalar-only answer, not a bug.
+        assert!(!v.truthy());
     }
 
     #[test]
