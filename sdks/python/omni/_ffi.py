@@ -20,6 +20,14 @@ Python FFI usually breaks in production:
    this module declares and refuses to return a library that disagrees, so a
    stale ``omni.dll`` is one clear error at import instead of a wrong number
    ten thousand calls later.
+4. **A callback's memory is the engine's, and only while the callback runs.**
+   Version 3 lets Python own a function a script calls. Inside that function,
+   an argument string points into the engine's arena and is copied with
+   :func:`ctypes.string_at` -- :func:`omni_str_copy` cannot be used, because it
+   is a call into the engine and the engine is already inside the call that
+   invoked us. Conversely, a string we hand *back* must outlive the return: the
+   engine reads ``out`` after our trampoline has already given control to C, so
+   each binding keeps its last output buffer until the next call replaces it.
 """
 
 from __future__ import annotations
@@ -29,6 +37,7 @@ import ctypes
 import os
 import platform
 import sys
+from collections.abc import Callable
 from ctypes import (
     POINTER,
     Structure,
@@ -36,10 +45,13 @@ from ctypes import (
     byref,
     c_char_p,
     c_double,
+    c_int32,
     c_size_t,
     c_uint32,
     c_uint64,
     c_void_p,
+    create_string_buffer,
+    string_at,
 )
 from dataclasses import dataclass
 
@@ -49,12 +61,18 @@ __all__ = [
     "MAX_SOURCE_LEN",
     "MAX_STRING_LEN",
     "MAX_IDENTIFIER_LEN",
+    "MAX_ARGS",
+    "MAX_CALL_DEPTH",
     "OMNI_ABI_VERSION",
+    "OMNI_HOST_OK",
+    "OMNI_HOST_ERR",
+    "HOST_FN",
     "OmniPayload",
     "OmniValue",
     "OmniStats",
     "Stats",
     "RawEngine",
+    "HostFunction",
     "OmniError",
     "OmniLibraryError",
     "load_library",
@@ -69,6 +87,8 @@ OMNI_ERR_COMPILE = 1
 OMNI_ERR_RUNTIME = 2
 OMNI_ERR_PANIC = 3
 OMNI_ERR_ARG = 4
+OMNI_ERR_HOST = 5
+OMNI_ERR_REENTRANT = 6
 
 STATUS = {
     OMNI_OK: "ok",
@@ -76,6 +96,8 @@ STATUS = {
     OMNI_ERR_RUNTIME: "runtime",
     OMNI_ERR_PANIC: "panic",
     OMNI_ERR_ARG: "argument",
+    OMNI_ERR_HOST: "host",
+    OMNI_ERR_REENTRANT: "reentrant",
 }
 
 OMNI_NUMBER = 0
@@ -92,9 +114,13 @@ TAGS = {
     OMNI_STRING: "string",
 }
 
+#: A host function's own return values: 0 for success, 1 for "out is a message".
+OMNI_HOST_OK = 0
+OMNI_HOST_ERR = 1
+
 #: Wire format of the value struct this module reads. Checked against the
 #: library at load; see the module docstring's rule 3.
-OMNI_ABI_VERSION = 2
+OMNI_ABI_VERSION = 3
 
 #: The ABI rejects any source ``len`` above this, so a huge value is an argument
 #: error rather than an out-of-bounds read.
@@ -108,6 +134,22 @@ MAX_STRING_LEN = 16 * 1024 * 1024
 #: Longest name a host may bind, in *bytes* of UTF-8. Mirrors
 #: ``OMNI_MAX_IDENTIFIER_LEN``.
 MAX_IDENTIFIER_LEN = 32
+
+#: Most arguments a call may pass, and the highest arity a registration may
+#: declare. Mirrors ``OMNI_MAX_ARGS``.
+MAX_ARGS = 16
+
+#: Deepest a script's calls may nest inside one execution. Mirrors
+#: ``OMNI_MAX_CALL_DEPTH``; the engine refuses to go past it, so a recursive
+#: host function that never terminates costs a runtime error, not a stack
+#: overflow that would take the Python process down with it.
+MAX_CALL_DEPTH = 64
+
+
+#: What a host function receives and returns: the arguments the script passed,
+#: lowered to ``float`` / ``bool`` / ``str`` / ``None``, and an answer of the
+#: same shapes. Anything else is reported to the script as a host error.
+HostFunction = Callable[..., object]
 
 
 class OmniPayload(Union):
@@ -155,6 +197,24 @@ class OmniValue(Structure):
         if self.tag in (OMNI_NUMBER, OMNI_BOOL):
             return f"<OmniValue {tag} {self.payload.number}>"
         return f"<OmniValue {tag}>"
+
+
+#: ``int32_t (*)(void *, const OmniValue *, uint32_t, OmniValue *)`` -- the
+#: shape the engine uses to enter host code.
+#:
+#: A ``CFUNCTYPE`` instance is the trampoline: C may call it at any later time,
+#: which is only safe while the object itself is alive. ctypes does not register
+#: the callback with the library, so nothing here holds a reference for us -- if
+#: a binding's trampoline were garbage-collected, C would keep calling a freed
+#: closure and CPython would crash in a place that looks nothing like the cause.
+#: :class:`_HostBinding` below is the reference that keeps them alive.
+HOST_FN = ctypes.CFUNCTYPE(
+    c_int32,  # return: OMNI_HOST_OK or OMNI_HOST_ERR
+    c_void_p,  # user_data -- always NULL from Python, see _HostBinding
+    POINTER(OmniValue),  # args, argc of them, borrowed from the running call
+    c_uint32,  # argc
+    POINTER(OmniValue),  # out, read by the engine after we return
+)
 
 
 class OmniStats(Structure):
@@ -223,7 +283,8 @@ class OmniError(RuntimeError):
 
     Attributes:
         status: the raw ``u32`` the ABI returned.
-        kind: ``"compile"``, ``"runtime"``, ``"panic"``, or ``"argument"``.
+        kind: ``"compile"``, ``"runtime"``, ``"panic"``, ``"argument"``,
+            ``"host"``, or ``"reentrant"``.
         message: the engine's own text, already copied out of the engine.
     """
 
@@ -415,6 +476,18 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     lib.omni_define_string.argtypes = [c_void_p, c_char_p, c_size_t, c_char_p, c_size_t]
     lib.omni_define_string.restype = c_uint32
 
+    # The callback parameter is declared as the CFUNCTYPE itself, so ctypes
+    # checks the trampoline's shape at the call rather than letting any integer
+    # through and faulting inside the engine.
+    lib.omni_register_host_fn.argtypes = [c_void_p, c_char_p, c_size_t, c_uint32, HOST_FN, c_void_p]
+    lib.omni_register_host_fn.restype = c_uint32
+
+    lib.omni_unregister_host_fn.argtypes = [c_void_p, c_char_p, c_size_t]
+    lib.omni_unregister_host_fn.restype = c_size_t
+
+    lib.omni_host_fn_count.argtypes = [c_void_p]
+    lib.omni_host_fn_count.restype = c_size_t
+
     lib.omni_debug_stats.argtypes = [c_void_p, POINTER(OmniStats)]
     lib.omni_debug_stats.restype = c_uint32
 
@@ -424,6 +497,121 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     lib.omni_debug_panic.argtypes = [c_void_p]
     lib.omni_debug_panic.restype = c_uint32
     return lib
+
+
+# ---------------------------------------------------------------------------
+# Host callbacks
+# ---------------------------------------------------------------------------
+
+#: Longest host error message the trampoline will carry. The engine has no
+#: separate limit on a failure string, so this one exists to keep a traceback
+#: printed inside an inner exception handler from becoming the result.
+MAX_ERROR_TEXT = 4096
+
+
+class _HostBinding:
+    """One registered Python callable, plus the two objects C must be able to reach.
+
+    ``trampoline`` is the ctypes closure whose address the engine holds. ctypes
+    frees a closure when the callback object dies, so this instance owns it and
+    :class:`RawEngine` owns this instance -- the only way the address the engine
+    has stays valid for the life of the registration.
+
+    ``keep`` is the buffer from the most recent call. The engine reads ``out``
+    *after* this trampoline returns to C, and a local buffer would be gone by
+    then, so the last one is held until the next call replaces it. That is a
+    per-function slot, not a growing list: one callback returns one value at a
+    time, and re-entrancy is refused by the ABI, so a call cannot interrupt
+    itself here.
+
+    ``user_data`` is always NULL. A ctypes closure already carries its own
+    environment, so the ABI's slot has nothing to point at -- and pointing it at
+    this instance would make two owners of the same trampoline.
+    """
+
+    __slots__ = ("name", "arity", "fn", "trampoline", "keep")
+
+    def __init__(self, name: bytes, arity: int, fn: HostFunction) -> None:
+        self.name = name
+        self.arity = arity
+        self.fn = fn
+        self.trampoline = HOST_FN(self._call)
+        self.keep: ctypes.Array | None = None
+
+    def _call(self, _user_data, args, argc, out) -> int:  # noqa: ANN001 - ctypes
+        """The trampoline's body: lower, call, write -- or fail as data."""
+        try:
+            values = [_lift(args[index]) for index in range(argc)]
+            result = self.fn(*values)
+            self._write(out, result)
+        except BaseException as exc:  # noqa: BLE001 - the boundary must not unwind
+            # Any exception, including KeyboardInterrupt, becomes an
+            # OMNI_HOST_ERR message. Nothing may propagate through this frame:
+            # ctypes would swallow it and return a zero, and the engine would
+            # read a half-written ``out`` as a result. The host sees the failure
+            # in the script's error text instead, which is the honest version.
+            return self._fail(out, exc)
+        return OMNI_HOST_OK
+
+    def _write(self, out, result) -> None:  # noqa: ANN001 - ctypes
+        target = out[0]  # a shadow over the engine's OmniValue; writes go through
+        target.len = 0
+        if result is None:
+            target.tag = OMNI_NIL
+            return
+        if isinstance(result, bool):
+            # Before the numeric test: True *is* an int in Python, and a boolean
+            # answer should read as `true` in the script, not as 1.
+            target.tag = OMNI_BOOL
+            target.payload.number = 1.0 if result else 0.0
+            return
+        if isinstance(result, (int, float)):
+            target.tag = OMNI_NUMBER
+            target.payload.number = float(result)
+            return
+        if isinstance(result, (str, bytes, bytearray)):
+            data = result.encode("utf-8") if isinstance(result, str) else bytes(result)
+            if len(data) > MAX_STRING_LEN:
+                raise ValueError(
+                    f"a host function returns at most {MAX_STRING_LEN} string bytes, got {len(data)}"
+                )
+            buffer = create_string_buffer(data)  # len(data) + 1, NUL at the end
+            target.tag = OMNI_STRING
+            target.len = len(data)
+            target.payload.ptr = ctypes.addressof(buffer)
+            self.keep = buffer
+            return
+        raise TypeError(
+            f"a host function must return a number, bool, str, bytes or None, "
+            f"not {type(result).__name__}"
+        )
+
+    def _fail(self, out, exc: BaseException) -> int:  # noqa: ANN001 - ctypes
+        message = f"{type(exc).__name__}: {exc}".encode("utf-8", "replace")[:MAX_ERROR_TEXT]
+        buffer = create_string_buffer(message)
+        target = out[0]
+        target.tag = OMNI_STRING
+        target.len = len(message)
+        target.payload.ptr = ctypes.addressof(buffer)
+        self.keep = buffer
+        return OMNI_HOST_ERR
+
+
+def _lift(value: OmniValue) -> object:
+    """Read one argument the engine handed us, from its borrowed bytes."""
+    if value.tag == OMNI_NUMBER:
+        return value.payload.number
+    if value.tag == OMNI_BOOL:
+        return value.payload.number != 0.0
+    if value.tag == OMNI_STRING:
+        # string_at, not omni_str_copy: the copy helper takes the engine handle,
+        # and the engine is inside the call that invoked us, so it would answer
+        # OMNI_ERR_REENTRANT with a zero-length read. The bytes are readable --
+        # that is the promise the ABI makes and this is where it is spent.
+        if not value.ptr or value.len == 0:
+            return ""
+        return string_at(value.ptr, value.len).decode("utf-8", "replace")
+    return None  # nil and undef both carry nothing a Python function can use
 
 
 # ---------------------------------------------------------------------------
@@ -443,7 +631,7 @@ class RawEngine:
     interpreter teardown is how these bindings segfault on exit.
     """
 
-    __slots__ = ("_lib", "_handle")
+    __slots__ = ("_lib", "_handle", "_host_fns")
 
     def __init__(self, lib: ctypes.CDLL | None = None) -> None:
         self._lib = lib if lib is not None else load_library()
@@ -451,6 +639,9 @@ class RawEngine:
         if not handle:
             raise OmniLibraryError("omni_engine_new returned a null handle")
         self._handle = handle
+        # Name (as registered bytes) -> binding. This dict is the only owner of
+        # the ctypes closures whose addresses the engine holds.
+        self._host_fns: dict[bytes, _HostBinding] = {}
 
     @property
     def lib(self) -> ctypes.CDLL:
@@ -516,6 +707,65 @@ class RawEngine:
             len(encoded_payload),
         )
 
+    def register_host_fn(self, name: str | bytes, arity: int, fn: HostFunction) -> int:
+        """Let scripts call ``fn`` as ``name(...)``; returns the status.
+
+        The registration survives every later evaluation, and so does this
+        object's reference to the closure: :mod:`ctypes` frees a callback the
+        moment its Python object dies, and the engine would go on calling the
+        address it was given.
+
+        Raises:
+            OmniError: the name is empty or longer than
+                :data:`MAX_IDENTIFIER_LEN` bytes, ``fn`` is not callable, or
+                ``arity`` is not a number of arguments the ABI can carry.
+        """
+        encoded_name = self._encode_bound("name", name, MAX_IDENTIFIER_LEN)
+        if not callable(fn):
+            # Refused here rather than at the first call. A ctypes closure can be
+            # built around anything, so an uncalled mistake would otherwise surface
+            # as a host error inside a script several evaluations later.
+            raise OmniError(OMNI_ERR_ARG, f"a host function must be callable, not {type(fn).__name__}")
+        if not isinstance(arity, int) or isinstance(arity, bool):
+            raise OmniError(OMNI_ERR_ARG, f"arity must be an int, not {type(arity).__name__}")
+        if not 0 <= arity <= MAX_ARGS:
+            raise OmniError(
+                OMNI_ERR_ARG,
+                f"a host function takes between 0 and {MAX_ARGS} arguments, not {arity}",
+            )
+        binding = _HostBinding(encoded_name, arity, fn)
+        status = self._lib.omni_register_host_fn(
+            self._handle,
+            encoded_name,
+            len(encoded_name),
+            arity,
+            binding.trampoline,
+            None,  # user_data: a ctypes closure carries its own environment
+        )
+        if status == OMNI_OK:
+            # Only on success, and only now: the engine has already forgotten the
+            # previous binding for this name, so dropping ours cannot strand a
+            # trampoline it still means to call.
+            self._host_fns[encoded_name] = binding
+        return status
+
+    def unregister_host_fn(self, name: str | bytes) -> bool:
+        """Drop a host function; True if the engine had one.
+
+        The engine releases the callback pointer here, which is the signal that
+        this module may release the closure -- so the two halves always go
+        together, including when the status is a silent ``0``.
+        """
+        encoded_name = self._encode_bound("name", name, MAX_IDENTIFIER_LEN)
+        removed = self._lib.omni_unregister_host_fn(self._handle, encoded_name, len(encoded_name))
+        if removed:
+            self._host_fns.pop(encoded_name, None)
+        return bool(removed)
+
+    def host_fn_count(self) -> int:
+        """Registrations the engine holds. Zero is what a teardown test wants."""
+        return self._lib.omni_host_fn_count(self._handle)
+
     def stats(self) -> Stats:
         """Read the memory counters, verifying the layout the library wrote."""
         out = OmniStats()
@@ -549,6 +799,13 @@ class RawEngine:
 
     def close(self) -> None:
         if self._handle:
+            # Unregister before freeing: the engine forgets every trampoline it
+            # was handed, and this dict stays the last owner of them until it
+            # does. Releasing a closure the engine still holds is the one way a
+            # Python host can make omni_exec() call freed memory.
+            for encoded_name in list(self._host_fns):
+                self._lib.omni_unregister_host_fn(self._handle, encoded_name, len(encoded_name))
+            self._host_fns.clear()
             self._lib.omni_engine_free(self._handle)
             self._handle = None
 

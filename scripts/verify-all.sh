@@ -7,10 +7,11 @@
 # PATH, and a missing tool is reported as SKIP rather than a failure, so this
 # script is usable on a machine that has not got the whole toolchain yet.
 #
-# The last four rows are Phase 2: they run one string program, one type error,
-# and the ABI level through every host that is present and compare the answers
-# with each other, which is the only way to catch a bridge that is internally
-# consistent and externally wrong.
+# The last rows are Phase 2 and Phase 3: they run one string program, one type
+# error, and the ABI level through every host that is present and compare the
+# answers with each other, then do the same for host callbacks -- a function the
+# host owns and a script calls. That comparison is the only way to catch a
+# bridge that is internally consistent and externally wrong.
 #
 # Exits non-zero if anything that could run, failed.
 
@@ -30,10 +31,10 @@ skip() { record "SKIP  $1 ($2)"; }
 fail() { record "FAIL  $1"; failures=$((failures + 1)); }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# The Phase 2 programs, defined once and used by several rows below. They are
-# written here rather than inline because a shell string inside $() around a -c
-# string around an Omni source literal is where a backslash quietly goes
-# missing, and \u has to reach the lexer as two characters.
+# The Phase 2 and Phase 3 programs, defined once and used by several rows below.
+# They are written here rather than inline because a shell string inside $()
+# around a -c string around an Omni source literal is where a backslash quietly
+# goes missing, and \u has to reach the lexer as two characters.
 CROSS_PROGRAM='"hello, " + "world" + "\u{1F600}"'
 CROSS_WANT=$(printf 'hello, world\xF0\x9F\x98\x80')
 MIX_PROGRAM='"hi" + 42'
@@ -41,6 +42,18 @@ MIX_WANT='line 1: cannot add string to number: "hi" + 42'
 # examples/strings.omni ends with a space before the escape, so its answer is
 # not the same bytes as CROSS_WANT. Checked against its own expectation.
 STRINGS_WANT=$(printf 'hello, world \xF0\x9F\x98\x80')
+# Phase 3. `shout` is registered by each host in its own language, and the
+# answer is the same bytes: the argument crossed in, the result crossed back
+# out, and the concatenation used it as a string like any other.
+CALL_PROGRAM='"say: " + shout("hey")'
+CALL_WANT='say: HEY!'
+BOOM_PROGRAM='boom(1)'
+BOOM_WANT="host function 'boom' failed"
+BOOM_DETAIL='host said no'
+PEEK_PROGRAM='peek(1)'
+# Both SDKs supply this text themselves, because the engine is busy and the one
+# thing it cannot do is render a message about being busy.
+PEEK_WANT='already inside a host function'
 
 echo "== OmniEngine cross-host verification =="
 echo "   workspace: $ROOT"
@@ -329,6 +342,188 @@ elif [[ -n "$grow_hosts" ]]; then
   pass "2000 string executions, one rewind each, reservation flat:$grow_hosts"
 else
   skip "egress bounded from a host" "python and node not available"
+fi
+
+# ---------------------------------------------------- Phase 3: a function the host owns
+#
+# A host callback is the bridge running backwards: the engine reads a script,
+# hands the arguments into foreign code, and then trusts whatever that code
+# writes back. Each row here checks a promise the C header makes and a single
+# host cannot verify about itself -- that the answer, the failure text, and the
+# refusal all come out the same on both sides of the boundary.
+
+printf 'A host function answers the same bytes in every host... '
+cb_hosts=''
+cb_wrong=''
+if [[ -n "${PY:-}" ]]; then
+  got=$(cd sdks/python && P="$CALL_PROGRAM" $PY -c '
+import os, sys; sys.path.insert(0, ".")
+import omni
+with omni.Engine() as e:
+    e.register_function("shout", lambda s: s.upper() + "!", arity=1)
+    sys.stdout.buffer.write(e.string(os.environ["P"]).encode("utf-8"))
+' 2>&1)
+  if [[ "$got" == "$CALL_WANT" ]]; then cb_hosts+=' python'
+  else cb_wrong+=" python='$got'"; fi
+fi
+if have node && [[ -d sdks/nodejs/node_modules/koffi ]]; then
+  got=$(cd sdks/nodejs && P="$CALL_PROGRAM" node -e '
+const { Engine } = require("./index.js");
+const e = new Engine();
+e.registerFunction("shout", (s) => s.toUpperCase() + "!", { arity: 1 });
+process.stdout.write(e.string(process.env.P));
+e.close();
+' 2>&1)
+  if [[ "$got" == "$CALL_WANT" ]]; then cb_hosts+=' node'
+  else cb_wrong+=" node='$got'"; fi
+fi
+if [[ -n "$cb_wrong" ]]; then
+  fail "the callback answer differs:$cb_wrong"
+elif [[ -n "$cb_hosts" ]]; then
+  pass "an argument crossed in and a string crossed back out, identically in:$cb_hosts"
+else
+  skip "host callback bytes" "python and node not available"
+fi
+
+printf 'A host failure is data, and says so identically... '
+boom_hosts=''
+boom_wrong=''
+if [[ -n "${PY:-}" ]]; then
+  got=$(cd sdks/python && P="$BOOM_PROGRAM" $PY -c '
+import os, sys; sys.path.insert(0, ".")
+import omni
+def boom(_):
+    raise ValueError("'"$BOOM_DETAIL"'")
+with omni.Engine() as e:
+    e.register_function("boom", boom, arity=1)
+    try:
+        e.run(os.environ["P"])
+        print("the failing call returned no error")
+    except omni.OmniError as err:
+        print(str(err))
+' 2>&1)
+  if [[ "$got" == *"$BOOM_WANT"* && "$got" == *"$BOOM_DETAIL"* ]]; then
+    boom_hosts+=' python'
+  else boom_wrong+=" python='$got'"; fi
+fi
+if have node && [[ -d sdks/nodejs/node_modules/koffi ]]; then
+  got=$(cd sdks/nodejs && P="$BOOM_PROGRAM" M="$BOOM_DETAIL" node -e '
+const { Engine } = require("./index.js");
+const e = new Engine();
+e.registerFunction("boom", () => { throw new Error(process.env.M); }, { arity: 1 });
+try { e.run(process.env.P); console.log("the failing call returned no error"); }
+catch (err) { console.log(String(err)); }
+e.close();
+' 2>&1)
+  if [[ "$got" == *"$BOOM_WANT"* && "$got" == *"$BOOM_DETAIL"* ]]; then
+    boom_hosts+=' node'
+  else boom_wrong+=" node='$got'"; fi
+fi
+if [[ -n "$boom_wrong" ]]; then
+  fail "the host failure text differs or the throw escaped:$boom_wrong"
+elif [[ -n "$boom_hosts" ]]; then
+  pass "an exception was caught at the boundary and named in:$boom_hosts"
+else
+  skip "host failure text" "python and node not available"
+fi
+
+printf 'Re-entering the engine from a callback is refused, not crashed... '
+re_hosts=''
+re_wrong=''
+if [[ -n "${PY:-}" ]]; then
+  # The callback calls back into the same handle it was called from, which is
+  # the one thing the borrowed arguments make unsafe. The answer must be an
+  # error, and the engine must still work after it.
+  got=$(cd sdks/python && P="$PEEK_PROGRAM" $PY -c '
+import os, sys; sys.path.insert(0, ".")
+import omni
+e = omni.Engine()
+def peek(_):
+    return e.evaluate("1 + 1")
+e.register_function("peek", peek, arity=1)
+try:
+    e.run(os.environ["P"])
+    text = "the re-entrant call returned no error"
+except omni.OmniError as err:
+    text = str(err)
+print(text, "|", e.evaluate("6 * 7"))
+' 2>&1)
+  if [[ "$got" == *"$PEEK_WANT"* && "$got" == *"42.0"* ]]; then
+    re_hosts+=' python'
+  else re_wrong+=" python='$got'"; fi
+fi
+if have node && [[ -d sdks/nodejs/node_modules/koffi ]]; then
+  got=$(cd sdks/nodejs && P="$PEEK_PROGRAM" node -e '
+const { Engine } = require("./index.js");
+const e = new Engine();
+e.registerFunction("peek", () => e.evaluate("1 + 1"), { arity: 1 });
+let text;
+try { e.run(process.env.P); text = "the re-entrant call returned no error"; }
+catch (err) { text = String(err); }
+console.log(text, "|", e.evaluate("6 * 7"));
+e.close();
+' 2>&1)
+  if [[ "$got" == *"$PEEK_WANT"* && "$got" == *"42"* ]]; then
+    re_hosts+=' node'
+  else re_wrong+=" node='$got'"; fi
+fi
+if [[ -n "$re_wrong" ]]; then
+  fail "re-entrancy was not refused-and-survived in:$re_wrong"
+elif [[ -n "$re_hosts" ]]; then
+  pass "a second borrow of the same handle errors and the engine lives on in:$re_hosts"
+else
+  skip "re-entrancy guard" "python and node not available"
+fi
+
+printf 'The registry says the same thing from both sides... '
+reg_hosts=''
+reg_wrong=''
+if [[ -n "${PY:-}" ]]; then
+  got=$(cd sdks/python && $PY -c '
+import sys; sys.path.insert(0, ".")
+import omni
+with omni.Engine() as e:
+    for name in ("a", "b", "c"):
+        e.register_function(name, lambda: 1.0, arity=0)
+    before = e.host_function_count
+    e.unregister_function("b")
+    after = e.host_function_count
+    again = 1 if e.unregister_function("b") else 0
+    try:
+        e.run("b()")
+        text = "b still answered"
+    except omni.OmniError as err:
+        text = str(err)
+    print(before, after, again, "|", text)
+' 2>&1)
+  if [[ "$got" == "3 2 0 |"*"unknown function 'b'"* ]]; then
+    reg_hosts+=' python'
+  else reg_wrong+=" python='$got'"; fi
+fi
+if have node && [[ -d sdks/nodejs/node_modules/koffi ]]; then
+  got=$(cd sdks/nodejs && node -e '
+const { Engine } = require("./index.js");
+const e = new Engine();
+for (const name of ["a", "b", "c"]) e.registerFunction(name, () => 1, { arity: 0 });
+const before = e.hostFunctionCount;
+e.unregisterFunction("b");
+const after = e.hostFunctionCount;
+const again = e.unregisterFunction("b") ? 1 : 0;
+let text;
+try { e.run("b()"); text = "b still answered"; } catch (err) { text = String(err); }
+console.log(before, after, again, "|", text);
+e.close();
+' 2>&1)
+  if [[ "$got" == "3 2 0 |"*"unknown function 'b'"* ]]; then
+    reg_hosts+=' node'
+  else reg_wrong+=" node='$got'"; fi
+fi
+if [[ -n "$reg_wrong" ]]; then
+  fail "the registry disagreed:$reg_wrong"
+elif [[ -n "$reg_hosts" ]]; then
+  pass "three registrations, one removal, then the name is unknown in:$reg_hosts"
+else
+  skip "registry agreement" "python and node not available"
 fi
 
 # ---------------------------------------------------------------- report

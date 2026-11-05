@@ -10,17 +10,30 @@ pulls in nothing and it works on any CPython that can load a shared library.
         engine.run("20 / 3").value               # -> 6.666666666666667
         engine.run(r'"omni" + " " + "engine"').value   # -> 'omni engine'
 
-``evaluate`` and ``run`` evaluate OmniEngine source only. OmniEngine is, for
-now, an expression language with numbers, booleans and strings: there is no
-host-code execution to escape into, and nothing here calls Python's ``eval``.
-
-Everything this package hands back is Python data. A string result is copied
-out of the engine by ``omni_str_copy`` before it becomes a ``str``, so no
-object you can hold refers to memory the engine rewinds on the next call.
+``evaluate`` and ``run`` evaluate OmniEngine source only. OmniEngine is an
+expression language with numbers, booleans and strings; it has no loops, no
+I/O and no way to reach Python except a function you registered yourself.
+Nothing here calls Python's ``eval``.
 
     engine.define_string("greeting", "hello")     # visible to the program
     engine.run("greeting + \", then some\"").value
     engine.stats().egress_bytes_reserved          # what the buffers cost
+
+A Python callable becomes a name the script can call:
+
+    engine.register_function("square", lambda x: x * x, arity=1)
+    engine.run("square(6) + 1").value              # -> 37.0
+    engine.run('shout("hi")').value                # -> 'HI!'  (yours to define)
+
+Arguments arrive as ``float``, ``bool``, ``str`` or ``None`` and the return
+value travels back the same way. An exception in the callable is not a crash
+and not a silent zero: it becomes an :class:`OmniError` whose kind is
+``"host"``, carrying the message to the line of the call that caused it.
+
+Everything this package hands back is Python data. A string result is copied
+out of the engine by ``omni_str_copy`` before it becomes a ``str``, so no
+object you can hold refers to memory the engine rewinds on the next call, and
+the same holds for a string argument inside a registered function.
 
 Build the library once and the SDK finds it on its own:
 
@@ -41,14 +54,18 @@ import ctypes
 from dataclasses import dataclass
 
 from ._ffi import (
+    MAX_ARGS,
+    MAX_CALL_DEPTH,
     MAX_IDENTIFIER_LEN,
     MAX_SOURCE_LEN,
     MAX_STRING_LEN,
     OMNI_ABI_VERSION,
+    OMNI_ERR_REENTRANT,
     OMNI_ERR_RUNTIME,
     OMNI_OK,
     STATUS,
     TAGS,
+    HostFunction,
     OmniError,
     OmniLibraryError,
     OmniValue,
@@ -63,12 +80,15 @@ __all__ = [
     "Stats",
     "OmniError",
     "OmniLibraryError",
+    "HostFunction",
     "library_file_name",
     "status_name",
     "tag_name",
     "MAX_SOURCE_LEN",
     "MAX_STRING_LEN",
     "MAX_IDENTIFIER_LEN",
+    "MAX_ARGS",
+    "MAX_CALL_DEPTH",
     "OMNI_ABI_VERSION",
     "__version__",
 ]
@@ -264,6 +284,59 @@ class Engine:
         if status != OMNI_OK:
             raise OmniError(status, self._message(raw, status) or f"the ABI rejected the binding {name!r}")
 
+    def register_function(self, name: str, fn: HostFunction, *, arity: int) -> None:
+        """Let programs call the Python ``fn`` as ``name(...)``.
+
+        The registration outlives every evaluation: bind it once at start-up and
+        call it from as many programs as you like. Defining ``name`` again
+        replaces the previous callable, and the engine forgets that one at the
+        same moment.
+
+        ``arity`` is required, because a Python signature is not always
+        knowable -- ``arity=1`` for :func:`len`, ``arity=2`` for a two-argument
+        lambda with the same shape -- and a program that passes a different count
+        is rejected by the engine, before your callable is entered, with an error
+        naming the function and both counts.
+
+        Args:
+            name: at most :data:`MAX_IDENTIFIER_LEN` UTF-8 bytes.
+            fn: called with the arguments as ``float`` / ``bool`` / ``str`` /
+                ``None``; returns one of those, and anything else becomes a host
+                error the program can read.
+            arity: 0 to :data:`MAX_ARGS`, the number of arguments a call takes.
+
+        Raises:
+            OmniError: the ABI rejected the name, the callable or the arity, or
+                this is called from inside a host function of the same engine.
+        """
+        raw = self._require()
+        status = raw.register_host_fn(name, arity, fn)
+        self._last_status = status
+        if status != OMNI_OK:
+            raise OmniError(
+                status,
+                self._message(raw, status) or f"the ABI rejected the registration {name!r}",
+            )
+
+    def unregister_function(self, name: str) -> bool:
+        """Drop a registered function; True if the engine had one.
+
+        Idempotent, and the only way to release a callable you no longer need:
+        until this returns, the engine holds a pointer into a ctypes trampoline
+        this package keeps alive on its behalf.
+        """
+        return self._require().unregister_host_fn(name)
+
+    @property
+    def host_function_count(self) -> int:
+        """Registrations this engine currently holds.
+
+        Read from the library rather than from this package's own table, so the
+        number is the engine's answer and a registration the SDK thought it had
+        but the ABI lost is a difference you can see here.
+        """
+        return self._require().host_fn_count()
+
     def stats(self) -> Stats:
         """The engine's memory counters: executions, strings built, bytes held.
 
@@ -274,7 +347,12 @@ class Engine:
         return self._require().stats()
 
     def close(self) -> None:
-        """Release the engine. Idempotent."""
+        """Release the engine, and every host function registered on it.
+
+        Idempotent. The ctypes closures handed to C are released only after the
+        engine has forgotten their addresses, so nothing can call a trampoline
+        this package has already let go.
+        """
         if self._raw is not None:
             self._raw.close()
             self._raw = None
@@ -291,6 +369,13 @@ class Engine:
             return text
         if status == OMNI_ERR_RUNTIME:
             return "the program did not evaluate to a number"
+        if status == OMNI_ERR_REENTRANT:
+            # The ABI's own answer carries no text here: the engine is busy, so
+            # the one thing it cannot do is render a message about being busy.
+            return (
+                "this engine is already inside a host function; a callback may "
+                "not call back into the engine that called it"
+            )
         return ""
 
     def _require(self) -> RawEngine:

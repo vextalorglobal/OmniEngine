@@ -30,6 +30,18 @@
  *     engine.run('greeting + ", then some"').value;
  *     engine.stats().egressBytesReserved;   // what the buffers cost
  *
+ * And a JavaScript function becomes a name the script can call:
+ *
+ *     engine.registerFunction('square', (x) => x * x, { arity: 1 });
+ *     engine.run('square(6) + 1').value;        // 37
+ *     engine.registerFunction('shout', (s) => s.toUpperCase() + '!');
+ *     engine.run('shout("hi")').value;          // 'HI!'
+ *
+ * Arguments arrive as numbers, booleans, strings, or null, and the return value
+ * travels back the same way. An exception in your function is not a crash: it
+ * becomes an `OmniError` whose kind is `'host'`, carrying your message to the
+ * line of the call that caused it.
+ *
  * Build the engine once and this package finds it:
  *
  *     cargo build -p omni-ffi
@@ -95,6 +107,11 @@ class Engine {
     this._statsOut = this._b.koffi.alloc(this._b.OmniStats, 1);
     this._errorBuf = Buffer.alloc(ERROR_BUFFER_SIZE);
     this._lastStatus = STATUS.OK;
+    // Registered callbacks and their koffi handles, keyed by name. The handle is
+    // the memory koffi allocated for the C-to-JS trampoline; it stays live only
+    // while this Map holds it, and `koffi.unregister` releases it. A callback
+    // that is not registered has no handle, so the engine never calls dead code.
+    this._hostFns = new Map();
   }
 
   /** Absolute path of the library this engine is talking to. */
@@ -229,6 +246,97 @@ class Engine {
   }
 
   /**
+   * Bind `name` to a JavaScript function the program can call.
+   *
+   * The script calls it by name -- `square(6)` -- with exactly `arity` arguments.
+   * Arguments arrive as numbers, booleans, strings, or null, and whatever the
+   * function returns travels back as the same kind of value. A string the
+   * function returns is copied by the engine before the call returns, so a
+   * Buffer the host built for the answer needs to live only until the callback
+   * hands it over.
+   *
+   * Registering `name` again replaces the previous binding. When the engine
+   * itself is calling your function, a second call into the engine on this same
+   * handle from that function is refused with a host error rather than
+   * re-entering a borrowed state.
+   *
+   * @param {string} name        at most `MAX_IDENTIFIER_LEN` UTF-8 bytes
+   * @param {(...args) => any} fn the JavaScript function to call
+   * @param {{ arity?: number }} [options] argument count; defaults to `fn.length`
+   * @throws {OmniError} when the name, the arity, or the library rejects it
+   */
+  registerFunction(name, fn, options = {}) {
+    const b = this._require();
+    if (typeof fn !== 'function') {
+      throw new OmniError(STATUS.ERR_ARG, `a host function must be callable, got ${typeof fn}`);
+    }
+    const arity = options.arity === undefined ? fn.length : options.arity;
+    if (!Number.isInteger(arity) || arity < 0 || arity > bindingsModule.MAX_ARGS) {
+      throw new OmniError(
+        STATUS.ERR_ARG,
+        `arity is ${arity}; a host function takes an integer between 0 and ${bindingsModule.MAX_ARGS}`
+      );
+    }
+    const nameBytes = encodeBytes(name, bindingsModule.MAX_IDENTIFIER_LEN, 'name');
+
+    const trampoline = (userData, args, argc, out) => this._callHost(name, fn, userData, args, argc, out);
+    const handle = b.koffi.register(trampoline, b.koffi.pointer(b.OmniHostFn));
+    const status = b.registerHostFn(this._handle, nameBytes, nameBytes.length, arity, handle, null);
+    this._lastStatus = status;
+    if (status !== STATUS.OK) {
+      b.koffi.unregister(handle);
+      throw new OmniError(status, this._error(b, status) || `the ABI rejected the host function ${JSON.stringify(String(name))}`);
+    }
+
+    // Replace any previous binding under this name, releasing its trampoline.
+    const previous = this._hostFns.get(String(name));
+    if (previous) b.koffi.unregister(previous.handle);
+    this._hostFns.set(String(name), { arity, fn, handle, nameBytes });
+  }
+
+  /**
+   * Remove the host function bound to `name`.
+   *
+   * Returns true when a binding was removed. The koffi trampoline is released
+   * immediately, so a script that calls the name afterwards gets an ordinary
+   * runtime error, not a call into a function that has been unregistered.
+   *
+   * @param {string} name
+   * @returns {boolean}
+   */
+  unregisterFunction(name) {
+    const b = this._b;
+    const key = String(name);
+    const entry = this._hostFns.get(key);
+    if (!entry) return false;
+    if (this._handle === null) {
+      // The engine is closed, so the registry is gone with it; release the
+      // trampoline and report that nothing was removed from a live engine.
+      b.koffi.unregister(entry.handle);
+      this._hostFns.delete(key);
+      return false;
+    }
+    const removed = Number(b.unregisterHostFn(this._handle, entry.nameBytes, entry.nameBytes.length)) === 1;
+    if (removed) {
+      b.koffi.unregister(entry.handle);
+      this._hostFns.delete(key);
+    }
+    return removed;
+  }
+
+  /** Registrations this engine currently holds.
+   *
+   * Read from the library, not from this file's own map, so the number is the
+   * engine's answer and a registration this SDK thought it had but lost is a
+   * difference you can see rather than one you have to discover at the next call.
+   *
+   * @returns {number}
+   */
+  get hostFunctionCount() {
+    return Number(this._require().hostFnCount(this._handle));
+  }
+
+  /**
    * The engine's memory counters: executions, strings built, bytes held.
    *
    * Read them after a benchmark to tell a high-water mark from a leak. The
@@ -283,6 +391,11 @@ class Engine {
   /** Release the engine and its buffers. Safe to call more than once. */
   close() {
     const b = this._b;
+    // Every registered trampoline belongs to this handle. Once the engine is
+    // gone, a callback the runtime still holds would be a live JS closure with
+    // dead C memory behind it, so unregister them all before letting go.
+    for (const entry of this._hostFns.values()) b.koffi.unregister(entry.handle);
+    this._hostFns.clear();
     if (this._handle) b.engineFree(this._handle);
     this._handle = null;
     for (const ptr of [this._valueOut, this._numberOut, this._statsOut]) {
@@ -293,6 +406,34 @@ class Engine {
     this._valueOut = null;
     this._numberOut = null;
     this._statsOut = null;
+  }
+
+  /**
+   * The trampoline koffi calls on the engine's behalf.
+   *
+   * The arguments arrive as raw memory owned by the engine and are only good
+   * for the duration of this call: `args` is a borrowed array of value structs,
+   * and a string argument's `payload.ptr` points at the text itself, not at the
+   * object header a *result* pointer points at. So this reads them with a direct
+   * copy rather than through `omni_str_copy`, which would re-enter the engine
+   * that is already inside this callback.
+   *
+   * Any JavaScript exception becomes a host error carried back as data. A throw
+   * that crossed into Rust would unwind through foreign frames -- undefined
+   * behaviour the ABI exists to prevent.
+   */
+  _callHost(name, fn, _userData, args, argc, out) {
+    const b = this._b;
+    const values = [];
+    try {
+      // koffi.array rejects a length of zero, so a call with no arguments reads
+      // the empty list without asking the pointer what lives at it.
+      const decoded = argc === 0 ? [] : b.koffi.decode(args, b.koffi.array(b.OmniValue, argc));
+      for (let i = 0; i < argc; i++) values.push(liftArgument(b, decoded[i]));
+      return writeValue(b, out, fn(...values));
+    } catch (err) {
+      return writeError(b, out, err);
+    }
   }
 
   /**
@@ -323,8 +464,13 @@ class Engine {
     const text = written > 0 ? this._errorBuf.subarray(0, written).toString('utf8') : '';
     if (text) return text;
     // execNumber can report a type failure the engine itself never produced,
-    // so the wrapper supplies the message instead of returning silence.
+    // so the wrapper supplies the message instead of returning silence. The
+    // re-entrant status is the other case: the engine refused before it could
+    // write, and a host that only sees a bare 6 learns nothing about why.
     if (status === STATUS.ERR_RUNTIME) return 'the program did not evaluate to a number';
+    if (status === STATUS.ERR_REENTRANT) {
+      return 'this engine is already inside a host function; a callback may not call back into the engine that called it';
+    }
     return '';
   }
 
@@ -352,6 +498,92 @@ if (Symbol.dispose) {
 /** @param {string|Buffer} source */
 function encode(source) {
   return encodeBytes(source, bindingsModule.MAX_SOURCE_LEN, 'source');
+}
+
+/**
+ * Lower one borrowed argument struct into a JavaScript value.
+ *
+ * This is the only place in the SDK that reads `payload.ptr` as a memory
+ * address rather than handing the struct to `omni_str_copy`, and it is only
+ * correct here: a callback argument's pointer addresses the first byte of the
+ * text, not the string object's header, and the bytes it points at cannot move
+ * while the engine is inside the callback.
+ *
+ * @param {Bindings} b
+ * @param {{ tag: number, len: number, payload: { number: number, ptr: bigint } }} raw
+ */
+function liftArgument(b, raw) {
+  const tag = tagName(raw.tag);
+  if (tag === 'number') return raw.payload.number;
+  if (tag === 'bool') return raw.payload.number !== 0;
+  if (tag === 'string') {
+    const length = Number(raw.len);
+    if (!raw.payload.ptr || length === 0) return '';
+    // `uint8_t` rather than `char`: koffi decodes a char array as a C string and
+    // stops at the first NUL, which would silently truncate a value whose bytes
+    // are otherwise complete.
+    const bytes = b.koffi.decode(raw.payload.ptr, b.koffi.array('uint8_t', length));
+    return Buffer.from(bytes).toString('utf8');
+  }
+  return null; // nil and undef carry no payload
+}
+
+/**
+ * Encode one JavaScript value as the result of a host call.
+ *
+ * The engine copies out of `out` before this call unwinds, so the Buffer that
+ * carries a returned string only needs to live until the callback returns --
+ * and returning OMNI_HOST_ERR is how a failure reports itself, with the message
+ * in the same `out` slot.
+ */
+function writeValue(b, out, result) {
+  if (result === null || result === undefined) {
+    b.koffi.encode(out, b.OmniValue, { tag: TAG.NIL, len: 0, payload: { number: 0 } });
+    return bindingsModule.HOST_OK;
+  }
+  if (typeof result === 'boolean') {
+    b.koffi.encode(out, b.OmniValue, { tag: TAG.BOOL, len: 0, payload: { number: result ? 1 : 0 } });
+    return bindingsModule.HOST_OK;
+  }
+  if (typeof result === 'number') {
+    if (Number.isNaN(result) || !Number.isFinite(result)) {
+      return writeFailure(b, out, 'a host function cannot return NaN or Infinity');
+    }
+    b.koffi.encode(out, b.OmniValue, { tag: TAG.NUMBER, len: 0, payload: { number: result } });
+    return bindingsModule.HOST_OK;
+  }
+  if (Buffer.isBuffer(result) || typeof result === 'string') {
+    const buf = Buffer.isBuffer(result) ? result : Buffer.from(String(result), 'utf8');
+    if (buf.length > bindingsModule.MAX_STRING_LEN) {
+      return writeFailure(b, out, `a host function returned ${buf.length} bytes; the ABI accepts at most ${bindingsModule.MAX_STRING_LEN}`);
+    }
+    b.koffi.encode(out, b.OmniValue, { tag: TAG.STRING, len: buf.length, payload: { ptr: buf } });
+    return bindingsModule.HOST_OK;
+  }
+  // Any other type is a mistake in the host's own function, so the engine gets
+  // a failure with the type named rather than a silent zero or a half value.
+  return writeFailure(b, out, `a host function must return a number, bool, string, Buffer or null, not ${typeof result}`);
+}
+
+/** Write a failure message in the result slot, with its length recorded. */
+function writeFailure(b, out, message) {
+  const buf = Buffer.from(message, 'utf8');
+  const capped = buf.length > 4096 ? buf.subarray(0, 4096) : buf;
+  b.koffi.encode(out, b.OmniValue, { tag: TAG.STRING, len: capped.length, payload: { ptr: capped } });
+  return bindingsModule.HOST_ERR;
+}
+
+/**
+ * Carrying the message is what turns a JavaScript throw into engine data.
+ *
+ * koffi re-surfaces an exception that escapes a callback as a throw at the
+ * native call site, which is exactly the unwinding across foreign frames this
+ * ABI forbids. The message travels in the same slot a result string would, so
+ * the engine reads it with the same rules.
+ */
+function writeError(b, out, err) {
+  const message = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+  return writeFailure(b, out, message);
 }
 
 /**
@@ -391,6 +623,18 @@ module.exports = {
   },
   get MAX_IDENTIFIER_LEN() {
     return bindingsModule.MAX_IDENTIFIER_LEN;
+  },
+  get MAX_ARGS() {
+    return bindingsModule.MAX_ARGS;
+  },
+  get MAX_CALL_DEPTH() {
+    return bindingsModule.MAX_CALL_DEPTH;
+  },
+  get HOST_OK() {
+    return bindingsModule.HOST_OK;
+  },
+  get HOST_ERR() {
+    return bindingsModule.HOST_ERR;
   },
   get ABI_VERSION() {
     return bindingsModule.ABI_VERSION;

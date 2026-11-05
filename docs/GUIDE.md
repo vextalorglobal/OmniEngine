@@ -12,9 +12,11 @@ SDKs that install through `pip` and `npm`.
 Two numbering systems are in use and both are kept, because the brief's five
 phases are how the work was asked for and how section 7 is scored. **"Phase 1–5"
 means the brief's deliverables** (workspace, core, bridge, Linguist, SDKs).
-**"the strings increment" or "ABI v2"** means the second round of work on the
+**"The strings increment" or "ABI v2"** means the second round of work on the
 language and the bridge — strings, the egress memory model, and the four new
-exports — which is not the brief's Phase 2.
+exports. **"The callback increment" or "ABI v3"** means the third — host
+functions, call syntax, and the re-entrancy guard. Neither is the brief's Phase 2
+or Phase 3.
 
 ---
 
@@ -23,16 +25,17 @@ exports — which is not the brief's Phase 2.
 | Deliverable | State | Evidence |
 | --- | --- | --- |
 | Phase 1 — workspace and build policy | done | `Cargo.toml`, `.cargo/config.toml`, `rust-toolchain.toml` |
-| Phase 2 — core engine | done | 110 `omni-core` tests |
-| Phase 3 — C ABI + header | done | 38 `omni-ffi` tests, PE export table, `examples/c/embed.c` |
+| Phase 2 — core engine | done | 128 `omni-core` tests |
+| Phase 3 — C ABI + header | done | 45 `omni-ffi` tests, PE export table, `examples/c/embed.c` |
 | Phase 4 — extension and Linguist | done (tier 1) | `.gitattributes`, `examples/*.omni` |
-| Phase 5 — SDKs and DX | done | 63 Python + 56 Node tests, CLI, wasm scaffold |
+| Phase 5 — SDKs and DX | done | 92 Python + 74 Node tests, CLI, wasm scaffold |
 | Strings, egress memory, ABI v2 | done | 4 new exports, `omni_str_copy` + `omni_define_string` + `omni_debug_stats` + `omni_abi_version` tested from all four hosts |
-| Same answer from four hosts | done | `scripts/verify-all.sh` — 13 rows, all passing |
+| Host callbacks, re-entrancy, ABI v3 | done | `omni_register_host_fn` + `omni_unregister_host_fn` + `omni_host_fn_count`, a `RefCell` borrow guard on every entry point, and call syntax in the parser |
+| Same answer from four hosts | done | `scripts/verify-all.sh` — 17 rows, all passing |
 
 ```
-cargo test --workspace        # 162 tests
-./scripts/verify-all.sh       # Rust, C, Python, Node: 42, "hello, world", ABI 2
+cargo test --workspace        # 187 tests
+./scripts/verify-all.sh       # Rust, C, Python, Node: 42, "hello, world", ABI 3
 ```
 
 ---
@@ -48,13 +51,13 @@ Measured on 2026-11-03.
 | gcc | 16.2.0 (MinGW-W64 x86_64-ucrt-posix-seh, WinLibs) |
 | Python | 3.15.0 |
 | Node / npm | 26.12.0 / 11.20.0 |
-| **C:** | 100 GB total, **7.6 GB free (93 % used)** |
-| **D:** | 138 GB total, **74 GB free (47 % used)** |
+| **C:** | 100 GB total, **7.3 GB free (93 % used)** |
+| **D:** | 138 GB total, **75 GB free (47 % used)** |
 | `CARGO_HOME` | 982 MB on disk (`du`), 1,067 MB of file bytes — the registry is nearly all of it, and none of it is from this project |
-| `D:\OmniEngine\target` | 201 MB (116 MB `deps`, 82 MB `incremental`) |
-| `target/debug/omni.dll` | 5,492,671 bytes — 5.2 MB, and `du -h` rounds that up to 5.3M |
-| Rust sources | 5,894 lines (`crates/**/*.rs`) |
-| Python, JavaScript, and C sources | 3,474 lines — 1,546 Python, 1,663 JavaScript, 265 C (`sdks/` and `examples/c/`, `node_modules` excluded) |
+| `D:\OmniEngine\target` | 227 MB (216 MB of it under `target/debug`) |
+| `target/debug/omni.dll` | 5,577,792 bytes — 5.3 MB, and `du -h` rounds that up to 5.4M |
+| Rust sources | 7,332 lines (`crates/**/*.rs`) |
+| Python, JavaScript, and C sources | 4,785 lines — 2,194 Python, 2,227 JavaScript, 364 C (`sdks/` and `examples/c/`, `node_modules` excluded) |
 
 **The storage premise needed correcting.** The brief said 20 GB allocated, and
 the natural reading was "keep it small on D:". D: has 74 GB free and is not the
@@ -97,7 +100,8 @@ OmniEngine/
 ├── .gitattributes             EOL policy and Linguist rules (Phase 4)
 ├── crates/
 │   ├── omni-core/             lib.rs value.rs arena.rs counted.rs object.rs lexer.rs engine.rs  (no deps)
-│   ├── omni-ffi/              src/lib.rs, include/omni.h, cbindgen.toml, tests/
+│   ├── omni-ffi/              src/lib.rs, include/omni.h, cbindgen.toml,
+│   │                          tests/{ffi_contract,host_callbacks}.rs
 │   ├── omni-cli/              src/main.rs                            (no deps)
 │   └── omni-wasm/             scaffold, excluded from default builds
 ├── sdks/
@@ -347,7 +351,7 @@ number is never the only clue.
 
 The core deliberately has **no AST type**. `Engine::exec` lexes once and then
 walks the token stream while evaluating, because an expression language with no
-functions has nothing to reuse a tree for. Adding an AST later is a
+user-defined functions has nothing to reuse a tree for. Adding an AST later is a
 refactor-with-a-home (section 10), not a rewrite.
 
 ```
@@ -357,9 +361,15 @@ expr     := additive ( ( '==' | '!=' ) additive )*
 additive := term ( ( '+' | '-' ) term )*
 term     := factor ( ( '*' | '/' | '%' ) factor )*
 factor   := ( '-' | '+' )? primary
-primary  := NUMBER | STRING | IDENT | '(' expr ')'
+primary  := NUMBER | STRING | call | IDENT | '(' expr ')'
+call     := IDENT '(' ( expr ( ',' expr )* )? ')'      // <= MAX_ARGS arguments
 ```
 
+The `IDENT '('` lookahead is what separates a call from a name: `pair` reads a
+binding and `pair()` reads the host function registry, so a host may install both
+under one name and the grammar tells them apart without a second namespace. The
+rule sits at the *primary* level, which is why a call binds tighter than every
+operator — `square(6) + 1` is 37, not a parse error.
 Precedence comes from the recursive descent, left-to-right, so `2 + 3 * 4` is
 14 and `(2 + 3) * 4` is 20 — both tested. Comparison is one level looser than
 `+`, which is what makes `"a" + "b" == "ab"` parse as `("a" + "b") == "ab"`; the
@@ -448,9 +458,11 @@ supposed to grow.
 
 No string length, indexing, slicing, methods, or interpolation; no ordering
 comparisons on strings; no boolean, `nil`, or `undefined *literals*` (booleans
-exist as values, and only `==` / `!=` produce them); no functions, control flow,
-or collections. `Engine::exec` is still the only entry point, and it still takes
-`&str`.
+exist as values, and only `==` / `!=` produce them); no control flow or
+collections. There are no *user-defined* functions either — a call site can only
+name a function the host registered (4.7), which is what makes the grammar's new
+`IDENT '(' args? ')'` rule complete rather than half-built. `Engine::exec` is
+still the only entry point, and it still takes `&str`.
 
 ---
 
@@ -466,7 +478,7 @@ Verified output in `target/debug/` on this machine:
 
 | File | Purpose |
 | --- | --- |
-| `omni.dll` (5.2 MB) | what Python, Node, and `LoadLibrary` load |
+| `omni.dll` (5.3 MB) | what Python, Node, and `LoadLibrary` load |
 | `libomni.dll.a` | MinGW import library, for C link time |
 | `libomni.a` | static archive |
 | `libomni.rlib` | lets the Rust contract tests call the same surface |
@@ -477,18 +489,21 @@ correction: the manifest originally promised `omni.dll` and produced
 `omni_ffi.dll`.
 
 The exports are not assumed. `objdump -p target/debug/omni.dll` shows exactly
-eleven, and that is the check:
+fourteen, and that is the check:
 
 ```
-omni_abi_version   omni_debug_panic   omni_debug_stats    omni_define_string
-omni_engine_free   omni_engine_new    omni_exec           omni_exec_number
-omni_last_error    omni_str_copy      omni_version
+omni_abi_version       omni_debug_panic       omni_debug_stats
+omni_define_string     omni_engine_free       omni_engine_new
+omni_exec              omni_exec_number       omni_host_fn_count
+omni_last_error        omni_register_host_fn  omni_str_copy
+omni_unregister_host_fn                        omni_version
 ```
 
-The four additions are the strings increment: the ABI gate, the copy-out, the
-host-defined string, and the stats read.
+The first four additions are the strings increment: the ABI gate, the copy-out,
+the host-defined string, and the stats read. The last three are the callback
+increment: bind a host function, drop it, and count what is bound.
 
-### 4.2 The three rules that make this sound
+### 4.2 The four rules that make this sound
 
 **A pointer leaves the engine only as an integer nobody may dereference.** The
 arena is bulk-freed at the start of every `exec`, so a `Value` pointing into it
@@ -511,18 +526,27 @@ Every body runs inside `catch_unwind(AssertUnwindSafe(..))` and a caught panic
 becomes `OMNI_ERR_PANIC`. There is a test for it, driven from both sides:
 `omni_debug_panic` returns 3, and the *same* engine then evaluates `1 + 1` to 2.
 
-**The wire format is checked before it is used.** `omni_abi_version()` returns 2,
+**The wire format is checked before it is used.** `omni_abi_version()` returns 3,
 and every host compares it with its own constant *first*: `embed.c` exits before
 creating an engine, and both SDKs refuse to finish loading. A stale artifact read
 with the new layout does not error — `len` and the payload swap meanings and the
 library returns plausible wrong numbers. Version 1 was `{ tag, _pad, number }`;
 the two are the same size, so nothing but this check distinguishes them.
 
+**The engine is borrowed, not assumed free.** A host callback runs *inside* an
+evaluation, so anything it calls back into the same handle would take a second
+mutable borrow of live state. `OmniEngine` holds its `Engine` in a `RefCell`, and
+every entry point opens it with `try_borrow_mut()`: a re-entrant call answers
+`OMNI_ERR_REENTRANT` (6) and touches nothing, where the unchecked version of this
+design would have been two `&mut` aliases and a segfault that looks like a bug in
+the host's own code. It is also what makes section 4.7's borrowed arguments safe
+to read: while a callback holds them, nothing else can move the engine.
+
 ### 4.3 The surface
 
 | Function | Returns |
 | --- | --- |
-| `omni_abi_version()` | `2` — read this before anything else |
+| `omni_abi_version()` | `3` — read this before anything else |
 | `omni_version()` | static NUL-terminated string, never freed |
 | `omni_engine_new()` | opaque `OmniEngine*`, null on failure |
 | `omni_engine_free(e)` | nothing; null is a no-op |
@@ -530,12 +554,17 @@ the two are the same size, so nothing but this check distinguishes them.
 | `omni_exec_number(e, src, len, out)` | status; writes a `double`; refuses a non-number tag |
 | `omni_str_copy(e, value, buf, cap)` | bytes copied; `0` for a non-string tag or an address this engine does not own |
 | `omni_define_string(e, name, name_len, bytes, bytes_len)` | status; installs a global the language can read |
+| `omni_register_host_fn(e, name, name_len, arity, fn, user_data)` | status; binds a function a script can call (4.7) |
+| `omni_unregister_host_fn(e, name, name_len)` | entries removed, `0` or `1` |
+| `omni_host_fn_count(e)` | registrations the engine currently holds |
 | `omni_debug_stats(e, out)` | status; fills `OmniStats`, whose `size` field says which layout was written |
 | `omni_last_error(e, buf, cap)` | bytes written, excluding the NUL |
 | `omni_debug_panic(e)` | status — a test hook, not an API |
 
-Statuses: `0 OK`, `1 ERR_COMPILE`, `2 ERR_RUNTIME`, `3 ERR_PANIC`,
-`4 ERR_ARG`. Tags: `0 NUMBER`, `1 NIL`, `2 BOOL`, `3 UNDEF`, `4 STRING`.
+Statuses: `0 OK`, `1 ERR_COMPILE`, `2 ERR_RUNTIME`, `3 ERR_PANIC`, `4 ERR_ARG`,
+`5 ERR_HOST`, `6 ERR_REENTRANT`. Tags: `0 NUMBER`, `1 NIL`, `2 BOOL`, `3 UNDEF`,
+`4 STRING`. `ERR_HOST` is what a callback's own failure becomes when the script
+that called it fails; `ERR_REENTRANT` is the guard in 4.2.
 
 The layout is pinned on both sides so a drifting SDK fails at compile time
 rather than returning wrong numbers at run time:
@@ -619,7 +648,7 @@ cbindgen --config crates/omni-ffi/cbindgen.toml crates/omni-ffi \
 gcc -std=c11 -Wall -Wextra -I crates/omni-ffi/include \
     examples/c/embed.c target/debug/libomni.dll.a -o target/debug/embed
 cd target/debug && ./embed
-# 28 checks: 42, strings, escapes, host strings, staleness, stats, panic
+# 39 checks: 42, strings, escapes, host strings, staleness, stats, callbacks, panic
 ```
 
 The output goes into `target/debug` because that is where `omni.dll` is: Windows
@@ -641,6 +670,67 @@ One handle, one thread. `&mut Engine` is what the ABI assumes internally, and
 the SDKs document the rule instead of pretending to enforce it. `Send` is
 implemented for the arena types because the handle moves cleanly between
 threads — it is just not shared.
+
+### 4.7 Host callbacks: the bridge running backwards
+
+Everything above hands a value to a host. A host callback hands control *back* —
+the engine reads a call in a script, enters foreign code, and then trusts whatever
+that code writes. Three exports and four rules make that trustworthy.
+
+```c
+int32_t omni_register_host_fn(OmniEngine *engine, const char *name, size_t name_len,
+                              uint32_t arity, omni_host_fn callback, void *user_data);
+size_t  omni_unregister_host_fn(OmniEngine *engine, const char *name, size_t name_len);
+size_t  omni_host_fn_count(const OmniEngine *engine);
+```
+
+The grammar needed one addition: `IDENT '(' args? ')'`, distinguished from a plain
+name binding by the parenthesis, which is why a host string and a host function may
+share a name (`pair` can be both a variable and a callable). Arity is fixed at
+registration and checked by the engine *before* the host is entered, so a callback
+never sees a call it was not written for, and a script that gets the count wrong
+reads `host function 'square' takes 1 argument, got 2`. `MAX_ARGS` is 16 and
+`MAX_CALL_DEPTH` is 64, both enforced in the evaluator rather than documented and
+hoped for.
+
+**Rule 8 — arguments are borrowed, and a string argument's pointer is the text.**
+A *result* struct's `payload.ptr` addresses the engine's own object header, which is
+why `omni_str_copy` takes that struct. An *argument* struct's `payload.ptr` addresses
+the first byte of the payload itself, and both are readable only until the callback
+returns. So a callback reads its arguments with a plain copy — `string_at` in
+`ctypes`, `koffi.decode` in Node, a loop in C — and never with `omni_str_copy`, which
+would re-enter the engine that is already inside the call. Returning a string is the
+mirror of the same rule: the callback puts the address of *its own* bytes in `out`,
+and the engine copies them into egress before it uses them, so the buffer may be
+reused the moment the callback returns.
+
+**Rule 9 — re-entrancy is refused, not supported.** That is the `RefCell` guard in
+4.2, and it is the reason rule 8's borrowed view is sound: the arena is reset at the
+entry of `omni_exec()`, and a nested call can never reach that entry. Where a status
+cannot be returned — `omni_str_copy`, `omni_unregister_host_fn`, `omni_last_error` —
+the answer is `0`, because a `size_t` and a `bool` carry no error code.
+
+**Rule 10 — nothing may unwind; a callback fails by returning 1.** A Python
+exception or a JavaScript `throw` that crossed into Rust would unwind through foreign
+frames, undefined behaviour in both directions. Both SDK trampolines catch
+`BaseException` / any throwable, put the message in `out` as an `OMNI_STRING`, and
+answer `OMNI_HOST_ERR` — `line 1: host function 'boom' failed: ValueError: host said
+no`. The host's own stack is gone by then, so the text is all either side keeps,
+which is why the SDKs prefix the exception class.
+
+**And one rule the header cannot write: the host owns the trampoline's life.** A
+registration outlives the call, so `ctypes` and `koffi` each free their closure the
+moment nothing references it — which would be the line after registration. Each SDK
+therefore keeps the closure alive for exactly as long as the engine holds its
+address: a map on the `Engine`, released by `unregister_function` and then by
+`close()`, in that order. Redefining a name replaces the callback without freeing
+anything, which is safe because the engine never owned it in the first place.
+
+From Rust the whole surface is contract tests
+(`crates/omni-ffi/tests/host_callbacks.rs`); from C it is `embed.c`; from a host it
+is the four `verify-all.sh` rows that only make sense across two languages at once —
+identical bytes from a callback, identical failure text, a re-entrant call refused
+with the engine still usable afterwards, and the registry count agreeing.
 
 ---
 
@@ -708,10 +798,13 @@ checkout and a Linux checkout do not fight over `Cargo.lock`.
 
 **Language statistics** — `linguist-vendored` removes `sdks/**` from the counts,
 and `linguist-documentation` removes `docs/**`. That is what makes the brief's
-"without altering native project statistics" true *in this repository*: the 3,209
-lines of Python and JavaScript under `sdks/` do not dilute the 5,894 lines of
-Rust. `examples/c/embed.c` is deliberately *not* vendored — it is part of the
-engine's own proof, and 265 lines against 5,894 would not move the bar anyway.
+"without altering native project statistics" true *in this repository*: the 4,421
+lines of Python and JavaScript under `sdks/` — 2,194 and 2,227 — do not dilute the
+7,332 lines of Rust. The numbers are raw `wc -l`; Linguist reports fewer for both,
+because it drops blanks and comments, and the ratio is not the claim — the
+*exclusion* is, so no SDK line reaches the bar at all. `examples/c/embed.c` is
+deliberately *not* vendored: it is part of the engine's own proof, and its 364
+lines against 7,332 would not move the bar anyway.
 
 ### 5.3 The honest limit, and the two-tier plan
 
@@ -775,6 +868,23 @@ with Engine() as engine:
     print(engine.stats().egress_bytes_reserved)           # 65536
 ```
 
+A script can also call back into Python:
+
+```python
+with Engine() as engine:
+    engine.register_function("shout", lambda s: s.upper() + "!", arity=1)
+    engine.register_function("now", lambda: 1735689600.0, arity=0)
+    print(engine.string('"say: " + shout("hey")'))   # say: HEY!
+    print(engine.host_function_count)                 # 2
+    engine.unregister_function("now")                 # the script stops seeing it
+```
+
+Arguments arrive as `float` / `bool` / `str` / `None` and the return value goes
+back the same way; anything else, and any exception, becomes a readable host error
+rather than a crash (section 4.7). `arity` is required because a Python signature is
+not reliably knowable, and it is checked by the engine before your callable is
+entered.
+
 `run` returns a frozen `Result` (`tag`, `number`, `text`, `value`); `evaluate`
 returns a `float` and raises `OmniError` on any non-number or failure; `string`
 returns a `str` and raises on any non-string; `try_run` returns
@@ -822,6 +932,25 @@ console.log(engine.run('greeting + "!"').value);       // hello wörld!
 console.log(engine.stats().egressBytesReserved);       // 65536
 engine.close();
 ```
+
+A script can also call back into JavaScript:
+
+```js
+const engine = new Engine();
+engine.registerFunction('shout', (s) => s.toUpperCase() + '!', { arity: 1 });
+engine.registerFunction('config', () => ({ retries: 3 }), { arity: 0 });
+console.log(engine.string('"say: " + shout("hey")'));  // say: HEY!
+console.log(engine.hostFunctionCount);                  // 2
+console.log(engine.tryRun('config()').message);
+// line 1: host function 'config' failed: a host function must return a number,
+//         bool, string, Buffer or null, not object
+engine.close();                                        // releases both trampolines
+```
+
+The last call is the point of the example: an object is not a value the ABI can
+carry, so the SDK reports the shape rule as a host error the script reads with
+status `5` (`host`), instead of coercing `{}` to a number and letting the program
+continue on a lie.
 
 `run` → `Result` (`tag`, `number`, `text`, `value`, where `text` is a `Buffer`);
 `evaluate` → number; `string` → string; `tryRun` → `{ status, statusName, result,
@@ -934,42 +1063,51 @@ One command, and it is the acceptance test for the whole brief:
 ./scripts/verify-all.sh
 ```
 
-Measured output on 2026-11-03, with the strings increment in it:
+Measured output on 2026-11-03, with the callback increment in it:
 
 ```
 == OmniEngine cross-host verification ==
    workspace: /d/OmniEngine
 
-Rust tests... Shared library... omni-cli... C embedding... Python SDK... Node SDK... A string is the same bytes in every host... One type error, the same text everywhere... Every surface agrees on the ABI level... String results do not grow memory...
+Rust tests... Shared library... omni-cli... C embedding... Python SDK... Node SDK... A string is the same bytes in every host... One type error, the same text everywhere... Every surface agrees on the ABI level... String results do not grow memory... A host function answers the same bytes in every host... A host failure is data, and says so identically... Re-entering the engine from a callback is refused, not crashed... The registry says the same thing from both sides...
 == Results ==
-  PASS  cargo test --workspace (162 tests)
-  PASS  omni.dll (5.3M)
+  PASS  cargo test --workspace (187 tests)
+  PASS  omni.dll (5.4M)
   PASS  omni run examples/hello.omni -> 42
   PASS  omni run examples/strings.omni -> hello, world 😀
   PASS  examples/c/embed.c -> 42 via omni.h
   PASS  python ctypes -> 42.0
-  PASS  python SDK tests (63 tests)
+  PASS  python SDK tests (92 tests)
   PASS  node koffi -> 42
-  PASS  node SDK tests (ℹ tests 56 ℹ pass 56 ℹ fail 0 )
+  PASS  node SDK tests (ℹ tests 74 ℹ pass 74 ℹ fail 0 )
   PASS  concat + \u{...} identical in: cli python node
   PASS  the mixed-type message survives the boundary in: cli python node c
-  PASS  ABI 2 declared and read identically: header=2 C=2 python=2/lib=2 node=2/lib=2
+  PASS  ABI 3 declared and read identically: header=3 C=3 python=3/lib=3 node=3/lib=3
   PASS  2000 string executions, one rewind each, reservation flat: python(65536 B) node(65536 B)
+  PASS  an argument crossed in and a string crossed back out, identically in: python node
+  PASS  an exception was caught at the boundary and named in: python node
+  PASS  a second borrow of the same handle errors and the engine lives on in: python node
+  PASS  three registrations, one removal, then the name is unknown in: python node
 
 All checks that could run, passed.
 ```
 
-The last four rows are the ones that could not exist in one host. The string
+The last eight rows are the ones that could not exist in one host. The string
 comparison is byte-exact — an escape decoded differently in Rust and Node passes
 both test suites and is still a broken bridge — and the ABI row reads the number
 off the header, the loaded library as C sees it, and the library as each SDK sees
 it. The egress row runs 2,000 string executions per host and requires the
-reservation to be identical before and after.
+reservation to be identical before and after. The four callback rows then check
+what only a *round trip* can: that a host's answer arrives as the same bytes in
+Python and in Node, that a host's exception surfaces as the same message rather
+than as a crash, that a callback which re-enters its own engine is refused and the
+engine still evaluates `6 * 7` afterwards, and that the registry count and the
+unknown-name error agree on both sides.
 
 The script degrades to `SKIP` rather than lying. `cargo`, `gcc`, `python` and
 `node` each have their own guard, Node without `koffi` is skipped with
 `npm install koffi` in the reason, and each cross-host row skips itself when fewer
-than two hosts answered. Nothing was skipped on this machine — all thirteen rows
+than two hosts answered. Nothing was skipped on this machine — all seventeen rows
 ran. `omni-wasm` has no row here because `wasm32-unknown-unknown` is not
 installed; its 7 tests run under `cargo test --workspace`, where the crate
 compiles for the host target and asserts its status codes against the same
@@ -979,15 +1117,16 @@ Against the brief's five phases:
 
 | Phase | Asked for | Verified by |
 | --- | --- | --- |
-| 1 | Workspace on D:, fast compiles, managed `target/` | `cargo test --workspace` 162 tests; `target/` measured at 201 MB |
+| 1 | Workspace on D:, fast compiles, managed `target/` | `cargo test --workspace` 187 tests; `target/` measured at 227 MB |
 | 2 | Ultra-fast memory-safe core, no GC | NaN-boxed 8-byte `Value` asserted for size; arena reset is O(chunks); egress rewind keeps reservations flat over 5,000 executions; no collector exists to pause |
-| 3 | C ABI callable from Python and JavaScript | same `42` and the same `hello, world 😀` from Rust, C, Python, Node; 11 exports confirmed with `objdump -p`; `omni.h` compiles warning-free under `-Wall -Wextra` |
+| 3 | C ABI callable from Python and JavaScript | same `42` and the same `hello, world 😀` from Rust, C, Python, Node; 14 exports confirmed with `objdump -p`; `omni.h` compiles warning-free under `-Wall -Wextra` |
 | 4 | A custom extension GitHub recognises | `.gitattributes` tier 1; the tier-2 limit is stated in section 5.3 rather than glossed over |
-| 5 | `pip`/`npm` SDKs that do not move the language stats | 63 + 56 SDK tests; `linguist-vendored` on `sdks/**`; no binary vendored into either package |
+| 5 | `pip`/`npm` SDKs that do not move the language stats | 92 + 74 SDK tests; `linguist-vendored` on `sdks/**`; no binary vendored into either package |
 
-Test totals: **110** in `omni-core`, **38** in `omni-ffi` (18 unit plus 20 in
-`tests/ffi_contract.rs`, which drive the ABI exactly as a host does), **7** in
-`omni-cli`, **7** in `omni-wasm`, **63** Python, **56** Node.
+Test totals: **128** in `omni-core`, **45** in `omni-ffi` (18 unit, 20 in
+`tests/ffi_contract.rs`, and 7 in `tests/host_callbacks.rs`, which drive the ABI
+exactly as a host does), **7** in `omni-cli`, **7** in `omni-wasm`, **92** Python,
+**74** Node.
 
 Static checks are part of the definition of done:
 
@@ -1006,15 +1145,15 @@ cache and cargo's `deps` contain hardlinks.
 
 | What | Size | Where | Note |
 | --- | --- | --- | --- |
-| Source tree (excluding `target/`) | 3.6 MB | D: | the whole repository, tracked files only |
-| `target/` total | **201 MB** | D: | `deps` 116 MB, `incremental` 82 MB |
-| `target/debug/omni.dll` | 5.2 MB | D: | the artifact every host loads |
+| Source tree (excluding `target/` and `node_modules`) | 2.5 MB | D: | the whole repository, tracked files only |
+| `target/` total | **228 MB** | D: | 216 MB of it under `target/debug` |
+| `target/debug/omni.dll` | 5.4 MB | D: | the artifact every host loads |
 | `CARGO_HOME` | 982 MB | C: | 897 MB registry + 170 MB `bin` by file size; none of it from this project |
 | `sdks/nodejs/node_modules` | 2.9 MB | D: | koffi prebuild, gitignored |
-| Free on C: | **7.6 GB** (93 % used) | | the binding constraint |
-| Free on D: | 74 GB (47 % used) | | |
+| Free on C: | **7.3 GB** (93 % used) | | the binding constraint |
+| Free on D: | 75 GB (47 % used) | | |
 
-`cargo clean` returns the 201 MB in a second, and it is the only routine way to
+`cargo clean` returns the 228 MB in a second, and it is the only routine way to
 do so. The knobs that keep it that size are in section 2.4: no dependencies, so
 no dependency artifacts; `debug = "line-tables-only"`, so no PDBs.
 
@@ -1043,11 +1182,12 @@ After changing the ABI, run `cargo build -p omni-ffi` explicitly, then re-verify
 This bit me once, and it is why `verify-all.sh` builds the library before it
 tests the hosts.
 
-**`speaks ABI version 1; this SDK is written for ABI version 2`** — that is the
-gate working. The artifact on disk predates the strings increment, and because
-v1 and v2 are both 16 bytes, reading one with the other's layout would produce
-plausible wrong numbers instead of an error. `cargo build -p omni-ffi`, or check
-you have not got two libraries and the discovery order picked the stale one. Both
+**`speaks ABI version 2; this SDK is written for ABI version 3`** — that is the
+gate working. The artifact on disk predates the increment, and because the value
+layout has not changed size since version 1, reading it with a newer SDK's
+assumptions would produce plausible wrong numbers instead of an error. `cargo
+build -p omni-ffi`, or check you have not got two libraries and the discovery
+order picked the stale one. Both
 SDKs tell you which file they mean: the Python error opens with the full path of
 the library it loaded (and when it finds none, it lists every location it tried),
 and in Node `engine.libraryPath` is the absolute path of the artifact that engine
@@ -1071,6 +1211,20 @@ or live host bindings. A value from another engine, a host string that has since
 been redefined, or a `OmniValue` you filled by hand all copy zero bytes rather
 than reading memory they have no claim on. Passing `cap == 0` or a NULL buffer
 does the same, on purpose.
+
+**A host function got `OMNI_ERR_REENTRANT`, or read garbage arguments** — a
+callback may not call back into the engine that called it, and the ABI answers 6
+rather than creating a second mutable reference. The two ways to hit it are
+deliberate in the test suites: calling `omni_exec` from inside a callback, and
+calling `omni_str_copy` on one of your own *arguments* — that helper is an engine
+call, and an argument's `payload.ptr` is already the text, so `memcpy` / `bytes` /
+`Buffer.from` is the read. If a host genuinely needs the engine's answer, compute
+it before the call and pass it in, or register it as a second function.
+
+**A callback worked in one host and not another** — check the arity first. The
+count is fixed at registration and the engine validates it before entering foreign
+code, so a Python callable registered with `arity=2` and called as `f(1)` is a
+runtime error naming both counts, never a partially-filled argument list.
 
 **Node aborts the process with `FATAL ERROR: Error::ThrowAsJavaScriptException`
 and no stack** — a koffi signature named a type koffi had not been told about. It
@@ -1116,9 +1270,12 @@ the call site.
 
 ## 10. What comes next
 
-Strings shipped, and with them the second soundness rule stopped being a claim:
-`OmniValue` is a union, a result's bytes are promoted into a block the host can
-copy from, and `omni_str_copy` refuses addresses it cannot prove. What the same
+Two increments shipped after the first bridge. Strings made `OmniValue` a union,
+promoted a result's bytes into a block a host can copy from, and made
+`omni_str_copy` refuse addresses it cannot prove. Host callbacks then made the
+boundary bidirectional: a script can call foreign code, the engine borrows its own
+state through `RefCell` so a re-entrant call is an error rather than an alias, and
+every host turns an exception into a message instead of an unwind. What the same
 memory model is still waiting for, in rough order:
 
 1. **Booleans, `nil`, `undefined` as literals.** The tags and singletons already
@@ -1128,14 +1285,18 @@ memory model is still waiting for, in rough order:
    way to get a number or a bool *into* a string. The box already stores the
    length, so this is evaluator work, not layout work.
 3. **An AST.** Extracting one from the current one-pass evaluator, so functions
-   and control flow have something to be built from. The grammar is now two
-   levels deeper than it was, which is more reason than before.
-4. **Functions and control flow.** Which is where the arena's `reset`-per-exec
-   model needs re-examining for call frames.
+   and control flow have something to be built from. A call node is the first
+   thing an AST would buy back: today `parse_call` evaluates its arguments as it
+   reads them, so a host function cannot see the source text of its own call, and
+   that is what macros, lazy arguments, and closures would need.
+4. **User-defined functions and control flow.** Host functions settled the call
+   *syntax*, the arity check, and the depth guard, so what remains is language-side
+   frames — which is where the arena's `reset`-per-exec model needs re-examining.
 5. **wasm for real.** `wasm-bindgen`, the `wasm32-unknown-unknown` target, and a
    browser example; the shape is already scaffolded and asserted to agree with
    the C statuses. A wasm string will need its own copy rule, since there is no
-   shared address space to rewind inside.
+   shared address space to rewind inside, and a host callback needs a `JsFunction`
+   rather than a function pointer.
 6. **Linguist tier 2.** The upstream PR from section 5.3, which would also make
    the new `examples/strings.omni` show up under its own language name.
 

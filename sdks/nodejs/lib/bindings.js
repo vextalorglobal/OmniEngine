@@ -42,6 +42,8 @@ const STATUS = Object.freeze({
   ERR_RUNTIME: 2,
   ERR_PANIC: 3,
   ERR_ARG: 4,
+  ERR_HOST: 5,
+  ERR_REENTRANT: 6,
 });
 
 const STATUS_NAMES = Object.freeze({
@@ -50,6 +52,8 @@ const STATUS_NAMES = Object.freeze({
   2: 'runtime',
   3: 'panic',
   4: 'argument',
+  5: 'host',
+  6: 'reentrant',
 });
 
 /** Value tags on OmniValue. */
@@ -75,13 +79,26 @@ const TAG_NAMES = Object.freeze({
  * Version 1 had no `len` field and no string arm, so a v1 library read through
  * these declarations yields `len` as padding -- wrong numbers, not an error.
  * `loadBindings` compares the library's own answer with this constant.
+ *
+ * Version 3 changes no layout: it adds the host callback exports and statuses.
+ * The bump is a guard rail -- a v2 library does not have `omni_register_host_fn`,
+ * so reading a script that calls a host function fails as a runtime error, not
+ * as a missing symbol.
  */
-const ABI_VERSION = 2;
+const ABI_VERSION = 3;
 
 /** The ABI rejects any length above these, before reading a single byte. */
 const MAX_SOURCE_LEN = 2 ** 28;
 const MAX_STRING_LEN = 16 * 1024 * 1024;
 const MAX_IDENTIFIER_LEN = 32;
+
+/** How many arguments a host function may take, and how deep calls may nest. */
+const MAX_ARGS = 16;
+const MAX_CALL_DEPTH = 64;
+
+/** What a host callback returns: success, or failure with a message in `out`. */
+const HOST_OK = 0;
+const HOST_ERR = 1;
 
 function statusName(status) {
   return STATUS_NAMES[status] || `status-${status}`;
@@ -173,6 +190,15 @@ function declare(koffi, lib, resolvedPath) {
     egress_high_water: 'uint64_t',
   });
 
+  // The callback signature. Declared as a proto so koffi knows how to build the
+  // trampoline when `koffi.register` is called on a JavaScript function. It is
+  // never named inside a signature string below -- koffi rejects a proto used as
+  // a parameter type, so the registry calls take `void *` and are handed the
+  // BigInt address that `koffi.register` returns.
+  const OmniHostFn = koffi.proto(
+    'int32_t OmniHostFn(void *user_data, const OmniValue *args, uint32_t argc, OmniValue *out)'
+  );
+
   // Fail here rather than returning wrong numbers later if the two sides drift.
   // koffi reports sizes and offsets for its own type system, which is the only
   // way to compare a header written in Rust with a struct declared in JS.
@@ -218,6 +244,7 @@ function declare(koffi, lib, resolvedPath) {
     OmniPayload,
     OmniValue,
     OmniStats,
+    OmniHostFn,
     statusName,
     tagName,
     STATUS,
@@ -226,6 +253,10 @@ function declare(koffi, lib, resolvedPath) {
     MAX_SOURCE_LEN,
     MAX_STRING_LEN,
     MAX_IDENTIFIER_LEN,
+    MAX_ARGS,
+    MAX_CALL_DEPTH,
+    HOST_OK,
+    HOST_ERR,
     abiVersion,
     version: lib.func('const char *omni_version()'),
     engineNew: lib.func('void *omni_engine_new()'),
@@ -240,6 +271,9 @@ function declare(koffi, lib, resolvedPath) {
     // explicit length for each buffer and may be handed bytes with a NUL in
     // them, which a string type would silently cut short.
     defineString: lib.func('uint32_t omni_define_string(void *engine, const void *name, size_t nameLen, const void *bytes, size_t bytesLen)'),
+    registerHostFn: lib.func('uint32_t omni_register_host_fn(void *engine, const void *name, size_t nameLen, uint32_t arity, void *cb, void *user_data)'),
+    unregisterHostFn: lib.func('size_t omni_unregister_host_fn(void *engine, const void *name, size_t nameLen)'),
+    hostFnCount: lib.func('size_t omni_host_fn_count(const void *engine)'),
     debugStats: lib.func('uint32_t omni_debug_stats(void *engine, OmniStats *out)'),
     lastError: lib.func('size_t omni_last_error(void *engine, void *buf, size_t cap)'),
     debugPanic: lib.func('uint32_t omni_debug_panic(void *engine)'),
@@ -281,4 +315,8 @@ module.exports = {
   MAX_SOURCE_LEN,
   MAX_STRING_LEN,
   MAX_IDENTIFIER_LEN,
+  MAX_ARGS,
+  MAX_CALL_DEPTH,
+  HOST_OK,
+  HOST_ERR,
 };

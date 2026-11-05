@@ -121,6 +121,46 @@ error messages is a binding that can hide one.
 Prefer data to exceptions? `tryRun` returns
 `{ status, statusName, result, message }` and never throws.
 
+## Calling back into JavaScript
+
+A script can call a JS function. Bind it by name, with the arity the script will
+use:
+
+```js
+engine.registerFunction('shout', (s) => s.toUpperCase() + '!', { arity: 1 });
+engine.registerFunction('now', () => 1735689600, { arity: 0 });
+
+engine.string('"say: " + shout("hey")');  // 'say: HEY!'
+engine.evaluate('now()');                  // 1735689600
+engine.hostFunctionCount;                  // 2
+engine.unregisterFunction('now');          // true; the name stops resolving
+engine.run('now()');                       // throws: unknown function 'now'
+```
+
+Arguments arrive as `number`, `boolean`, `string` or `null`, and the return value
+goes back the same way — `undefined` crosses as `nil`, and a number is a
+JavaScript `number` because every OmniEngine number is a `double`. Two rules
+decide what your function may do:
+
+- **The arguments are borrowed, and they are already decoded.** A string argument
+  is a JS `string` by the time your function runs, so there is nothing to copy —
+  but keep it only for the duration of the call.
+- **Do not call back into the same engine from inside a callback.** The ABI
+  refuses it with `OMNI_ERR_REENTRANT` (status 6) rather than handing out a second
+  mutable reference, and `lastError()`, `strCopy` and `unregisterFunction` report
+  the same refusal as an empty result or `false`. Compute what you need before the
+  call, or register a second function.
+
+Anything your function throws is caught at the boundary and becomes
+`host function 'shout' failed: Error: …` in the script's error, because an
+exception unwinding through the Rust frames that called your callback is undefined
+behaviour. A return value the ABI cannot carry — an object, a symbol, a function —
+is reported the same way, so a stray `{}` fails loudly instead of crossing as `0`.
+
+The koffi handle and the encoded name are held for as long as the engine knows
+them, which is what `close()` releases. Register once at start-up; a callback
+re-registered per request pays the encode every time.
+
 ## What is guaranteed
 
 - The engine handle is a **BigInt**. Converting it with `Number()` would
@@ -129,6 +169,10 @@ Prefer data to exceptions? `tryRun` returns
   takes the value struct, and the bytes arrive in a `Buffer` you own.
 - Source, names and payloads are passed as UTF-8 `Buffer`s with explicit
   lengths, never as NUL-terminated strings the ABI does not expect.
+- A registration is refused here, before the ABI sees it, when the callable is
+  not a function or the arity is not an integer between 0 and `MAX_ARGS` —
+  `kind === 'argument'`, and `hostFunctionCount` unchanged. A typo'd callback
+  fails where you typed it, not several evaluations later inside a script.
 - `OmniValue`, `OmniPayload` and `OmniStats` sizes and every field offset are
   asserted against the C header at load time.
 - The library's ABI level is read at load and compared with this package's. A
@@ -139,12 +183,18 @@ Prefer data to exceptions? `tryRun` returns
   length makes the copy shorter, the untouched tail is dropped rather than
   exposed through `.buffer`.
 - A Rust panic returns status `3` instead of terminating your process.
-- `close()` is idempotent, and the scratch memory koffi allocated is freed.
+- An exception thrown inside a host function becomes status `5` (`host`) with
+  your message in the script's error, never an unwind through the Rust frames that
+  called your callback.
+- `close()` is idempotent, and the scratch memory koffi allocated is freed. Every
+  registered trampoline is unregistered first, so a live JS closure is never left
+  pointing at a dead engine.
 
 ## Limits
 
 One engine per thread. A Worker needs its own `Engine`, and a handle must never
-cross a worker boundary.
+cross a worker boundary. A host function registered on an engine is released when
+that engine closes, and a callback may not call back into the same engine.
 
 Strings are data, not a full string language yet: literals with `\n`, `\r`,
 `\t`, `\"`, `\\` and `\u{…}` escapes, `+` concatenation with strict typing
@@ -152,6 +202,11 @@ Strings are data, not a full string language yet: literals with `\n`, `\r`,
 content equality. No length, indexing, slicing, methods, interpolation or
 ordering comparisons yet — and no `null` or `true` literals, so booleans only
 arrive from a comparison.
+
+A host function takes at most 16 arguments (`MAX_ARGS`) and a program may nest
+calls 64 deep (`MAX_CALL_DEPTH`); both are checked by the engine and reported as
+errors rather than as a stack overflow. A returned string is capped by the same
+`MAX_STRING_LEN` the engine gives a program.
 
 `text` is a fresh `Buffer` per string result, and that copy is the price of the
 rule above. Measure it with `engine.stats()` before optimising around it.
@@ -161,7 +216,7 @@ rule above. Measure it with `engine.stats()` before optimising around it.
 ```bash
 cd sdks/nodejs
 npm install koffi
-npm test                                   # 56 tests, node:test
+npm test                                   # 74 tests, node:test
 ```
 
 They need `cargo build -p omni-ffi` — the build, not `cargo test`, because the

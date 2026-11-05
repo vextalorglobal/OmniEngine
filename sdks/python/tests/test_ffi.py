@@ -47,7 +47,7 @@ class VerticalSlice(unittest.TestCase):
         # The SDK refused to hand back a library whose layout this file cannot
         # read, so by the time an Engine exists the level is known.
         self.assertEqual(engine.abi_version, _ffi.OMNI_ABI_VERSION)
-        self.assertEqual(engine.abi_version, 2)
+        self.assertEqual(engine.abi_version, 3)
 
     def test_arithmetic_precedence_and_parentheses(self) -> None:
         engine = omni.Engine()
@@ -270,6 +270,312 @@ class HostStrings(unittest.TestCase):
         status = raw.define_string("bad", b"\xff\xfe")
         self.assertEqual(status, _ffi.OMNI_ERR_ARG)
         self.assertEqual(raw.last_error(), "")  # the status is the whole report
+
+
+class HostFunctions(unittest.TestCase):
+    """Phase 3's new direction: a script calls *out* into Python.
+
+    Every test here is also a lifetime test. A registration hands C the address
+    of a ctypes closure, so the assertions keep coming back to the same two
+    questions -- is the closure still alive when the engine calls it, and is it
+    released only once the engine has forgotten it?
+    """
+
+    def setUp(self) -> None:
+        self.engine = omni.Engine()
+        self.addCleanup(self.engine.close)
+        self.calls: list[object] = []
+
+    def spy(self, result: object = "spied"):
+        """A callable that records what it was given and answers with `result`."""
+
+        def fn(value):
+            self.calls.append(value)
+            return result
+
+        return fn
+
+    def test_a_python_function_answers_a_script(self) -> None:
+        # The acceptance criterion, stated in the spec: a host-defined function
+        # called from an .omni program returns the value it computed.
+        self.engine.register_function("square", lambda x: x * x, arity=1)
+        self.assertEqual(self.engine.evaluate("square(6) + 1"), 37.0)
+        self.assertEqual(self.engine.host_function_count, 1)
+
+    def test_arguments_arrive_as_python_data(self) -> None:
+        self.engine.register_function("spy", self.spy(0.0), arity=1)
+        self.assertEqual(self.calls, [])
+        self.engine.run("spy(1.5)")
+        self.assertEqual(self.calls, [1.5])
+        self.calls.clear()
+        self.engine.run('spy("text")')
+        self.assertEqual(self.calls, ["text"])
+        self.calls.clear()
+        self.engine.run("spy(1 == 1)")  # the grammar has no boolean literal
+        self.assertEqual(self.calls, [True])
+
+    def test_a_string_argument_its_bytes_and_no_more(self) -> None:
+        # The borrowed view is exactly `len` bytes long. A Python function that
+        # reads to a NUL would stop early; one that over-reads would see the next
+        # allocation. Length is the only answer, and interior NULs prove it.
+        seen: list[str] = []
+        self.engine.register_function("collect", lambda s: seen.append(s) or "-", arity=1)
+        self.engine.run(r'collect("a" + "\u{0}" + "b")')
+        self.assertEqual(seen, ["a\x00b"])
+
+    def test_return_types_become_the_values_they_look_like(self) -> None:
+        cases = {
+            "num": (lambda: 42, "number", 42.0),
+            "neg": (lambda: -1.5, "number", -1.5),
+            "yes": (lambda: True, "bool", True),
+            "no": (lambda: False, "bool", False),
+            "nothing": (lambda: None, "nil", None),
+            "text": (lambda: "hi", "string", "hi"),
+            "raw": (lambda: b"bytes", "string", "bytes"),
+            "empty": (lambda: "", "string", ""),
+        }
+        for name, (fn, tag, value) in cases.items():
+            with self.subTest(name=name):
+                self.engine.register_function(name, fn, arity=0)
+                result = self.engine.run(f"{name}()")
+                self.assertEqual(result.tag, tag)
+                self.assertEqual(result.value, value)
+
+    def test_a_returned_string_is_the_engines_after_the_next_execution(self) -> None:
+        # The trampoline keeps its output buffer until the *next* call replaces
+        # it, which is what lets the engine read it after Python has returned.
+        # Result.text is Python bytes either way, so a later run cannot disturb it.
+        self.engine.register_function("greet", lambda name: f"hello {name}", arity=1)
+        first = self.engine.run('greet("fahim")')
+        for _ in range(20):
+            self.engine.run('greet("someone much longer than the first answer")')
+        self.assertEqual(first.value, "hello fahim")
+
+    def test_nesting_and_arity_are_checked_before_python_is_entered(self) -> None:
+        self.engine.register_function("add", lambda a, b: a + b, arity=2)
+        self.assertEqual(self.engine.evaluate("add(add(1, 2), 3)"), 6.0)
+        with self.assertRaises(omni.OmniError) as caught:
+            self.engine.run("add(1)")
+        self.assertEqual(caught.exception.kind, "runtime")
+        self.assertIn("takes 2 arguments, got 1", caught.exception.message)
+
+    def test_a_wrong_count_never_calls_the_host(self) -> None:
+        self.engine.register_function("never", lambda x: x, arity=1)
+        with self.assertRaises(omni.OmniError):
+            self.engine.run("never(1, 2)")
+        # `never` ran zero times: arity is the engine's check, not the host's.
+        self.assertEqual(self.engine.evaluate("1 + 1"), 2.0)
+
+    def test_an_unregistered_name_fails_where_it_is_called(self) -> None:
+        # Name resolution happens at evaluation, not at parse: the grammar cannot
+        # know which names a host will register, so an unknown callee is a
+        # runtime error that says so and gives the line.
+        with self.assertRaises(omni.OmniError) as caught:
+            self.engine.run("nothere(1)")
+        self.assertEqual(caught.exception.kind, "runtime")
+        self.assertIn("unknown function 'nothere'", caught.exception.message)
+
+    def test_more_arguments_than_the_abi_carries_is_refused(self) -> None:
+        with self.assertRaises(omni.OmniError) as caught:
+            self.engine.register_function("wide", lambda *a: 0.0, arity=_ffi.MAX_ARGS + 1)
+        self.assertEqual(caught.exception.kind, "argument")
+        self.assertIn("0 and 16", caught.exception.message)
+        self.assertEqual(self.engine.host_function_count, 0)
+        # And at the other end, a function of 16 arguments is registerable.
+        self.engine.register_function("wide", lambda *a: float(len(a)), arity=_ffi.MAX_ARGS)
+        args = ", ".join(str(i) for i in range(_ffi.MAX_ARGS))
+        self.assertEqual(self.engine.evaluate(f"wide({args})"), float(_ffi.MAX_ARGS))
+
+    def test_a_python_exception_becomes_a_host_error_not_a_crash(self) -> None:
+        def boom(value):
+            raise RuntimeError("the host said no")
+
+        self.engine.register_function("boom", boom, arity=1)
+        with self.assertRaises(omni.OmniError) as caught:
+            self.engine.run("boom(1) + 1")
+        self.assertEqual(caught.exception.kind, "host")
+        self.assertEqual(caught.exception.status, _ffi.OMNI_ERR_HOST)
+        self.assertIn("line 1", caught.exception.message)
+        self.assertIn("host function 'boom' failed", caught.exception.message)
+        self.assertIn("RuntimeError: the host said no", caught.exception.message)
+        # The engine is still standing, and still knows the function.
+        self.assertEqual(self.engine.evaluate("1 + 1"), 2.0)
+
+    def test_a_return_value_python_cannot_pass_is_reported(self) -> None:
+        self.engine.register_function("odd", lambda: {"not": "a value"}, arity=0)
+        with self.assertRaises(omni.OmniError) as caught:
+            self.engine.run("odd()")
+        self.assertEqual(caught.exception.kind, "host")
+        self.assertIn("must return a number, bool, str, bytes or None, not dict", caught.exception.message)
+
+    def test_a_callback_that_calls_back_in_is_refused_not_corrupting(self) -> None:
+        # Re-entrancy on one handle is the soundness case the ABI refuses: the
+        # engine is borrowed by the call that entered Python, so Python's own
+        # run() gets status 6, which the trampoline turns into a host error.
+        def reenter(value):
+            return self.engine.evaluate("1 + 1")
+
+        self.engine.register_function("reenter", reenter, arity=1)
+        with self.assertRaises(omni.OmniError) as caught:
+            self.engine.run("reenter(1)")
+        self.assertEqual(caught.exception.kind, "host")
+        self.assertIn("already inside a host function", caught.exception.message)
+
+    def test_unregister_lets_the_script_stop_seeing_the_name(self) -> None:
+        self.engine.register_function("temp", lambda: 1.0, arity=0)
+        self.assertEqual(self.engine.evaluate("temp()"), 1.0)
+        self.assertTrue(self.engine.unregister_function("temp"))
+        self.assertEqual(self.engine.host_function_count, 0)
+        with self.assertRaises(omni.OmniError) as caught:
+            self.engine.run("temp()")
+        self.assertEqual(caught.exception.kind, "runtime")
+        # Idempotent, and it answers honestly the second time.
+        self.assertFalse(self.engine.unregister_function("temp"))
+
+    def test_redefining_a_name_replaces_the_callable(self) -> None:
+        self.engine.register_function("f", lambda: 1.0, arity=0)
+        self.engine.register_function("f", lambda: 2.0, arity=0)
+        self.assertEqual(self.engine.evaluate("f()"), 2.0)
+        self.assertEqual(self.engine.host_function_count, 1)
+
+    def test_a_non_callable_is_rejected_before_the_abi_sees_it(self) -> None:
+        # Node can ask `typeof` for free, and Python can ask `callable`; both
+        # decline the registration rather than storing a trampoline that fails as a
+        # host error several evaluations later.
+        for not_a_function in (42, "shout", None, ["a", "list"]):
+            with self.assertRaises(omni.OmniError) as caught:
+                self.engine.register_function("bad", not_a_function, arity=0)
+            self.assertEqual(caught.exception.kind, "argument")
+        self.assertEqual(self.engine.host_function_count, 0)
+
+    def test_a_name_binding_and_a_function_of_the_same_name_coexist(self) -> None:
+        # define_string owns a variable, register_function owns a call site; the
+        # grammar tells them apart by the parenthesis, so both are legal.
+        self.engine.define_string("pair", "two words")
+        self.engine.register_function("pair", lambda: 2.0, arity=0)
+        self.assertEqual(self.engine.run("pair").value, "two words")
+        self.assertEqual(self.engine.evaluate("pair()"), 2.0)
+
+    def test_a_registration_survives_interpretations_and_a_dropped_name(self) -> None:
+        import gc
+
+        def long_lived(value):
+            return value
+
+        self.engine.register_function("keep", long_lived, arity=1)
+        # Drop every Python name that could be the only thing keeping the closure
+        # alive, then collect. If the SDK had handed C a borrowed reference, this
+        # is where the interpreter would die -- instead the engine still calls it.
+        del long_lived
+        gc.collect()
+        for _ in range(2_000):
+            self.assertEqual(self.engine.run("keep(7)").value, 7.0)
+        self.assertEqual(self.engine.host_function_count, 1)
+
+    def test_the_rentrancy_guard_leaves_memory_flat(self) -> None:
+        # Registrations are not arena allocations, so 2,000 callbacks reserve
+        # nothing beyond what the first one did.
+        self.engine.register_function("echo", lambda s: s, arity=1)
+        self.engine.run('echo("prime")')
+        before = self.engine.stats()
+        for _ in range(2_000):
+            self.assertEqual(self.engine.run('echo("a string through python")').value, "a string through python")
+        after = self.engine.stats()
+        self.assertEqual(after.arena_bytes_reserved, before.arena_bytes_reserved)
+        self.assertEqual(after.egress_bytes_reserved, before.egress_bytes_reserved)
+
+    def test_two_engines_do_not_share_host_functions(self) -> None:
+        other = omni.Engine()
+        self.addCleanup(other.close)
+        self.engine.register_function("mine", lambda: 1.0, arity=0)
+        self.assertEqual(self.engine.host_function_count, 1)
+        self.assertEqual(other.host_function_count, 0)
+        with self.assertRaises(omni.OmniError) as caught:
+            other.run("mine()")
+        self.assertEqual(caught.exception.kind, "runtime")
+
+    def test_python_recursion_costs_the_engine_no_depth(self) -> None:
+        # A callable that recurses in Python stays one call deep: the engine
+        # entered it once, and re-entering the engine from inside is refused
+        # rather than counted. So the depth guard is about the *program's*
+        # nesting, which is the recursion the native stack would otherwise pay for.
+        def down(value):
+            if value == 0.0:
+                return 0.0
+            return down(value - 1)
+
+        self.engine.register_function("down", down, arity=1)
+        self.assertEqual(self.engine.evaluate("down(500)"), 0.0)
+
+    def test_a_program_that_nests_past_the_guard_is_stopped(self) -> None:
+        # MAX_CALL_DEPTH is the reason this test exists at all: without it,
+        # `id(id(id(...)))` would grow the native stack until the process died.
+        def nest(depth: int) -> str:
+            return "id(" * depth + "1" + ")" * depth
+
+        self.engine.register_function("id", lambda x: x, arity=1)
+        self.assertEqual(self.engine.evaluate(nest(_ffi.MAX_CALL_DEPTH)), 1.0)
+        with self.assertRaises(omni.OmniError) as caught:
+            self.engine.evaluate(nest(_ffi.MAX_CALL_DEPTH + 1))
+        self.assertEqual(caught.exception.kind, "runtime")
+        self.assertIn(f"nested {_ffi.MAX_CALL_DEPTH} deep", caught.exception.message)
+        # And the counter is per execution: the same program one depth shorter
+        # still works after the refusal.
+        self.assertEqual(self.engine.evaluate(nest(_ffi.MAX_CALL_DEPTH)), 1.0)
+
+    def test_close_releases_every_registration_it_holds(self) -> None:
+        raw = _ffi.RawEngine()
+        for index in range(5):
+            self.assertEqual(raw.register_host_fn(f"f{index}", 0, lambda: 1.0), _ffi.OMNI_OK)
+        self.assertEqual(raw.host_fn_count(), 5)
+        raw.close()
+        raw.close()  # idempotent, and it must not call into a freed handle twice
+
+    def test_a_registration_with_a_bad_name_is_rejected_locally(self) -> None:
+        with self.assertRaises(omni.OmniError) as caught:
+            self.engine.register_function("n" * 33, lambda: 1.0, arity=0)
+        self.assertEqual(caught.exception.kind, "argument")
+        self.assertEqual(self.engine.host_function_count, 0)
+        # An empty name reaches the library, which refuses it as an argument.
+        self.assertEqual(_ffi.RawEngine().register_host_fn("", 0, lambda: 1.0), _ffi.OMNI_ERR_ARG)
+
+
+class CallSyntax(unittest.TestCase):
+    """The grammar Phase 3 added, tested through the friendly wrapper."""
+
+    def setUp(self) -> None:
+        self.engine = omni.Engine()
+        self.addCleanup(self.engine.close)
+        self.engine.register_function("id", lambda x: x, arity=1)
+
+    def test_a_call_is_an_expression_not_only_a_statement(self) -> None:
+        self.assertEqual(self.engine.evaluate("id(1) + id(2)"), 3.0)
+        self.assertTrue(self.engine.run('id("a") == "a"').value)
+        self.assertEqual(self.engine.run("-id(2) * id(3)").value, -6.0)
+
+    def test_whitespace_and_a_paren_still_mean_a_call(self) -> None:
+        self.assertEqual(self.engine.evaluate("id ( 5 )"), 5.0)
+
+    def test_a_missing_comma_names_the_call(self) -> None:
+        with self.assertRaises(omni.OmniError) as caught:
+            self.engine.run('id(1 2)')
+        self.assertEqual(caught.exception.kind, "compile")
+        self.assertIn("expected ',' or ')'", caught.exception.message)
+
+    def test_an_unclosed_call_is_a_compile_error(self) -> None:
+        with self.assertRaises(omni.OmniError) as caught:
+            self.engine.run("id(1")
+        self.assertEqual(caught.exception.kind, "compile")
+
+    def test_a_semicolon_and_a_comment_after_a_call_are_ignored(self) -> None:
+        self.assertEqual(self.engine.evaluate("id(1); // trailing"), 1.0)
+
+    def test_too_many_arguments_in_a_program_is_a_parse_error(self) -> None:
+        args = ", ".join("1" for _ in range(_ffi.MAX_ARGS + 1))
+        with self.assertRaises(omni.OmniError) as caught:
+            self.engine.run(f"id({args})")
+        self.assertEqual(caught.exception.kind, "compile")
+        self.assertIn("at most 16 arguments", caught.exception.message)
 
 
 class Memory(unittest.TestCase):
@@ -543,7 +849,7 @@ class Discovery(unittest.TestCase):
         with self.assertRaises(omni.OmniLibraryError) as caught:
             _ffi._checked(Fake(), "stale-omni.dll")
         self.assertIn("ABI version 1", str(caught.exception))
-        self.assertIn("ABI version 2", str(caught.exception))
+        self.assertIn("ABI version 3", str(caught.exception))
         self.assertIn("cargo build -p omni-ffi", str(caught.exception))
 
     def test_a_library_without_an_abi_version_export_is_refused(self) -> None:

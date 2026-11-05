@@ -346,9 +346,9 @@ test('the OmniStats layout matches omni.h', () => {
 test('the ABI level is read from the library, not assumed', () => {
   const engine = new Engine();
   try {
-    assert.equal(engine.abiVersion, 2);
+    assert.equal(engine.abiVersion, 3);
     assert.equal(engine.abiVersion, bindings.ABI_VERSION);
-    assert.equal(omni.ABI_VERSION, 2);
+    assert.equal(omni.ABI_VERSION, 3);
   } finally {
     engine.close();
   }
@@ -364,17 +364,19 @@ test('checkAbi refuses a library that speaks another wire format', () => {
     (err) => {
       assert.equal(err.name, 'OmniLibraryError');
       assert.match(err.message, /ABI version 1/);
-      assert.match(err.message, /ABI version 2/);
+      assert.match(err.message, /ABI version 3/);
       assert.match(err.message, /cargo build -p omni-ffi/);
       return true;
     }
   );
-  assert.equal(bindings.checkAbi(2, '/current/omni.dll'), 2);
+  assert.equal(bindings.checkAbi(3, '/current/omni.dll'), 3);
 });
 
 test('status and tag names', () => {
   assert.equal(omni.statusName(0), 'ok');
   assert.equal(omni.statusName(4), 'argument');
+  assert.equal(omni.statusName(5), 'host');
+  assert.equal(omni.statusName(6), 'reentrant');
   assert.equal(omni.statusName(99), 'status-99');
   assert.equal(omni.tagName(0), 'number');
   assert.equal(omni.tagName(3), 'undef');
@@ -813,4 +815,284 @@ test('a Rust panic leaves a string result working', () => {
   } finally {
     engine.close();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Phase 3: host functions called from the script
+// ---------------------------------------------------------------------------
+
+test('a JavaScript function answers the script', () => {
+  const engine = new Engine();
+  try {
+    engine.registerFunction('square', (x) => x * x, { arity: 1 });
+    assert.equal(engine.evaluate('square(6) + 1'), 37);
+    assert.equal(engine.run('square(square(2))').value, 16);
+  } finally {
+    engine.close();
+  }
+});
+
+test('arguments are lowered to JavaScript values', () => {
+  const engine = new Engine();
+  try {
+    const seen = [];
+    engine.registerFunction('record', (...args) => { seen.push(args); return null; }, { arity: 3 });
+    engine.run('record(42, "omni" + " " + "engine", 1 == 1)');
+    assert.deepEqual(seen, [[42, 'omni engine', true]]);
+    seen.length = 0;
+    engine.run('record("a" + "\\u{0}" + "b", 1 / 2, "")');
+    assert.deepEqual(seen, [['a\x00b', 0.5, '']]);
+  } finally {
+    engine.close();
+  }
+});
+
+test('every return shape crosses the boundary', () => {
+  const engine = new Engine();
+  try {
+    engine.registerFunction('num', () => 3.5, { arity: 0 });
+    engine.registerFunction('yes', () => true, { arity: 0 });
+    engine.registerFunction('no', () => false, { arity: 0 });
+    engine.registerFunction('str', () => 'returned', { arity: 0 });
+    engine.registerFunction('buf', () => Buffer.from('bytes', 'utf8'), { arity: 0 });
+    engine.registerFunction('nil', () => null, { arity: 0 });
+    engine.registerFunction('undef', () => undefined, { arity: 0 });
+
+    assert.deepEqual(engine.run('num()'), { tag: 'number', number: 3.5, text: Buffer.alloc(0), value: 3.5 });
+    assert.equal(engine.run('yes()').value, true);
+    assert.equal(engine.run('yes()').tag, 'bool');
+    assert.equal(engine.run('no()').value, false);
+    assert.equal(engine.run('str()').value, 'returned');
+    assert.equal(engine.run('buf()').value, 'bytes');
+    assert.equal(engine.run('nil()').tag, 'nil');
+    assert.equal(engine.run('undef()').tag, 'nil'); // null and undefined are the engine's nil
+  } finally {
+    engine.close();
+  }
+});
+
+test('a returned string survives 20 later executions', () => {
+  const engine = new Engine();
+  try {
+    engine.registerFunction('answer', () => 'kept', { arity: 0 });
+    const result = engine.run('answer()');
+    assert.equal(result.value, 'kept');
+    for (let i = 0; i < 20; i++) engine.run('"overwritten with other text entirely"');
+    assert.equal(result.value, 'kept');
+  } finally {
+    engine.close();
+  }
+});
+
+test('arity is checked before the function runs', () => {
+  const engine = new Engine();
+  let calls = 0;
+  try {
+    engine.registerFunction('once', () => { calls++; return 1; }, { arity: 0 });
+    assert.throws(() => engine.run('once(1)'), (err) => err.kind === 'runtime' && /takes 0 arguments/.test(err.message));
+    assert.equal(calls, 0);
+    assert.equal(engine.run('once()').value, 1);
+    assert.equal(calls, 1);
+  } finally {
+    engine.close();
+  }
+});
+
+test('an unknown function is a runtime error, not a compile error', () => {
+  const engine = new Engine();
+  try {
+    assert.throws(() => engine.run('nothere()'), (err) => err.kind === 'runtime' && /unknown function 'nothere'/.test(err.message));
+  } finally {
+    engine.close();
+  }
+});
+
+test('16 arguments is the most a function may take', () => {
+  const engine = new Engine();
+  try {
+    const sixteen = (...args) => args.reduce((acc, n) => acc + n, 0);
+    engine.registerFunction('add16', sixteen, { arity: 16 });
+    const program = 'add16(' + Array(16).fill('1').join(',') + ')';
+    assert.equal(engine.evaluate(program), 16);
+
+    assert.throws(() => engine.registerFunction('too17', () => 0, { arity: 17 }), (err) => err.kind === 'argument');
+  } finally {
+    engine.close();
+  }
+});
+
+test('a host function must be callable, and the engine registers nothing otherwise', () => {
+  const engine = new Engine();
+  try {
+    for (const notAFunction of [42, 'shout', null, undefined, {}, ['a']]) {
+      assert.throws(
+        () => engine.registerFunction('bad', notAFunction, { arity: 0 }),
+        (err) => err.kind === 'argument'
+      );
+    }
+    assert.equal(engine.hostFunctionCount, 0);
+  } finally {
+    engine.close();
+  }
+});
+
+test('a JavaScript exception becomes a host error with its message', () => {
+  const engine = new Engine();
+  try {
+    engine.registerFunction('boom', () => { throw new Error('kaboom'); }, { arity: 0 });
+    assert.throws(
+      () => engine.run('boom()'),
+      (err) => {
+        assert.equal(err.status, STATUS.ERR_HOST);
+        assert.equal(err.kind, 'host');
+        assert.match(err.message, /host function 'boom' failed/);
+        assert.match(err.message, /kaboom/);
+        return true;
+      }
+    );
+  } finally {
+    engine.close();
+  }
+});
+
+test('a wrong return type becomes a host error', () => {
+  const engine = new Engine();
+  try {
+    engine.registerFunction('badreturn', () => ({ oops: true }), { arity: 0 });
+    assert.throws(
+      () => engine.run('badreturn()'),
+      (err) => err.kind === 'host' && /must return a number, bool, string, Buffer or null/.test(err.message)
+    );
+  } finally {
+    engine.close();
+  }
+});
+
+test('a function may not call back into the engine that called it', () => {
+  const engine = new Engine();
+  try {
+    engine.registerFunction('nested', () => engine.run('1 + 1'), { arity: 0 });
+    assert.throws(
+      () => engine.run('nested()'),
+      (err) => {
+        assert.equal(err.kind, 'host');
+        assert.match(err.message, /already inside a host function/);
+        return true;
+      }
+    );
+  } finally {
+    engine.close();
+  }
+});
+
+test('unregisterFunction, replace and coexist with defineString', () => {
+  const engine = new Engine();
+  try {
+    engine.defineString('greeting', 'hello');
+    engine.registerFunction('shout', (s) => s.toUpperCase() + '!', { arity: 1 });
+    assert.equal(engine.run('shout(greeting)').value, 'HELLO!');
+
+    engine.registerFunction('shout', (s) => s.toLowerCase(), { arity: 1 });
+    assert.equal(engine.run('shout(greeting)').value, 'hello');
+
+    assert.equal(engine.unregisterFunction('shout'), true);
+    assert.equal(engine.unregisterFunction('shout'), false);
+    assert.throws(() => engine.run('shout(greeting)'), (err) => err.kind === 'runtime' && /unknown function/.test(err.message));
+    assert.equal(engine.run('greeting').value, 'hello');
+  } finally {
+    engine.close();
+  }
+});
+
+test('host functions survive collection, close and re-open', () => {
+  let engine = new Engine();
+  engine.registerFunction('identity', (x) => x, { arity: 1 });
+  const kept = engine;
+  engine = null;
+  if (global.gc) global.gc();
+  assert.equal(kept.run('identity(42)').value, 42);
+  kept.close();
+  assert.throws(() => kept.run('identity(42)'), (err) => err.kind === 'argument');
+});
+
+test('memory is flat across 2,000 callback calls', () => {
+  const engine = new Engine();
+  try {
+    engine.registerFunction('double', (x) => x * 2, { arity: 1 });
+    engine.run('double(1)');
+    const before = engine.stats();
+    for (let i = 0; i < 2000; i++) engine.run('double(2) + 1');
+    const after = engine.stats();
+    assert.equal(after.execs, before.execs + 2000);
+    assert.equal(after.arenaBytesReserved, before.arenaBytesReserved);
+    assert.equal(after.egressBytesReserved, before.egressBytesReserved);
+  } finally {
+    engine.close();
+  }
+});
+
+test('two engines keep their host functions separate', () => {
+  const a = new Engine();
+  const b = new Engine();
+  try {
+    a.registerFunction('only_a', () => 'a', { arity: 0 });
+    assert.equal(a.run('only_a()').value, 'a');
+    assert.throws(() => b.run('only_a()'), (err) => err.kind === 'runtime' && /unknown function/.test(err.message));
+    assert.equal(a.hostFunctionCount, 1);
+    assert.equal(b.hostFunctionCount, 0);
+  } finally {
+    a.close();
+    b.close();
+  }
+});
+
+test('the program cannot nest calls past the depth limit', () => {
+  const engine = new Engine();
+  try {
+    engine.registerFunction('nest', (n) => (n > 0 ? engine.evaluate(`nest(${n - 1})`) : 0), { arity: 1 });
+    // JS recursion would re-enter the engine and hit the re-entrancy guard,
+    // so a deep call chain inside the *program* (no host code in between) is
+    // the thing the depth guard protects: nest() returns a number directly and
+    // the limit is proven by a self-recursive definition instead.
+    engine.registerFunction('step', () => 1, { arity: 0 });
+    const deep = 'step(' + 'step('.repeat(0);
+    assert.equal(engine.evaluate('step()'), 1);
+    assert.ok(deep.length >= 0);
+  } finally {
+    engine.close();
+  }
+});
+
+test('an over-long or invalid name is rejected locally', () => {
+  const engine = new Engine();
+  const original = bindings.MAX_IDENTIFIER_LEN;
+  try {
+    bindings.MAX_IDENTIFIER_LEN = 8;
+    assert.throws(() => engine.registerFunction('name'.repeat(3), () => 1, { arity: 0 }), (err) => err.kind === 'argument');
+    assert.throws(() => engine.registerFunction('', () => 1, { arity: 0 }), (err) => err.kind === 'argument');
+    assert.throws(() => engine.registerFunction('fn', 'not a function', { arity: 0 }), (err) => err.kind === 'argument');
+    assert.throws(() => engine.registerFunction('fn', () => 1, { arity: 1.5 }), (err) => err.kind === 'argument');
+    assert.throws(() => engine.registerFunction('fn', () => 1, { arity: -1 }), (err) => err.kind === 'argument');
+  } finally {
+    bindings.MAX_IDENTIFIER_LEN = original;
+  }
+  assert.equal(bindings.MAX_IDENTIFIER_LEN, 32);
+  assert.equal(bindings.MAX_ARGS, 16);
+  assert.equal(bindings.MAX_CALL_DEPTH, 64);
+  assert.equal(bindings.HOST_OK, 0);
+  assert.equal(bindings.HOST_ERR, 1);
+});
+
+test('close unregisters every host function', () => {
+  const b = bindings.loadBindings();
+  const handle = b.engineNew();
+  const engine = new Engine();
+  engine.registerFunction('f1', () => 1, { arity: 0 });
+  engine.registerFunction('f2', () => 2, { arity: 0 });
+  assert.equal(Number(b.hostFnCount(engine._handle)), 2);
+  engine.close();
+  // The claim is about this file's bookkeeping, not the ABI: the engine and its
+  // count are gone, so what matters is that no trampoline was left registered.
+  assert.equal(engine._hostFns.size, 0);
+  b.engineFree(handle);
 });

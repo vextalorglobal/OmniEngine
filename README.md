@@ -6,8 +6,9 @@ CLI that runs `.omni` files.
 
 This is a **runnable engine**, not a toy skeleton. `let answer = 40 + 2`
 evaluates to `42`, and `"hello, " + "world"` evaluates to `hello, world`, through
-the same code path from four hosts — Rust, C, Python, and Node — and every claim
-below is covered by a test that has been run on this machine.
+the same code path from four hosts — Rust, C, Python, and Node — and a script can
+call *back* into whichever host embeds it. Every claim below is covered by a test
+that has been run on this machine.
 
 ```
 cargo build -p omni-ffi                          # the shared library
@@ -33,7 +34,7 @@ cargo run -p omni-cli -- run examples/strings.omni  # -> hello, world 😀
 
 ```bash
 # Rust
-cargo test --workspace                                  # 162 tests
+cargo test --workspace                                  # 187 tests
 cargo run -p omni-cli -- eval '"omni" + " " + "engine"'  # -> omni engine
 
 # C, against the hand-written header — built beside the library it loads
@@ -57,9 +58,33 @@ Or run everything at once:
 ```
 
 It checks that the same bytes come out of the same program on every host, that
-all four surfaces agree on the ABI level, and that string results do not grow
-memory over 2,000 executions. Tools that are missing are reported as `SKIP`, not
+all four surfaces agree on the ABI level, that string results do not grow memory
+over 2,000 executions, and that a host function called from a script answers
+identically in Python and Node. Tools that are missing are reported as `SKIP`, not
 as a pass.
+
+## Calling back into the host
+
+A script's `name(args)` call enters foreign code. The host binds it by name, with
+an arity the engine checks before the callback is ever entered:
+
+```python
+engine.register_function("shout", lambda s: s.upper() + "!", arity=1)
+engine.string('"say: " + shout("hey")')      # say: HEY!
+```
+
+```js
+engine.registerFunction('shout', (s) => s.toUpperCase() + '!', { arity: 1 });
+engine.string('"say: " + shout("hey")');     // say: HEY!
+```
+
+Numbers, booleans, strings and `nil` cross in both directions. A Python exception
+or a JavaScript `throw` becomes `host function 'shout' failed: <message>` at the
+line of the call, because an exception unwinding through the Rust frames that
+called it is undefined behaviour — the same reason a callback that calls back into
+its own engine gets `OMNI_ERR_REENTRANT` instead of a second mutable reference.
+See [docs/GUIDE.md](docs/GUIDE.md#47-host-callbacks-the-bridge-running-backwards)
+and `examples/c/embed.c` for the C surface.
 
 ## How it stays fast and small
 
@@ -76,6 +101,11 @@ as a pass.
   host dereferences. `omni_str_copy` fills a buffer you passed in and validates
   the address against the engine's own registry, so a fabricated or superseded
   pointer copies zero bytes instead of reading somebody else's heap.
+- **A callback cannot alias the engine.** The handle holds its state in a
+  `RefCell` and every entry point opens it with `try_borrow_mut()`, so a host
+  function that calls back into the engine that called it gets
+  `OMNI_ERR_REENTRANT` — a defined status — where the unchecked shape would be
+  two mutable references and a crash blamed on the host.
 - **Zero dependencies in the core.** The compile graph stays small, and building
   this workspace fetched nothing into `~/.cargo` — the only file it touched is
   cargo's own metadata.
@@ -93,15 +123,17 @@ The engine understands numbers, arithmetic with precedence, parentheses,
 length-delimited: literals with `\n`, `\r`, `\t`, `\"`, `\\` and `\u{…}`
 escapes, `+` concatenation that refuses a mixed-type program by naming both
 operands, and `==` / `!=` by content. A host can define a string global from
-outside the language.
+outside the language, and can bind functions a script calls by name — up to 16
+arguments, up to 64 calls deep.
 
 Errors report the line they happened on, and that line number survives the FFI
 boundary into Python and Node.
 
 What is still missing: string length, indexing, slicing, methods and
 interpolation; ordering comparisons on strings; boolean, `nil`, and `undefined`
-literals; functions, control flow, and collections. The memory model that makes
-those cheap is already in place — the syntax is the next increment.
+literals; user-defined functions, control flow, and collections. The memory model
+and the call machinery that make those cheap are already in place — the syntax is
+the next increment.
 
 ## File extensions
 

@@ -83,6 +83,41 @@ engine.try_run("###")      # returns (1, None, "line 1: unexpected character '#'
 own text, including the line number — that context survives the C boundary on
 purpose.
 
+## Calling back into Python
+
+A script can call a Python function. Bind it by name, with the arity the script
+will use:
+
+```python
+engine.register_function("shout", lambda s: s.upper() + "!", arity=1)
+engine.register_function("now", lambda: 1735689600.0, arity=0)
+
+engine.string('"say: " + shout("hey")')   # 'say: HEY!'
+engine.evaluate("now()")                  # 1735689600.0
+engine.host_function_count                # 2
+engine.unregister_function("now")         # True; the name stops resolving
+engine.run("now()")                       # raises: unknown function 'now'
+```
+
+Arguments arrive as `float`, `bool`, `str` or `None`, and the return value goes
+back the same way. Two rules decide what your function may do:
+
+- **The arguments are borrowed, and they are already decoded.** A string argument
+  is a `str` by the time your function runs, so nothing to copy — but keep it only
+  for the duration of the call.
+- **Do not call back into the same engine from inside a callback.** The ABI
+  refuses it with `OMNI_ERR_REENTRANT` (status 6) rather than handing out a second
+  mutable reference, and `omni_str_copy`, `omni_last_error` and
+  `unregister_function` report the same refusal as `0`. Compute what you need
+  before the call, or register a second function.
+
+Anything your function raises — including `BaseException` — is caught at the
+boundary and becomes `host function 'shout' failed: ValueError: …` in the
+script's error, because an exception unwinding through the Rust frames that called
+your callback is undefined behaviour. A return value that is not a number, bool,
+`str`, `bytes` or `None` is reported the same way, so a stray dict fails loudly
+instead of crossing as `0`.
+
 ## What is guaranteed
 
 - Every ABI argument and return type is declared, so a 64-bit handle is never
@@ -102,14 +137,20 @@ purpose.
 - `omni_str_copy` checks the address against the engine, so another engine's
   value, a released host binding, or an invented pointer copies zero bytes.
 - A Rust panic becomes `OmniError(kind="panic")` rather than a dead process.
+- A Python exception inside a host function becomes `OmniError(kind="host")` with
+  the message your script can read, never an unwind through the frames that
+  called your callback.
 - Source, names and payloads longer than the ABI's bounds are rejected in
-  Python, before a call.
+  Python, before a call — and so is a registration whose `fn` is not callable.
+  `register_function` raises `OmniError(kind="argument")` there rather than
+  storing a trampoline that would fail as a host error several evaluations later.
 
 ## Limits
 
 One engine per thread: a handle is not thread-safe, so create one per thread or
 serialise the calls. `close()` is idempotent and engines also clean themselves
-up at interpreter exit.
+up at interpreter exit. A host function registered on an engine is released when
+that engine closes; a callback may not call back into the same engine.
 
 Strings are data, not a full string language yet: literals with `\n`, `\r`,
 `\t`, `\"`, `\\` and `\u{…}` escapes, `+` concatenation with strict typing
@@ -118,6 +159,11 @@ content equality. No length, indexing, slicing, methods, interpolation or
 ordering comparisons yet — and no `null` or `true` literals, so booleans only
 arrive from a comparison.
 
+A host function takes at most 16 arguments (`MAX_ARGS`) and a program may nest
+calls 64 deep (`MAX_CALL_DEPTH`); both are checked by the engine and reported as
+errors rather than as stack overflow. A returned string is capped by the same
+`MAX_STRING_LEN` the engine gives a program.
+
 `Result.text` is a `bytes`, and a `str` you get back is a Python object that
 costs one copy. If you are moving megabytes per call, that copy is the price of
 the safety rule above; measure it with `engine.stats()` before deciding.
@@ -125,7 +171,7 @@ the safety rule above; measure it with `engine.stats()` before deciding.
 ## Tests
 
 ```bash
-python sdks/python/tests/test_ffi.py        # 63 tests, stdlib unittest
+python sdks/python/tests/test_ffi.py        # 92 tests, stdlib unittest
 ```
 
 They need `cargo build -p omni-ffi` (the build, not `cargo test`: the tests load
