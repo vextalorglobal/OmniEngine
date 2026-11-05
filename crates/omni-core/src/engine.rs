@@ -39,6 +39,19 @@ use crate::object::{self, MAX_STRING_LEN, StrRef};
 /// emerging from a capacity accident.
 pub const MAX_IDENTIFIER_LEN: usize = 32;
 
+/// Arguments one call may pass, and the widest argument buffer the FFI has to
+/// build. Sixteen is generous for a host function and small enough that the
+/// boundary can use a stack array instead of allocating per call.
+pub const MAX_ARGS: usize = 16;
+
+/// How deep calls may nest inside one evaluation.
+///
+/// The evaluator is recursive descent, so `f(g(h(…)))` consumes native stack per
+/// level. The limit turns exhaustion into an error that says what happened. It is
+/// counted per engine and reset with each execution, because an aborted
+/// evaluation never runs its unwinding.
+pub const MAX_CALL_DEPTH: u32 = 64;
+
 /// The category of a failure, which the FFI maps onto status codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
@@ -50,6 +63,10 @@ pub enum ErrorKind {
     Runtime,
     /// An internal invariant broke. Reserved; hosts see it as a caught panic.
     Panic,
+    /// A host function reported its own failure. Distinct from [`ErrorKind::Runtime`]
+    /// so a caller can tell "my callback threw" from "the program divided by zero",
+    /// and so an SDK's test suite cannot mistake one for the other.
+    Host,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +114,8 @@ pub enum HostError {
     NotUtf8,
     /// Longer than [`MAX_STRING_LEN`].
     TooLong,
+    /// A host function declared more parameters than [`MAX_ARGS`] allows.
+    ArityTooLarge,
 }
 
 impl fmt::Display for HostError {
@@ -113,6 +132,9 @@ impl fmt::Display for HostError {
                 "string is longer than the {} MiB limit",
                 MAX_STRING_LEN / (1024 * 1024)
             ),
+            HostError::ArityTooLarge => {
+                write!(f, "a host function takes at most {MAX_ARGS} arguments")
+            }
         }
     }
 }
@@ -165,6 +187,40 @@ struct Global {
     owned: Option<Box<[u8]>>,
 }
 
+/// What a host callback gives back.
+///
+/// Primitives only, never a [`Value`]. A `Value` is an address the *engine*
+/// minted, and letting a boundary layer fabricate one would mean trusting the FFI
+/// to box a pointer correctly — so the host returns bytes or a number and
+/// [`Engine`] does its own boxing. That is the same rule [`Engine::define_string`]
+/// already follows from the other side.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HostOutcome {
+    Number(f64),
+    Bool(bool),
+    Nil,
+    Undefined,
+    /// String payload, copied by the engine into the execution arena.
+    String(Vec<u8>),
+    /// The host reported failure. The payload is its message, possibly empty.
+    Failure(Vec<u8>),
+}
+
+/// A host callback as the core sees it: read the engine, read the arguments,
+/// hand back a primitive.
+///
+/// `&Engine` rather than `&mut Engine` is the whole contract. A callback may look
+/// up a string's bytes because they are still on hand, and it may not allocate,
+/// bind, or reset — the engine is busy running the very call that invoked it.
+pub type HostCall = dyn Fn(&Engine, &[Value]) -> HostOutcome + Send;
+
+/// One registered host function: a name, a fixed arity, and the callback.
+struct HostFunction {
+    name: String,
+    arity: u32,
+    call: Box<HostCall>,
+}
+
 /// Counters a host reads to prove the memory story from outside Rust.
 ///
 /// Fixed-width and `Copy` because the FFI hands it across the boundary as a
@@ -196,6 +252,15 @@ pub struct Engine {
     bindings: Vec<Slot<Binding>>,
     /// Persistent host-injected bindings.
     globals: Vec<Global>,
+    /// Host functions, addressed by name at call sites.
+    ///
+    /// A fourth block with a fourth lifetime: it survives every execution and is
+    /// released only by `unregister_host_fn` or the engine's own drop. That is
+    /// what makes `arena.reset()` safe to run while a call is on the stack — the
+    /// callback's own identity is not in the arena.
+    host_fns: Vec<HostFunction>,
+    /// Live `parse_call` frames, guarded against [`MAX_CALL_DEPTH`].
+    call_depth: u32,
     last_value: Value,
     last_error: Option<OmniError>,
     execs: u64,
@@ -209,6 +274,8 @@ impl Engine {
             egress: Arena::new(),
             bindings: Vec::new(),
             globals: Vec::new(),
+            host_fns: Vec::new(),
+            call_depth: 0,
             last_value: Value::UNDEF,
             last_error: None,
             execs: 0,
@@ -249,6 +316,9 @@ impl Engine {
         self.arena.reset();
         self.bindings.clear();
         self.egress.rewind();
+        // An error mid-call returns through `?` and skips the decrement, so the
+        // count is re-zeroed here rather than trusted to unwind cleanly.
+        self.call_depth = 0;
         self.execs += 1;
     }
 
@@ -337,6 +407,57 @@ impl Engine {
                 owned,
             }),
         }
+    }
+
+    /// Register a function a host owns, callable from scripts as `name(...)`.
+    ///
+    /// Redefining a name replaces the callback, mirroring [`Engine::define`] — a
+    /// host that registers in a setup loop must not grow a vector forever. The
+    /// engine keeps only the `Box<dyn>`; whatever C address it wraps stays the
+    /// caller's problem, which is why [`omni-ffi`] refuses to release it and the
+    /// SDKs own the unregister path.
+    ///
+    /// A registered name and a global of the same name can coexist: `foo` reads
+    /// the global and `foo(1)` calls the function, because position decides.
+    pub fn register_host_fn<F>(&mut self, name: &str, arity: u32, call: F) -> Result<(), HostError>
+    where
+        F: Fn(&Engine, &[Value]) -> HostOutcome + Send + 'static,
+    {
+        if name.is_empty() {
+            return Err(HostError::EmptyName);
+        }
+        if name.len() > MAX_IDENTIFIER_LEN {
+            return Err(HostError::NameTooLong);
+        }
+        if arity as usize > MAX_ARGS {
+            return Err(HostError::ArityTooLarge);
+        }
+        let entry = HostFunction {
+            name: name.to_string(),
+            arity,
+            call: Box::new(call),
+        };
+        match self.host_fns.iter_mut().find(|h| h.name == name) {
+            Some(existing) => *existing = entry,
+            None => self.host_fns.push(entry),
+        }
+        Ok(())
+    }
+
+    /// Drop the host function called `name`, reporting whether one was there.
+    pub fn unregister_host_fn(&mut self, name: &str) -> bool {
+        let before = self.host_fns.len();
+        self.host_fns.retain(|h| h.name != name);
+        self.host_fns.len() != before
+    }
+
+    /// How many host functions are registered.
+    pub fn host_fn_count(&self) -> usize {
+        self.host_fns.len()
+    }
+
+    fn find_host_fn(&self, name: &str) -> Option<usize> {
+        self.host_fns.iter().rposition(|h| h.name == name)
     }
 
     /// The language's own equality, which `Value`'s `PartialEq` cannot implement:
@@ -601,12 +722,20 @@ impl Engine {
                 self.new_string(&bytes, token.line, ErrorKind::Runtime)
             }
             TokenKind::Ident => {
+                let name = token.text;
                 self.advance(i);
-                self.lookup(token.text).ok_or_else(|| {
+                // A name followed by '(' is a call and nothing else; the same name
+                // on its own is still a global or binding lookup. Position is the
+                // only disambiguation, which is what lets a host register `print`
+                // without reserving the identifier.
+                if self.peek_kind(t, *i) == Some(TokenKind::LParen) {
+                    return self.parse_call(t, i, name, token.line);
+                }
+                self.lookup(name).ok_or_else(|| {
                     OmniError::new(
                         ErrorKind::Runtime,
                         token.line,
-                        format!("undefined variable '{}'", token.text),
+                        format!("undefined variable '{name}'"),
                     )
                 })
             }
@@ -622,6 +751,146 @@ impl Engine {
                 "unexpected end of input",
             )),
             other => Err(self.parse_error_kind(t, *i, other, "expected a value")),
+        }
+    }
+
+    /// `name(arg, …)` with the call already resolved to a host function.
+    ///
+    /// Arity is checked against the registration rather than inferred from what
+    /// arrived, so `len("a", "b")` names the function and both counts. The depth
+    /// guard wraps argument evaluation too: `f(g(x))` nests here, and the stack
+    /// the recursion spends is the thing being limited.
+    fn parse_call(
+        &mut self,
+        t: &[Token<'_>],
+        i: &mut usize,
+        name: &str,
+        line: u32,
+    ) -> Result<Value, OmniError> {
+        if self.call_depth >= MAX_CALL_DEPTH {
+            return Err(OmniError::new(
+                ErrorKind::Runtime,
+                line,
+                format!(
+                    "calls are nested {MAX_CALL_DEPTH} deep, the limit; a host function \
+                     cannot call itself"
+                ),
+            ));
+        }
+        let index = self.find_host_fn(name).ok_or_else(|| {
+            OmniError::new(
+                ErrorKind::Runtime,
+                line,
+                format!(
+                    "unknown function '{name}' (no host function is registered with that name)"
+                ),
+            )
+        })?;
+        let arity = self.host_fns[index].arity as usize;
+        self.advance(i); // the '(' that made this a call
+
+        self.call_depth += 1;
+        let outcome = self.read_args(t, i, name, arity);
+        self.call_depth -= 1;
+        let args = outcome?;
+        if args.len() != arity {
+            return Err(OmniError::new(
+                ErrorKind::Runtime,
+                line,
+                format!(
+                    "host function '{name}' takes {arity} argument{}, got {}",
+                    if arity == 1 { "" } else { "s" },
+                    args.len()
+                ),
+            ));
+        }
+        self.invoke_host(index, name, &args, line)
+    }
+
+    /// Read `arg, arg, …` up to and including the closing paren.
+    ///
+    /// Split out of [`Engine::parse_call`] so the depth counter has exactly one
+    /// increment and one decrement between them, with a `Result` in the middle —
+    /// the shape that makes an early `?` unable to strand the count.
+    fn read_args(
+        &mut self,
+        t: &[Token<'_>],
+        i: &mut usize,
+        name: &str,
+        arity: usize,
+    ) -> Result<Vec<Value>, OmniError> {
+        let mut args = Vec::with_capacity(arity);
+        if self.peek_kind(t, *i) != Some(TokenKind::RParen) {
+            loop {
+                // The last argument's expression is where an error most often
+                // lives, so the line number moves with the cursor instead of
+                // staying on the function name.
+                let arg_line = self.peek_line(t, *i);
+                args.push(self.parse_expr(t, i)?);
+                if args.len() > MAX_ARGS {
+                    return Err(OmniError::new(
+                        ErrorKind::Parse,
+                        arg_line,
+                        format!("a call takes at most {MAX_ARGS} arguments"),
+                    ));
+                }
+                match self.peek_kind(t, *i) {
+                    Some(TokenKind::Comma) => self.advance(i),
+                    Some(TokenKind::RParen) | None => break,
+                    Some(kind) => {
+                        return Err(self.parse_error_kind(
+                            t,
+                            *i,
+                            kind,
+                            &format!("expected ',' or ')' in the call to '{name}'"),
+                        ));
+                    }
+                }
+            }
+        }
+        self.expect(t, i, TokenKind::RParen)?;
+        Ok(args)
+    }
+
+    /// Run one host callback and box its answer.
+    ///
+    /// The two borrows are both shared, which is the point: the callback may read
+    /// through `&Engine` — that is how it gets a string argument's bytes — and may
+    /// not touch anything here. Nothing mutable is aliased while foreign code runs,
+    /// so a panic in the engine around the call unwinds only through Rust frames.
+    fn invoke_host(
+        &mut self,
+        index: usize,
+        name: &str,
+        args: &[Value],
+        line: u32,
+    ) -> Result<Value, OmniError> {
+        let outcome = {
+            let host = &self.host_fns[index];
+            (host.call)(&*self, args)
+        };
+        match outcome {
+            HostOutcome::Number(n) => Ok(Value::from_f64(n)),
+            HostOutcome::Bool(b) => Ok(Value::bool(b)),
+            HostOutcome::Nil => Ok(Value::NIL),
+            HostOutcome::Undefined => Ok(Value::UNDEF),
+            HostOutcome::String(bytes) => self.new_string(&bytes, line, ErrorKind::Runtime),
+            HostOutcome::Failure(message) => {
+                // The host's own text, if it sent any. A callback that fails with
+                // nothing to say still produces a message that names the function,
+                // because "host function failed" without the name cannot be acted on.
+                let shown = String::from_utf8_lossy(&message);
+                let detail = if shown.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {shown}")
+                };
+                Err(OmniError::new(
+                    ErrorKind::Host,
+                    line,
+                    format!("host function '{name}' failed{detail}"),
+                ))
+            }
         }
     }
 
@@ -978,6 +1247,7 @@ fn display_kind(kind: TokenKind) -> &'static str {
         TokenKind::NotEq => "'!='",
         TokenKind::LParen => "'('",
         TokenKind::RParen => "')'",
+        TokenKind::Comma => "','",
         TokenKind::Semi => "';'",
         TokenKind::Eof => "end of input",
         TokenKind::BinOp(op) => op.symbol(),
@@ -1632,5 +1902,291 @@ mod tests {
             .exec(src)
             .unwrap_or_else(|err| panic!("{src} failed: {err}"));
         e.render(v)
+    }
+
+    // -- host functions -------------------------------------------------------
+
+    /// A number-times-itself callback, the smallest thing that proves a call works.
+    fn add_square(e: &mut Engine) {
+        e.register_host_fn("square", 1, |_engine, args| match args[0].as_f64() {
+            Some(n) => HostOutcome::Number(n * n),
+            None => HostOutcome::Failure(b"needs a number".to_vec()),
+        })
+        .unwrap();
+    }
+
+    /// Upper-cases a string argument, which is the first callback that has to read
+    /// the engine's bytes rather than just its bits.
+    fn add_shout(e: &mut Engine) {
+        e.register_host_fn("shout", 1, |engine, args| match engine.string_of(args[0]) {
+            Some(bytes) => {
+                let up = String::from_utf8_lossy(bytes).to_uppercase().into_bytes();
+                HostOutcome::String(up)
+            }
+            None => HostOutcome::Failure(b"needs a string".to_vec()),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_host_function_returns_a_number() {
+        let mut e = Engine::new();
+        add_square(&mut e);
+        assert_eq!(e.exec("square(6)"), Ok(num(36.0)));
+    }
+
+    #[test]
+    fn a_host_function_sits_in_an_expression() {
+        let mut e = Engine::new();
+        add_square(&mut e);
+        assert_eq!(e.exec("square(6) + 1"), Ok(num(37.0)));
+        assert_eq!(e.exec("square(2 + 3)"), Ok(num(25.0)));
+        assert_eq!(e.exec("-square(4)"), Ok(num(-16.0)));
+        // Calls bind tighter than `==`, so this compares 36 to 36, not 6 to 36.
+        assert_eq!(e.exec("square(6) == 36"), Ok(Value::TRUE));
+    }
+
+    #[test]
+    fn a_host_function_returns_a_string_the_engine_can_read() {
+        let mut e = Engine::new();
+        add_shout(&mut e);
+        assert_eq!(text_of(&mut e, "shout(\"hi\")"), "HI");
+        assert_eq!(text_of(&mut e, "shout(\"hi\") + \"!\""), "HI!");
+        assert_eq!(e.exec("shout(\"a\") == \"A\""), Ok(Value::TRUE));
+        assert_eq!(e.exec("shout(\"a\") == \"a\""), Ok(Value::FALSE));
+    }
+
+    #[test]
+    fn a_host_string_result_lives_in_egress_like_any_other_result() {
+        // The promotion rule cannot know about host callbacks, so it has to cover
+        // them: a string returned by a host lands in the arena during the call and
+        // is copied to egress on the way out, exactly like a concatenation.
+        let mut e = Engine::new();
+        add_shout(&mut e);
+        let grown = {
+            e.exec("shout(\"hi\")").unwrap();
+            e.stats()
+        };
+        for _ in 0..50 {
+            e.exec("shout(\"hi\")").unwrap();
+        }
+        let again = e.stats();
+        assert_eq!(again.egress_bytes_reserved, grown.egress_bytes_reserved);
+        assert_eq!(again.egress_high_water, grown.egress_high_water);
+    }
+
+    #[test]
+    fn zero_arity_and_max_arity_calls_work() {
+        let mut e = Engine::new();
+        e.register_host_fn("pi", 0, |_, _| HostOutcome::Number(std::f64::consts::PI))
+            .unwrap();
+        e.register_host_fn("sum16", 16, |_, args| {
+            let total: f64 = args.iter().map(|v| v.as_f64().unwrap_or(0.0)).sum();
+            HostOutcome::Number(total)
+        })
+        .unwrap();
+        assert_eq!(e.exec("pi()"), Ok(num(std::f64::consts::PI)));
+        assert_eq!(
+            e.exec("pi(1)"),
+            Err(OmniError::new(
+                ErrorKind::Runtime,
+                1,
+                "host function 'pi' takes 0 arguments, got 1",
+            ))
+        );
+        let src = format!(
+            "sum16({})",
+            (1..=16)
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert_eq!(e.exec(&src), Ok(num(136.0)));
+    }
+
+    #[test]
+    fn a_nested_call_evaluates_inside_out() {
+        let mut e = Engine::new();
+        add_square(&mut e);
+        e.register_host_fn("double", 1, |_, args| match args[0].as_f64() {
+            Some(n) => HostOutcome::Number(n * 2.0),
+            None => HostOutcome::Failure(Vec::new()),
+        })
+        .unwrap();
+        assert_eq!(e.exec("double(square(3))"), Ok(num(18.0)));
+        assert_eq!(e.exec("square(double(3))"), Ok(num(36.0)));
+    }
+
+    #[test]
+    fn a_missing_comma_names_the_comma() {
+        let mut e = Engine::new();
+        add_square(&mut e);
+        let err = e.exec("square(1 2)").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Parse);
+        assert_eq!(
+            err.message,
+            "expected ',' or ')' in the call to 'square' (found 'a number')"
+        );
+    }
+
+    #[test]
+    fn an_unterminated_call_names_the_function_it_left_open() {
+        let mut e = Engine::new();
+        add_square(&mut e);
+        let err = e.exec("square(2").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Parse);
+        // The lexer ends the stream with an Eof token rather than running out, so
+        // this is the call's own message and not a bare "unexpected end of input".
+        assert_eq!(
+            err.message,
+            "expected ',' or ')' in the call to 'square' (found 'end of input')"
+        );
+        assert_eq!(err.line, 1);
+        // The line moves with the cursor, so a call left open on line 2 reports 2.
+        let err = e.exec("let unused = 1\nsquare(2").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Parse);
+        assert_eq!(err.line, 2);
+    }
+
+    #[test]
+    fn arity_is_the_registrations_contract() {
+        let mut e = Engine::new();
+        add_square(&mut e);
+        let err = e.exec("square(1, 2)").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Runtime);
+        assert_eq!(
+            err.message,
+            "host function 'square' takes 1 argument, got 2"
+        );
+        assert_eq!(err.line, 1);
+    }
+
+    #[test]
+    fn an_unregistered_name_is_a_runtime_error_that_says_so() {
+        let mut e = Engine::new();
+        let err = e.exec("nope(1)").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Runtime);
+        assert_eq!(
+            err.message,
+            "unknown function 'nope' (no host function is registered with that name)"
+        );
+    }
+
+    #[test]
+    fn a_host_failure_is_its_own_error_kind_and_keeps_its_message() {
+        let mut e = Engine::new();
+        add_square(&mut e);
+        let err = e.exec("square(\"two\")").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Host);
+        assert_eq!(err.message, "host function 'square' failed: needs a number");
+    }
+
+    #[test]
+    fn a_host_failure_with_nothing_to_say_still_names_the_function() {
+        let mut e = Engine::new();
+        e.register_host_fn("quiet", 0, |_, _| HostOutcome::Failure(Vec::new()))
+            .unwrap();
+        let err = e.exec("quiet()").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Host);
+        assert_eq!(err.message, "host function 'quiet' failed");
+    }
+
+    /// `id(id(id(1)))` with the given number of frames.
+    fn nest(depth: usize) -> String {
+        format!("{}1{}", "id(".repeat(depth), ")".repeat(depth))
+    }
+
+    #[test]
+    fn call_nesting_stops_at_the_limit_instead_of_the_stack() {
+        let mut e = Engine::new();
+        e.register_host_fn("id", 1, |_, args| {
+            HostOutcome::Number(args[0].as_f64().unwrap_or(0.0))
+        })
+        .unwrap();
+        let limit = MAX_CALL_DEPTH as usize;
+        assert_eq!(e.exec(&nest(limit)), Ok(num(1.0)), "at the limit");
+        let err = e.exec(&nest(limit + 1)).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Runtime);
+        assert!(
+            err.message.contains(&format!("nested {limit} deep")),
+            "{err}"
+        );
+        // The counter lives per execution: an aborted nest must not strand it.
+        assert_eq!(e.exec("id(1)"), Ok(num(1.0)));
+        assert_eq!(e.exec(&nest(limit)), Ok(num(1.0)));
+    }
+
+    #[test]
+    fn more_arguments_than_the_ceiling_is_a_parse_error() {
+        let mut e = Engine::new();
+        add_square(&mut e);
+        let src = format!("square({})", vec!["1"; MAX_ARGS + 1].join(","));
+        let err = e.exec(&src).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Parse);
+        assert!(
+            err.message
+                .contains(&format!("at most {MAX_ARGS} arguments")),
+            "{err}"
+        );
+    }
+
+    /// A named callback, so one item can be registered several times — a closure
+    /// variable would move into the first call.
+    fn nil_call(_: &Engine, _: &[Value]) -> HostOutcome {
+        HostOutcome::Nil
+    }
+
+    #[test]
+    fn registration_rejects_bad_names_and_arities() {
+        let mut e = Engine::new();
+        assert_eq!(
+            e.register_host_fn("", 0, nil_call),
+            Err(HostError::EmptyName)
+        );
+        assert_eq!(
+            e.register_host_fn(&"n".repeat(MAX_IDENTIFIER_LEN + 1), 0, nil_call),
+            Err(HostError::NameTooLong)
+        );
+        assert_eq!(
+            e.register_host_fn("wide", (MAX_ARGS + 1) as u32, nil_call),
+            Err(HostError::ArityTooLarge)
+        );
+        assert_eq!(e.host_fn_count(), 0, "a rejected name registers nothing");
+    }
+
+    #[test]
+    fn a_host_function_outlives_every_execution_until_unregistered() {
+        let mut e = Engine::new();
+        add_square(&mut e);
+        assert_eq!(e.exec("square(2)"), Ok(num(4.0)));
+        // The arena reset and the egress rewind are both between these two calls;
+        // the registry is the one block that does neither.
+        assert_eq!(e.exec("let unused = 1"), Ok(num(1.0)));
+        assert_eq!(e.exec("square(3)"), Ok(num(9.0)));
+        assert_eq!(e.host_fn_count(), 1);
+        assert!(e.unregister_host_fn("square"));
+        assert!(!e.unregister_host_fn("square"));
+        assert_eq!(e.host_fn_count(), 0);
+        assert!(e.exec("square(3)").is_err());
+    }
+
+    #[test]
+    fn redefining_a_name_replaces_the_callback() {
+        let mut e = Engine::new();
+        e.register_host_fn("which", 0, |_, _| HostOutcome::Number(1.0))
+            .unwrap();
+        e.register_host_fn("which", 0, |_, _| HostOutcome::Number(2.0))
+            .unwrap();
+        assert_eq!(e.host_fn_count(), 1);
+        assert_eq!(e.exec("which()"), Ok(num(2.0)));
+    }
+
+    #[test]
+    fn a_global_and_a_host_function_can_share_a_name() {
+        let mut e = Engine::new();
+        add_square(&mut e);
+        e.define("square", num(7.0));
+        assert_eq!(e.exec("square"), Ok(num(7.0)));
+        assert_eq!(e.exec("square(4)"), Ok(num(16.0)));
     }
 }

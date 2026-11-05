@@ -33,7 +33,10 @@ pub mod counted;
 static COUNTED: counted::Counting = counted::Counting;
 
 pub use arena::Arena;
-pub use engine::{Engine, ErrorKind, HostError, MAX_IDENTIFIER_LEN, OmniError, Stats};
+pub use engine::{
+    Engine, ErrorKind, HostCall, HostError, HostOutcome, MAX_ARGS, MAX_CALL_DEPTH,
+    MAX_IDENTIFIER_LEN, OmniError, Stats,
+};
 pub use lexer::{BinOp, LexError, Token, TokenKind, lex};
 pub use object::{MAX_STRING_LEN, StrRef};
 pub use value::Value;

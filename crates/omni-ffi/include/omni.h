@@ -1,5 +1,5 @@
 /*
- * omni.h -- the C ABI of OmniEngine, version 2.
+ * omni.h -- the C ABI of OmniEngine, version 3.
  *
  * Hand-written and authoritative. It mirrors
  * crates/omni-ffi/src/lib.rs, and the Rust side has compile-time asserts
@@ -28,10 +28,13 @@
  *    later execution wrote at those addresses. To keep a string, copy it with
  *    omni_str_copy() into storage you own.
  *
- *    omni_str_copy() checks the address against the engine you pass. A pointer
- *    from another engine, a host binding that has since been redefined, or a
- *    number you invented all copy zero bytes instead of faulting. That is why
- *    you call it instead of memcpy'ing from payload.ptr.
+ *    `payload.ptr` identifies the string, it is not the first byte of the text:
+ *    the engine keeps a length word in front of the bytes it stores. That is
+ *    why you call omni_str_copy() instead of memcpy'ing from it -- the copy
+ *    knows where the payload starts, checks that the address belongs to the
+ *    engine you name, and bounds itself by the engine's own header rather than
+ *    by a `len` that may be stale. A host callback's arguments are the one
+ *    place that pointer IS the text; see rule 8.
  *
  * 2. Error text is copied into storage you own. Call omni_last_error() with a
  *    buffer; it truncates rather than overflowing, and always NUL-terminates.
@@ -55,6 +58,31 @@
  *
  * 7. One engine handle is one thread. Do not share a handle across threads
  *    without your own lock.
+ *
+ * 8. A host function's arguments are a borrowed view, and the one place a
+ *    pointer is the text itself. Inside an omni_host_fn callback, an args[i]
+ *    tagged OMNI_STRING has `payload.ptr` at its FIRST BYTE and `len` bytes of
+ *    UTF-8 following it -- copy with memcpy(), not through omni_str_copy(),
+ *    which is a call into the engine and would answer OMNI_ERR_REENTRANT with a
+ *    zero-length read. The view is good only until the callback returns, and
+ *    returning a string is its mirror: put the address of YOUR bytes in `out`,
+ *    and the engine copies them into its own memory before it uses them, so
+ *    your buffer may be reused the moment you return.
+ *
+ * 9. Re-entrancy is refused, not supported. Calling any function in this header
+ *    from inside a callback, on the same handle, returns OMNI_ERR_REENTRANT
+ *    rather than handing out a second mutable reference to the engine.
+ *    omni_str_copy(), omni_unregister_host_fn() and omni_last_error() report it
+ *    as 0, because a size_t and a bool carry no status. Rule 8 holds precisely
+ *    because this rule does: the arena is reset at the entry of omni_exec(), and
+ *    a nested call can never reach that entry.
+ *
+ * 10. Your callback reports failure by returning OMNI_HOST_ERR, never by
+ *    unwinding. A C++ exception, a Python exception and a JavaScript throw all
+ *    have to be caught before this boundary, because unwinding through the Rust
+ *    frames that are calling you is not recoverable. Put the message in `out` as
+ *    an OMNI_STRING and return 1; the script's error becomes
+ *    "host function 'name' failed: <message>" at the line of the call.
  *
  * ## Linking
  *
@@ -91,8 +119,15 @@ extern "C" {
 
 /* ---- the ABI level -------------------------------------------------- */
 
-/* Wire format, not the crate version. See caller rule 5. */
-#define OMNI_ABI_VERSION 2u
+/* Wire format, not the crate version. See caller rule 5.
+ *
+ * Version 3 changed no layout: OmniValue is still 16 bytes and OmniStats still
+ * 72, and every struct, tag and status through 4 keeps its version-2 meaning.
+ * What changed is the surface -- the omni_host_fn callback type, the three
+ * registration functions, and the two new statuses. A host compiled against 2
+ * still reads correct values from a library that reports 3; it just cannot see
+ * the new symbols, which is why the number moved. */
+#define OMNI_ABI_VERSION 3u
 
 /* ---- status codes: the u32 returned by every call ---- */
 
@@ -101,12 +136,15 @@ extern "C" {
 #define OMNI_ERR_RUNTIME   2u /* parsed, then failed while evaluating     */
 #define OMNI_ERR_PANIC     3u /* a Rust panic was caught at the boundary  */
 #define OMNI_ERR_ARG       4u /* null pointer, bad length, or bad UTF-8   */
+#define OMNI_ERR_HOST      5u /* a host function returned OMNI_HOST_ERR   */
+#define OMNI_ERR_REENTRANT 6u /* from a callback, on this same handle     */
 
 /* There is deliberately no OMNI_ERR_MEMORY. A program that builds too long a
  * string is the program's fault (OMNI_ERR_RUNTIME); a host that passes too long
- * an argument is a bad call (OMNI_ERR_ARG); a real allocation failure aborts. A
- * fifth code would let callers branch on a condition that cannot tell them
- * anything the two existing codes do not. */
+ * an argument is a bad call (OMNI_ERR_ARG); a real allocation failure aborts.
+ * The two codes version 3 adds are not memory codes either: 5 names whose
+ * callback refused, and 6 names a call the engine will not honour. Neither tells
+ * a caller anything the older codes did not already cover. */
 
 /* ---- value tags: OmniValue::tag ---- */
 
@@ -114,9 +152,10 @@ extern "C" {
 #define OMNI_NIL           1u /* no payload                               */
 #define OMNI_BOOL          2u /* payload.number is 0.0 or 1.0             */
 #define OMNI_UNDEF         3u /* no payload; an empty program             */
-#define OMNI_STRING        4u /* payload.ptr, len bytes, engine-owned     */
+#define OMNI_STRING        4u /* payload.ptr + len, engine-owned          */
 
-/* ---- limits: mirrors of omni_core::{object::MAX_STRING_LEN, engine::MAX_IDENTIFIER_LEN} ----
+/* ---- limits: mirrors of omni_core::{object::MAX_STRING_LEN,
+ *       engine::{MAX_IDENTIFIER_LEN, MAX_ARGS, MAX_CALL_DEPTH}} ----
  *
  * Restated here because C cannot read a Rust constant; the engine enforces them
  * and refuses a longer payload (OMNI_ERR_ARG from a host, OMNI_ERR_RUNTIME from
@@ -125,6 +164,8 @@ extern "C" {
 
 #define OMNI_MAX_STRING_LEN     (16u * 1024u * 1024u)
 #define OMNI_MAX_IDENTIFIER_LEN 32u
+#define OMNI_MAX_ARGS           16u /* arguments a call may pass, and an arity may claim */
+#define OMNI_MAX_CALL_DEPTH     64u /* nested calls one execution may reach              */
 
 /* The payload of an OmniValue: whichever arm its tag says is live. */
 typedef union OmniPayload {
@@ -186,6 +227,31 @@ OMNI_STATIC_ASSERT(offsetof(OmniStats, egress_high_water) == 64, "OmniStats tail
 /* Opaque. Never dereference; the layout is a Rust private detail. */
 typedef struct OmniEngine OmniEngine;
 
+/* ---- host callbacks: the function a host owns and a script calls ---- */
+
+/* The calling convention the engine uses to enter host code.
+ *
+ * user_data: whatever was passed to omni_register_host_fn(). The engine never
+ *            reads it; it only hands it back, so it may point at anything.
+ * args:      an array of `argc` OmniValues, one per argument, in source order.
+ *            Follows caller rule 8 -- the strings in it are the engine's, and
+ *            readable only until this function returns.
+ * argc:      how many elements `args` has. Equals the `arity` registered under
+ *            the name the script called: the engine checks before entering you.
+ * out:       where to write the result (or, on failure, the message). Write it;
+ *            the engine reads it the moment you return.
+ *
+ * Return OMNI_HOST_OK to hand `out` back as the call's value, or OMNI_HOST_ERR
+ * to fail the call with `out` read as an OMNI_STRING message. See rule 10: an
+ * exception of any kind must be caught here, not unwound into Rust. */
+typedef int32_t(OMNI_CALL *omni_host_fn)(void *user_data,
+                                         const OmniValue *args,
+                                         uint32_t argc,
+                                         OmniValue *out);
+
+#define OMNI_HOST_OK  0 /* the value in out is the result                    */
+#define OMNI_HOST_ERR 1 /* out holds a message; the call fails with it       */
+
 /* ABI level of the loaded library. Compare with OMNI_ABI_VERSION before
  * trusting any other symbol in this header. */
 OMNI_API uint32_t OMNI_CALL omni_abi_version(void);
@@ -198,7 +264,13 @@ OMNI_API OmniEngine *OMNI_CALL omni_engine_new(void);
 
 /* Destroy an engine. NULL is accepted and does nothing. Do not use the
  * handle again, and do not free it twice -- including for any OMNI_STRING
- * result still pointing into it. */
+ * result still pointing into it, and including every host callback registered
+ * on it, whose user_data the engine never owned and so never frees.
+ *
+ * Called from inside one of this engine's own callbacks, it does nothing at
+ * all: the handle is borrowed for the duration of that callback, and destroying
+ * it there would free memory the caller is still executing on (caller rule 9).
+ * Freeing from the ordinary path is always safe. */
 OMNI_API void OMNI_CALL omni_engine_free(OmniEngine *engine);
 
 /* Evaluate `src` (exactly `len` bytes, UTF-8, need not be NUL-terminated)
@@ -207,7 +279,13 @@ OMNI_API void OMNI_CALL omni_engine_free(OmniEngine *engine);
  * OMNI_OK.
  * A `len` of 0 is a valid empty program and yields OMNI_UNDEF; `src` may then
  * be NULL, which is what hosts such as Node do with an empty buffer.
- * When out->tag is OMNI_STRING, out->payload.ptr follows caller rule 1. */
+ * When out->tag is OMNI_STRING, out->payload.ptr follows caller rule 1.
+ *
+ * A program that calls a name no host function holds is OMNI_ERR_COMPILE, and
+ * one whose callback returned OMNI_HOST_ERR is OMNI_ERR_HOST -- read
+ * omni_last_error() for the function's name and the line of the call. Called
+ * from inside a callback on the same handle, it is OMNI_ERR_REENTRANT and the
+ * running execution is left untouched. */
 OMNI_API uint32_t OMNI_CALL omni_exec(OmniEngine *engine,
                                       const char *src,
                                       size_t len,
@@ -232,7 +310,8 @@ OMNI_API uint32_t OMNI_CALL omni_exec_number(OmniEngine *engine,
  * Returns 0 without reading or writing anything when value->tag is not
  * OMNI_STRING, when any pointer is NULL, when value->payload.ptr is not an
  * address this engine can account for (another engine's, a redefined host
- * binding's, or one you invented), or when cap is 0.
+ * binding's, or one you invented), when cap is 0, or when called from inside a
+ * callback on this engine -- a size_t has nowhere to put status 6.
  *
  * `value` is taken by pointer so that a 16-byte struct never has to cross a
  * C-extension calling convention in three different toolkits; you already have
@@ -259,6 +338,45 @@ OMNI_API uint32_t OMNI_CALL omni_define_string(OmniEngine *engine,
                                                const char *bytes,
                                                size_t bytes_len);
 
+/* Register a function a script can call as name(...).
+ *
+ * The engine stores `callback` and `user_data` and never dereferences either --
+ * user_data travels back to the callback unchanged, so hang whatever you need off
+ * it. Redefining `name` replaces both halves together and releases neither, which
+ * is why a host unregisters before it frees what user_data pointed at.
+ *
+ * `arity` is fixed. A script that passes a different count is an
+ * OMNI_ERR_RUNTIME naming the function and both counts, produced by the engine
+ * without entering host code.
+ *
+ * Every buffer carries its own length, as elsewhere in this ABI: `name` need not
+ * be NUL-terminated.
+ * Returns OMNI_OK, OMNI_ERR_ARG for a NULL engine or callback, an empty or
+ * over-long name, non-UTF-8 in `name`, or an `arity` above OMNI_MAX_ARGS, and
+ * OMNI_ERR_REENTRANT when called from inside one of this engine's callbacks. */
+OMNI_API uint32_t OMNI_CALL omni_register_host_fn(OmniEngine *engine,
+                                                  const char *name,
+                                                  size_t name_len,
+                                                  uint32_t arity,
+                                                  omni_host_fn callback,
+                                                  void *user_data);
+
+/* Drop the host function called `name`; returns 1 if there was one, 0 if there
+ * was not (including for a NULL engine, a bad name, or a re-entrant call).
+ *
+ * This is the call that makes it safe to release the callback's own storage
+ * afterwards: a koffi slot, a ctypes trampoline, a C closure. The engine forgets
+ * the function at the same moment, so a later call to that name is an ordinary
+ * "unknown function" error rather than a call through a dangling pointer. */
+OMNI_API size_t OMNI_CALL omni_unregister_host_fn(OmniEngine *engine,
+                                                  const char *name,
+                                                  size_t name_len);
+
+/* How many host functions this engine currently has. Returns 0 for a NULL
+ * engine. A teardown check that the count is back to its baseline is the
+ * cheapest proof that a host released every callback it registered. */
+OMNI_API size_t OMNI_CALL omni_host_fn_count(const OmniEngine *engine);
+
 /* Fill *out with the engine's counters and OMNI_OK, or return OMNI_ERR_ARG if
  * engine or out is NULL.
  *
@@ -273,14 +391,18 @@ OMNI_API uint32_t OMNI_CALL omni_debug_stats(OmniEngine *engine,
  * The text is the rendered error -- "line 3: division by zero" -- so a host
  * can show the user where the program failed, not only what went wrong.
  * Returns 0 when there is no pending error (including after a success, which
- * clears it) or when buf is NULL or cap is 0. */
+ * clears it), when buf is NULL or cap is 0, and when called from inside a
+ * callback on this engine. */
 OMNI_API size_t OMNI_CALL omni_last_error(OmniEngine *engine,
                                           char *buf,
                                           size_t cap);
 
 /* Test hook: deliberately panics inside the engine so a host can verify the
  * boundary returns OMNI_ERR_PANIC instead of crashing the process.
- * It is not part of the API and is named to make that obvious. */
+ * It is not part of the API and is named to make that obvious.
+ * From inside a callback it returns OMNI_ERR_REENTRANT instead -- the panic
+ * would have to unwind through the foreign frames that are calling it, which is
+ * exactly what rule 9 exists to prevent. */
 OMNI_API uint32_t OMNI_CALL omni_debug_panic(OmniEngine *engine);
 
 #ifdef __cplusplus

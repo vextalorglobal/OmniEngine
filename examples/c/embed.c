@@ -79,6 +79,61 @@ static int expect(int condition, const char *what) {
   return !condition;
 }
 
+/* ---- host callbacks, defined at file scope ---- */
+
+/* The simplest host function: one number in, its square out. */
+static int32_t OMNI_CALL square_cb(void *user_data, const OmniValue *args, uint32_t argc,
+                                    OmniValue *out) {
+  (void)user_data;
+  if (argc != 1 || args[0].tag != OMNI_NUMBER) return OMNI_HOST_ERR;
+  double n = args[0].payload.number;
+  out->tag = OMNI_NUMBER;
+  out->len = 0;
+  out->payload.number = n * n;
+  return OMNI_HOST_OK;
+}
+
+/* The argument's payload.ptr is the first byte of the text, not the object
+ * header a result's pointer is. This is caller rule 8, and it is what lets a
+ * host read its own arguments without calling back into the engine. */
+static int32_t OMNI_CALL shout_cb(void *user_data, const OmniValue *args, uint32_t argc,
+                                   OmniValue *out) {
+  (void)user_data;
+  if (argc != 1 || args[0].tag != OMNI_STRING) return OMNI_HOST_ERR;
+  static char answer[64];
+  size_t n = args[0].len;
+  if (n > sizeof answer - 2) n = sizeof answer - 2;
+  for (size_t i = 0; i < n; ++i) {
+    char ch = ((const char *)args[0].payload.ptr)[i];
+    if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 'a' + 'A');
+    answer[i] = ch;
+  }
+  answer[n] = '!';
+  answer[n + 1] = '\0';
+  out->tag = OMNI_STRING;
+  out->len = (uint32_t)(n + 1);
+  out->payload.ptr = answer; /* static: the engine copies before returning */
+  return OMNI_HOST_OK;
+}
+
+/* Re-entrancy is refused with a status, not a second alias of the engine: a
+ * callback that calls omni_exec on its own handle gets OMNI_ERR_REENTRANT
+ * rather than undefined behaviour, which is what makes the borrowed argument
+ * view sound. */
+static uint32_t reentrant_status = 0;
+static int32_t OMNI_CALL reentrant_cb(void *user_data, const OmniValue *args, uint32_t argc,
+                                       OmniValue *out) {
+  (void)args;
+  (void)argc;
+  OmniEngine *self = (OmniEngine *)user_data;
+  OmniValue nested;
+  reentrant_status = omni_exec(self, "1 + 1", 5, &nested);
+  out->tag = OMNI_NUMBER;
+  out->len = 0;
+  out->payload.number = 0.0;
+  return OMNI_HOST_OK;
+}
+
 int main(void) {
   /* Rule 5: agree on the wire format before trusting a single other symbol. A
    * mismatch means the header and the library disagree about where `len` sits,
@@ -257,6 +312,50 @@ int main(void) {
   uint32_t wrong = omni_exec_number(engine, text, strlen(text), &refused);
   failures += expect(wrong == OMNI_ERR_RUNTIME && refused == 0.0,
                      "omni_exec_number refuses a string without writing out");
+
+  printf("\n-- host callbacks (Phase 3) --\n");
+  {
+    /* A function registered by name, taking one number, returning its square.
+     * This is the entire contract of `omni_host_fn`: read the borrowed argument,
+     * write the answer into `out`, return OMNI_HOST_OK. */
+    const char *cb_name = "square";
+    uint32_t code = omni_register_host_fn(engine, cb_name, strlen(cb_name), 1, square_cb, NULL);
+    failures += expect(code == OMNI_OK, "omni_register_host_fn accepts a number callback");
+    failures += expect(omni_host_fn_count(engine) == 1, "the count reflects one registration");
+
+    const char *call = "square(6) + 1";
+    OmniValue result;
+    code = omni_exec(engine, call, strlen(call), &result);
+    failures += expect(code == OMNI_OK && result.tag == OMNI_NUMBER && result.payload.number == 37.0,
+                       "a script calls the host function and reads its answer");
+
+    /* The return count is the number removed, so unregistering a name that is
+     * not there reports 0 rather than an error. */
+    failures += expect(omni_unregister_host_fn(engine, cb_name, strlen(cb_name)) == 1,
+                       "unregister removes exactly one");
+    failures += expect(omni_unregister_host_fn(engine, cb_name, strlen(cb_name)) == 0,
+                       "unregister again removes nothing");
+    failures += expect(omni_host_fn_count(engine) == 0, "the count falls to zero");
+
+    code = omni_register_host_fn(engine, "shout", 5, 1, shout_cb, NULL);
+    failures += expect(code == OMNI_OK, "a string callback registers");
+    const char *shout_src = "shout(\"omni\")";
+    code = omni_exec(engine, shout_src, strlen(shout_src), &result);
+    Str text2 = copy_string(engine, &result);
+    failures += expect(code == OMNI_OK && text2.n == 5 && memcmp(text2.buf, "OMNI!", 5) == 0,
+                       "a borrowed argument reads byte-for-byte; the returned string copies out");
+    omni_unregister_host_fn(engine, "shout", 5);
+
+    reentrant_status = 0;
+    code = omni_register_host_fn(engine, "reenter", 7, 0, reentrant_cb, engine);
+    failures += expect(code == OMNI_OK, "a re-entrant callback registers");
+    const char *bad_call = "reenter()";
+    code = omni_exec(engine, bad_call, strlen(bad_call), &result);
+    failures += expect(code == OMNI_OK, "the outer call itself succeeds");
+    failures += expect(reentrant_status == OMNI_ERR_REENTRANT,
+                       "and omni_exec from inside the callback reports OMNI_ERR_REENTRANT");
+    omni_unregister_host_fn(engine, "reenter", 7);
+  }
 
   omni_engine_free(engine);
 

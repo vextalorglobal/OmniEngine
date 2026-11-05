@@ -52,6 +52,10 @@ pub enum TokenKind {
     NotEq,
     LParen,
     RParen,
+    /// `,` — the argument separator a call needs. Its own variant rather than a
+    /// punctuation-free hack because the parser reports what it expected, and
+    /// `f(1 2)` is only a useful message if the comma is a thing.
+    Comma,
     /// Accepted and ignored. Optional in OmniEngine, present so a C-style
     /// semicolon is not an error.
     Semi,
@@ -281,6 +285,14 @@ pub fn lex(source: &str) -> Result<Vec<Token<'_>>, LexError> {
                 tokens.push(Token {
                     kind: TokenKind::RParen,
                     text: ")",
+                    line,
+                });
+                pos += 1;
+            }
+            b',' => {
+                tokens.push(Token {
+                    kind: TokenKind::Comma,
+                    text: ",",
                     line,
                 });
                 pos += 1;

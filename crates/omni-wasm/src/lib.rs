@@ -139,11 +139,16 @@ fn encode(engine: &Engine, v: Value) -> WasmValue {
 
 /// Maps an [`omni_core::ErrorKind`] onto the C status integers. Present so the
 /// wasm and C bridges cannot silently disagree once the wasm build goes live.
+///
+/// `5` is `OMNI_ERR_HOST`. There is no `6` here: re-entrancy is a property of an
+/// opaque handle borrowed across a C boundary, and a wasm instance owns its engine
+/// outright, so the condition cannot arise.
 pub const fn status_code(kind: ErrorKind) -> u32 {
     match kind {
         ErrorKind::Lex | ErrorKind::Parse => 1,
         ErrorKind::Runtime => 2,
         ErrorKind::Panic => 3,
+        ErrorKind::Host => 5,
     }
 }
 
@@ -178,6 +183,7 @@ mod tests {
         assert_eq!(status_code(ErrorKind::Parse), 1);
         assert_eq!(status_code(ErrorKind::Runtime), 2);
         assert_eq!(status_code(ErrorKind::Panic), 3);
+        assert_eq!(status_code(ErrorKind::Host), 5);
     }
 
     /// The tag integers are the C ABI's, in the same order, and they are part of

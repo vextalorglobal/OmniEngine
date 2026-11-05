@@ -1,10 +1,10 @@
-//! OmniEngine's C ABI — version 2.
+//! OmniEngine's C ABI — version 3.
 //!
 //! This is the only crate permitted to name a `#[repr(C)]` type or an
 //! `extern "C"` function, which is what keeps `omni-core` from becoming
 //! FFI-shaped by accident.
 //!
-//! ## The two rules that make this sound
+//! ## The three rules that make this sound
 //!
 //! **A pointer that crosses the boundary addresses bytes the engine owns for as
 //! long as the handle does.** Phase 1 said "no arena pointer crosses the
@@ -27,26 +27,52 @@
 //! undefined behaviour, and it is the most common defect in hand-rolled Rust FFI.
 //! Every body here runs inside `catch_unwind`, and a caught panic becomes
 //! [`OMNI_ERR_PANIC`] rather than a crashed interpreter.
+//!
+//! **A host callback may never unwind into Rust, and may never alias the engine.**
+//! The third rule is new and it is the one that makes the other two survive a
+//! callback. An [`OmniEngine`] holds its engine in a [`RefCell`], so the borrow
+//! an evaluation runs on is *checked* rather than assumed: a re-entrant call on
+//! the same handle meets [`OMNI_ERR_REENTRANT`] instead of creating the second
+//! `&mut` that would be undefined behaviour at the cast, before any code could
+//! notice. That refusal is what makes two things sound at once — the argument
+//! strings a callback may dereference, and the panic boundary, since the only way
+//! to get a Rust frame unwinding through a foreign one is to re-enter.
+//!
+//! The mirror is the callback's own failure. [`omni_host_fn`] reports an error by
+//! *returning* [`OMNI_HOST_ERR`] with a message in `out`, never by unwinding: a
+//! Python exception cannot cross a ctypes trampoline at all, and a JavaScript
+//! throw would unwind through the native frames `omni_exec` is sitting on. Both
+//! SDKs therefore catch before Rust ever sees the failure.
 
-use std::ffi::{c_char, c_double};
+use std::cell::{Ref, RefCell, RefMut};
+use std::ffi::{c_char, c_double, c_void};
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::slice;
 
-use omni_core::{Engine, ErrorKind, HostError, Value};
+use omni_core::{Engine, ErrorKind, HostError, HostOutcome, Value};
 
-/// The two ceilings a host has to size its buffers against.
+/// The ceilings a host has to size its buffers and names against.
 ///
 /// Re-exported rather than restated: they are part of the ABI's contract, and a
 /// number duplicated on both sides of a module boundary is a number that drifts.
-pub use omni_core::{MAX_IDENTIFIER_LEN, MAX_STRING_LEN};
+pub use omni_core::{MAX_ARGS, MAX_CALL_DEPTH, MAX_IDENTIFIER_LEN, MAX_STRING_LEN};
 
 pub const OMNI_OK: u32 = 0;
 pub const OMNI_ERR_COMPILE: u32 = 1;
 pub const OMNI_ERR_RUNTIME: u32 = 2;
 pub const OMNI_ERR_PANIC: u32 = 3;
 pub const OMNI_ERR_ARG: u32 = 4;
+/// A host function reported its own failure. Its text is in the engine's last
+/// error, and the distinction from [`OMNI_ERR_RUNTIME`] is the point: a host that
+/// cannot tell "my callback threw" from "the program divided by zero" cannot
+/// route the one to its own error handling.
+pub const OMNI_ERR_HOST: u32 = 5;
+/// The handle was already inside an evaluation, so this call would have aliased
+/// it. Only reachable from a host function that calls back into the engine that
+/// is calling it — see the module doc's third rule.
+pub const OMNI_ERR_REENTRANT: u32 = 6;
 
 pub const OMNI_NUMBER: u32 = 0;
 pub const OMNI_NIL: u32 = 1;
@@ -62,7 +88,13 @@ pub const OMNI_STRING: u32 = 4;
 /// [`omni_abi_version`] at load time and refuse to continue on a mismatch, so a
 /// stale `omni.dll` turns into one clear error at import instead of a wrong
 /// number ten thousand calls later.
-pub const OMNI_ABI_VERSION: u32 = 2;
+///
+/// Version 3 is the callback increment, and note what it did *not* change:
+/// `OmniValue` is still 16 bytes with the same three fields at the same offsets,
+/// and `OmniStats` is still 72. The bump is for [`omni_host_fn`], which a v2 host
+/// has no way to declare, and for [`OMNI_ERR_HOST`] and [`OMNI_ERR_REENTRANT`],
+/// which a v2 host would read as unknown statuses.
+pub const OMNI_ABI_VERSION: u32 = 3;
 
 /// 256 MiB of source is already absurd; the bound exists so a hostile or buggy
 /// `len` from a host cannot fabricate an out-of-bounds slice.
@@ -79,8 +111,13 @@ const MAX_SOURCE_LEN: usize = 1 << 28;
 pub union OmniPayload {
     /// Live for [`OMNI_NUMBER`] and [`OMNI_BOOL`].
     pub number: c_double,
-    /// Live for [`OMNI_STRING`]: an address the engine owns, never dereferenced
-    /// by a host that wants correctness — copy it out with [`omni_str_copy`].
+    /// Live for [`OMNI_STRING`]. Which of the two it addresses depends on who
+    /// wrote the struct, and both rules are in `omni.h`:
+    ///
+    /// - a result from [`omni_exec`] identifies the string inside a block the
+    ///   engine owns — copy it with [`omni_str_copy`], do not `memcpy` from it;
+    /// - an argument handed to a host callback is the first byte of its text
+    ///   (see [`encode_argument`]), readable for the callback's extent.
     pub ptr: *const c_char,
 }
 
@@ -238,14 +275,89 @@ const _: () = assert!(std::mem::offset_of!(OmniStats, egress_high_water) == 64);
 /// Has no `#[repr(C)]` because C never looks inside it, and `Engine` owns its
 /// identifier strings, so there is no lifetime that could make a long-lived
 /// handle unsound.
-pub struct OmniEngine(Engine);
+///
+/// The [`RefCell`] is not decoration. Every export below either takes the engine
+/// for reading or for writing, and a host function that called back into
+/// [`omni_exec`] would create a second `&mut Engine` from the same raw pointer —
+/// undefined behaviour at the cast, before any check could run. With the cell,
+/// that call is a `try_borrow_mut` that fails, and the re-entrancy becomes a
+/// status code. The cost is one integer read per call, inside a function that
+/// already pays for `catch_unwind`.
+pub struct OmniEngine {
+    inner: RefCell<Engine>,
+}
+
+/// The callback a host registers, and the only shape a host function may have.
+///
+/// `Option` because C's null is then `None` in the type: an absent callback is
+/// unmatched rather than a pointer that will be called and crash.
+///
+/// `args` points at `argc` [`OmniValue`]s whose string arms address this engine's
+/// own memory. That is a **borrowed view, valid until this function returns**:
+/// copy what you need, and never store the address. It is sound for exactly as
+/// long as the arena cannot reset under the call, and the arena cannot reset
+/// because `arena.reset()` runs only at the entry of `omni_exec` — which a
+/// re-entrant call cannot reach.
+///
+/// Return [`OMNI_HOST_OK`] with the value in `out`, or [`OMNI_HOST_ERR`] with the
+/// message in `out` as an `OMNI_STRING`. A nonzero return is data, and it is the
+/// only way a host may report failure: nothing may unwind into Rust from here.
+pub type OmniHostFn = Option<
+    unsafe extern "C" fn(
+        user_data: *mut c_void,
+        args: *const OmniValue,
+        argc: u32,
+        out: *mut OmniValue,
+    ) -> i32,
+>;
+
+/// The status a host function returns for success and for failure.
+pub const OMNI_HOST_OK: i32 = 0;
+/// The host failed; whatever `out` carries is the message, not a result.
+pub const OMNI_HOST_ERR: i32 = 1;
+
+/// `user_data` as the engine stores it.
+///
+/// A raw pointer is not `Send`, and the registry lives inside an `Engine` that
+/// is, so without this newtype the callback would silently make the handle
+/// non-`Send` — a change nothing in this crate would notice until someone moved
+/// a handle across threads. The assertion restates the rule the whole ABI already
+/// runs on: one handle, one thread, and the host keeps the pointee alive at least
+/// as long as the registration.
+#[derive(Clone, Copy)]
+struct HostContext(*mut c_void);
+
+// Safety: the pointer is only ever dereferenced by the host that supplied it, on
+// the thread that registered it, while the engine's borrow is held.
+unsafe impl Send for HostContext {}
 
 fn status_for(kind: ErrorKind) -> u32 {
     match kind {
         ErrorKind::Lex | ErrorKind::Parse => OMNI_ERR_COMPILE,
         ErrorKind::Runtime => OMNI_ERR_RUNTIME,
         ErrorKind::Panic => OMNI_ERR_PANIC,
+        ErrorKind::Host => OMNI_ERR_HOST,
     }
+}
+
+/// Take the handle for writing, or report the re-entrancy that would have
+/// aliased it.
+///
+/// The argument is a *shared* reference on purpose: a `RefCell` hands out `RefMut`
+/// through `&`, which is the one way to get a checked mutable borrow out of a
+/// pointer that cannot lend a lifetime. A raw pointer could not appear here and
+/// keep the returned borrow honest about how long it lives.
+fn borrow_mut(engine: &OmniEngine) -> Result<RefMut<'_, Engine>, u32> {
+    engine
+        .inner
+        .try_borrow_mut()
+        .map_err(|_| OMNI_ERR_REENTRANT)
+}
+
+/// Take the handle for reading. Same contract as [`borrow_mut`], for the exports
+/// that must not stop a host from asking a question mid-evaluation.
+fn borrow(engine: &OmniEngine) -> Result<Ref<'_, Engine>, u32> {
+    engine.inner.try_borrow().map_err(|_| OMNI_ERR_REENTRANT)
 }
 
 /// Run `body`, converting a panic into [`OMNI_ERR_PANIC`].
@@ -313,6 +425,111 @@ fn encode(engine: &Engine, v: Value) -> OmniValue {
     }
 }
 
+/// Put one *call argument* into the boundary struct.
+///
+/// One difference from [`encode`], and it is the whole of the callback's borrowed
+/// view: a string's `payload.ptr` addresses its bytes, not the block header that
+/// [`omni_str_copy`] reads. A host dereferences an argument directly —
+/// `memcpy(dst, args[i].payload.ptr, args[i].len)` — because the copy helper is
+/// unavailable there: it takes the handle, and the handle is already borrowed by
+/// the very call that is handing the argument over. The bytes cannot move while
+/// the callback runs, because nothing that resets the arena can run while this
+/// borrow is held — which is exactly what the header's re-entrancy rule buys.
+fn encode_argument(engine: &Engine, v: Value) -> OmniValue {
+    if v.is_string() {
+        // The same empty-string rule as `encode`: no address is handed out for
+        // nothing, so a host that sees a null pointer sees a length of zero too.
+        let bytes = engine.string_of(v).unwrap_or_default();
+        let addr = if bytes.is_empty() {
+            ptr::null()
+        } else {
+            bytes.as_ptr()
+        };
+        return OmniValue::string(bytes, addr);
+    }
+    encode(engine, v)
+}
+
+/// Read a string an [`OmniValue`] carries out of *host* memory.
+///
+/// This is the one place the boundary reads a pointer the engine did not mint, so
+/// it is deliberately narrow: `None` when the address is null with a nonzero
+/// length or when the length is past [`MAX_STRING_LEN`], both of which the caller
+/// turns into a failure rather than a partial read. The bytes are copied into an
+/// owned buffer, which is what keeps the engine from ever storing a host address —
+/// the same rule [`omni_define_string`] states from the other side.
+fn host_bytes(value: &OmniValue) -> Option<Vec<u8>> {
+    let len = usize::try_from(value.len).ok()?;
+    if len > MAX_STRING_LEN {
+        return None;
+    }
+    let addr = value.string_ptr()?;
+    if addr.is_null() {
+        return (len == 0).then(Vec::new);
+    }
+    // Safety: the host guarantees `out` addresses readable bytes for `len`, and
+    // this runs inside the dynamic extent of the callback that filled it.
+    Some(unsafe { slice::from_raw_parts(addr.cast::<u8>(), len) }.to_vec())
+}
+
+/// Lower the arguments, run one host callback, and read its answer back.
+///
+/// `engine` is the evaluator's own borrow, shared rather than mutable, which is
+/// what lets [`encode`] hand the host an address into the arena: those bytes
+/// cannot move, because nothing that resets the arena can run while this borrow
+/// is held. A returned string is copied out of host memory before the callback's
+/// frame is gone, and only then boxed.
+fn call_host(
+    engine: &Engine,
+    callback: OmniHostFn,
+    context: HostContext,
+    args: &[Value],
+) -> HostOutcome {
+    let Some(f) = callback else {
+        return HostOutcome::Failure(b"the registered callback is null".to_vec());
+    };
+    if args.len() > MAX_ARGS {
+        // Core enforces arity at registration and at the call site, so reaching
+        // here means that invariant broke. Refusing beats writing past `buf`.
+        return HostOutcome::Failure(b"more arguments than the ABI carries".to_vec());
+    }
+    let mut buf = [OmniValue::default(); MAX_ARGS];
+    for (slot, value) in buf.iter_mut().zip(args) {
+        *slot = encode_argument(engine, *value);
+    }
+    let mut out = OmniValue::default();
+    let argc = args.len() as u32;
+    // Safety: `f` is the host's own function, registered by name on this thread;
+    // `buf`, `out`, and the null `user_data` are all the host agreed to accept.
+    let code = unsafe { f(context.0, buf.as_ptr(), argc, &mut out) };
+    if code != OMNI_HOST_OK {
+        // The host's message if it sent one. A failure with no string attached is
+        // still a failure, and core prints the function's name for it.
+        return HostOutcome::Failure(host_bytes(&out).unwrap_or_default());
+    }
+    match out.tag {
+        OMNI_NUMBER => match out.number() {
+            Some(n) => HostOutcome::Number(n),
+            None => HostOutcome::Failure(b"a number result has no readable payload".to_vec()),
+        },
+        OMNI_BOOL => match out.number() {
+            // A host that returns `true` as 1.0 and one that returns 1.0 as `true`
+            // are the same eight bytes, so nonzero is the rule and it is stated.
+            Some(n) => HostOutcome::Bool(n != 0.0),
+            None => HostOutcome::Failure(b"a boolean result has no readable payload".to_vec()),
+        },
+        OMNI_NIL => HostOutcome::Nil,
+        OMNI_UNDEF => HostOutcome::Undefined,
+        OMNI_STRING => match host_bytes(&out) {
+            Some(bytes) => HostOutcome::String(bytes),
+            None => HostOutcome::Failure(b"a string result has no readable bytes".to_vec()),
+        },
+        other => HostOutcome::Failure(
+            format!("the host returned tag {other}, which is not a value").into_bytes(),
+        ),
+    }
+}
+
 /// ABI level of the loaded library. Compare with your `OMNI_ABI_VERSION` before
 /// trusting any other symbol.
 #[unsafe(no_mangle)]
@@ -332,24 +549,41 @@ pub extern "C" fn omni_version() -> *const c_char {
 #[unsafe(no_mangle)]
 pub extern "C" fn omni_engine_new() -> *mut OmniEngine {
     match catch_unwind(AssertUnwindSafe(|| {
-        Box::into_raw(Box::new(OmniEngine(Engine::new())))
+        Box::into_raw(Box::new(OmniEngine {
+            inner: RefCell::new(Engine::new()),
+        }))
     })) {
         Ok(handle) => handle,
         Err(_) => ptr::null_mut(),
     }
 }
 
+/// Release an engine, and with it every host string and host function it owns.
+///
+/// Refusing is the interesting case. A host function that freed its own engine
+/// from inside the callback would drop the `Engine` while the evaluator's borrow
+/// of it is still live, and the borrow would then be reading freed memory on the
+/// way out — so a handle that is mid-evaluation is not freed at all. This returns
+/// without doing anything; there is no status to report, and a host that wants
+/// one checks [`omni_host_fn_count`] is zero and calls it from outside a callback.
+///
 /// # Safety
 ///
 /// `engine` must be null or a value returned by [`omni_engine_new`], must not be
 /// used after this call, and must not be freed twice.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn omni_engine_free(engine: *mut OmniEngine) {
-    if !engine.is_null() {
-        // Safety: the caller asserts this pointer came from Box::into_raw above
-        // and has not been reclaimed already.
-        drop(unsafe { Box::from_raw(engine) });
+    if engine.is_null() {
+        return;
     }
+    // The re-entrancy rule, applied to the one call that cannot report it.
+    if borrow_mut(unsafe { &*engine }).is_err() {
+        return;
+    }
+    // Safety: the caller asserts this pointer came from Box::into_raw above
+    // and has not been reclaimed already. The borrow above is dropped here, so
+    // nothing aliases the engine from this point.
+    drop(unsafe { Box::from_raw(engine) });
 }
 
 /// Evaluate `source` and write the result to `out`.
@@ -395,12 +629,17 @@ pub unsafe extern "C" fn omni_exec(
         }
     };
     // Safety: the null check above ran, and the caller guarantees the handle is
-    // live and not concurrently aliased. One handle, one thread.
-    let engine = unsafe { &mut (*engine).0 };
+    // live. One handle, one thread.
+    let mut engine = match borrow_mut(unsafe { &*engine }) {
+        Ok(borrow) => borrow,
+        // A host function calling `omni_exec` on the engine that is calling it.
+        // Refused rather than aliased — see the module doc's third rule.
+        Err(code) => return code,
+    };
     guarded(|| match engine.exec(text) {
         Ok(value) => {
             // Safety: `out` was checked non-null and writable.
-            unsafe { *out = encode(engine, value) };
+            unsafe { *out = encode(&engine, value) };
             OMNI_OK
         }
         Err(error) => status_for(error.kind),
@@ -475,7 +714,13 @@ pub unsafe extern "C" fn omni_str_copy(
     }
     // Safety: the null checks above ran, and the caller guarantees the handle is
     // live and that `buf` holds `cap` writable bytes.
-    let engine = unsafe { &(*engine).0 };
+    let engine = match borrow(unsafe { &*engine }) {
+        Ok(borrow) => borrow,
+        // Mid-evaluation, so the arena these addresses live in is exactly what is
+        // being written. A `usize` cannot carry a status, and zero already means
+        // "this is not mine to read", so the refusal reuses the existing answer.
+        Err(_) => return 0,
+    };
     // Safety: `value` was checked non-null and readable as an `OmniValue`.
     let value = unsafe { &*value };
     let Some(addr) = value.string_ptr() else {
@@ -562,7 +807,10 @@ pub unsafe extern "C" fn omni_define_string(
     };
     // Safety: the null check above ran and the caller guarantees the handle is
     // live. One handle, one thread.
-    let engine = unsafe { &mut (*engine).0 };
+    let mut engine = match borrow_mut(unsafe { &*engine }) {
+        Ok(borrow) => borrow,
+        Err(code) => return code,
+    };
     guarded(|| match engine.define_string(name, payload) {
         Ok(()) => OMNI_OK,
         // Every `HostError` is the caller's fault, so there is nothing else to
@@ -570,7 +818,8 @@ pub unsafe extern "C" fn omni_define_string(
         Err(HostError::EmptyName)
         | Err(HostError::NameTooLong)
         | Err(HostError::NotUtf8)
-        | Err(HostError::TooLong) => OMNI_ERR_ARG,
+        | Err(HostError::TooLong)
+        | Err(HostError::ArityTooLarge) => OMNI_ERR_ARG,
     })
 }
 
@@ -592,7 +841,10 @@ pub unsafe extern "C" fn omni_debug_stats(engine: *mut OmniEngine, out: *mut Omn
     let stats = {
         // Safety: the null check above ran, and the caller guarantees the handle
         // is live.
-        let engine = unsafe { &(*engine).0 };
+        let engine = match borrow(unsafe { &*engine }) {
+            Ok(borrow) => borrow,
+            Err(code) => return code,
+        };
         let s = engine.stats();
         OmniStats {
             size: std::mem::size_of::<OmniStats>() as u32,
@@ -634,9 +886,15 @@ pub unsafe extern "C" fn omni_last_error(
     // Copy the *rendered* error, not just its message. A host that shows a
     // user "expected a name" with no line number cannot point them at the
     // source, and this boundary is where that context would otherwise be lost.
-    let rendered = match unsafe { (*engine).0.last_error() } {
-        Some(error) => error.to_string(),
-        None => String::new(),
+    let rendered = match borrow(unsafe { &*engine }) {
+        Ok(engine) => match engine.last_error() {
+            Some(error) => error.to_string(),
+            None => String::new(),
+        },
+        // Zero, which a host already reads as "there was no error". A callback
+        // that wants the failure it just caused should return the message in
+        // `out` rather than ask for it here.
+        Err(_) => return 0,
     };
     let message = rendered.as_bytes();
     let n = message.len().min(cap - 1);
@@ -652,13 +910,159 @@ pub unsafe extern "C" fn omni_last_error(
 /// Test hook that proves the panic boundary is wired, from Rust or from a host.
 /// There is no other way to exercise the acceptance criterion "a panic returns
 /// `OMNI_ERR_PANIC`", and it is named so nobody mistakes it for an API.
+///
+/// It takes the handle first, because a panic started while an evaluation holds
+/// the engine would unwind through the host frames that call is sitting on. From
+/// inside a callback this returns [`OMNI_ERR_REENTRANT`] and does not panic at
+/// all, which is the third rule doing its job on the crate's own test hook.
+///
+/// # Safety
+///
+/// `engine` must come from [`omni_engine_new`] and still be live.
 #[doc(hidden)]
 #[unsafe(no_mangle)]
-pub extern "C" fn omni_debug_panic(engine: *mut OmniEngine) -> u32 {
+pub unsafe extern "C" fn omni_debug_panic(engine: *mut OmniEngine) -> u32 {
     if engine.is_null() {
         return OMNI_ERR_ARG;
     }
+    // Safety: the null check above ran and the caller guarantees the handle is
+    // live, which is the same contract every other export in this file takes.
+    let _guard = match borrow_mut(unsafe { &*engine }) {
+        Ok(borrow) => borrow,
+        Err(code) => return code,
+    };
     guarded(|| panic!("omni_debug_panic: deliberate panic to prove the FFI boundary catches it"))
+}
+
+/// Register a function a host owns, callable from scripts as `name(...)`.
+///
+/// The engine stores the pointer and the `user_data` it is given and never
+/// dereferences either — `user_data` only ever travels back to `callback`, so a
+/// host may hang whatever it needs off it: a `PyObject *`, a JavaScript function,
+/// an index into the host's own table.
+///
+/// Redefining `name` replaces the callback and its `user_data` together, and does
+/// **not** release anything the previous registration owned. That is deliberate —
+/// the engine cannot know whether the old `user_data` was freed — but it is why
+/// [`omni_unregister_host_fn`] exists, and why both SDKs unregister before they
+/// drop a callback.
+///
+/// `arity` is fixed: a script that passes a different count is a runtime error
+/// naming the function and both counts, checked by the engine before the host is
+/// entered.
+///
+/// Returns [`OMNI_OK`], [`OMNI_ERR_ARG`] for a null handle or callback, an empty
+/// or over-[`MAX_IDENTIFIER_LEN`] name, an `arity` over [`MAX_ARGS`], or
+/// [`OMNI_ERR_REENTRANT`] when called from inside one of this engine's own
+/// callbacks.
+///
+/// # Safety
+///
+/// `engine` must come from [`omni_engine_new`]. `name` must be readable for
+/// `name_len` bytes, or be null with a zero length. `callback` must be callable
+/// for every argument tuple the registered `arity` describes, must not unwind,
+/// and `user_data` must stay valid for every call until this name is
+/// unregistered or the engine is freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn omni_register_host_fn(
+    engine: *mut OmniEngine,
+    name: *const c_char,
+    name_len: usize,
+    arity: u32,
+    callback: OmniHostFn,
+    user_data: *mut c_void,
+) -> u32 {
+    if engine.is_null() || callback.is_none() {
+        return OMNI_ERR_ARG;
+    }
+    if name_len > MAX_IDENTIFIER_LEN || (name.is_null() && name_len != 0) {
+        return OMNI_ERR_ARG;
+    }
+    // Safety: the length is bounded and the caller guarantees `name` is readable
+    // for it.
+    let name_bytes = if name_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(name.cast::<u8>(), name_len) }
+    };
+    let Ok(name) = std::str::from_utf8(name_bytes) else {
+        return OMNI_ERR_ARG;
+    };
+    let mut engine = match borrow_mut(unsafe { &*engine }) {
+        Ok(borrow) => borrow,
+        Err(code) => return code,
+    };
+    // The pointer and its context are captured, not inspected: this closure is
+    // the only place either is used, and it runs on the thread holding the borrow.
+    let callback = callback.expect("checked non-null above");
+    let context = HostContext(user_data);
+    guarded(|| {
+        match engine.register_host_fn(name, arity, move |engine, args| {
+            call_host(engine, Some(callback), context, args)
+        }) {
+            Ok(()) => OMNI_OK,
+            Err(HostError::EmptyName)
+            | Err(HostError::NameTooLong)
+            | Err(HostError::NotUtf8)
+            | Err(HostError::TooLong)
+            | Err(HostError::ArityTooLarge) => OMNI_ERR_ARG,
+        }
+    })
+}
+
+/// Drop the host function called `name`, and return 1 if there was one.
+///
+/// The engine releases the callback it stored; what `user_data` pointed at was
+/// never its to free. A koffi slot, a ctypes trampoline, a C closure — releasing
+/// those is the caller's half of the registration, and this is the call that makes
+/// it safe to do them.
+///
+/// # Safety
+///
+/// As [`omni_register_host_fn`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn omni_unregister_host_fn(
+    engine: *mut OmniEngine,
+    name: *const c_char,
+    name_len: usize,
+) -> usize {
+    if engine.is_null() || name_len > MAX_IDENTIFIER_LEN || (name.is_null() && name_len != 0) {
+        return 0;
+    }
+    // Safety: bounded length, and the caller guarantees `name` is readable for it.
+    let name_bytes = if name_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(name.cast::<u8>(), name_len) }
+    };
+    let Ok(name) = std::str::from_utf8(name_bytes) else {
+        return 0;
+    };
+    let mut engine = match borrow_mut(unsafe { &*engine }) {
+        Ok(borrow) => borrow,
+        Err(_) => return 0,
+    };
+    guarded_len(|| usize::from(engine.unregister_host_fn(name)))
+}
+
+/// How many host functions this engine has registered.
+///
+/// Zero means no foreign code can be entered, which is what a leak test asserts
+/// after it unregisters everything it registered.
+///
+/// # Safety
+///
+/// `engine` must come from [`omni_engine_new`], or be null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn omni_host_fn_count(engine: *const OmniEngine) -> usize {
+    if engine.is_null() {
+        return 0;
+    }
+    let engine = match borrow(unsafe { &*engine }) {
+        Ok(borrow) => borrow,
+        Err(_) => return 0,
+    };
+    guarded_len(|| engine.host_fn_count())
 }
 
 #[cfg(test)]
@@ -683,10 +1087,10 @@ mod tests {
     }
 
     #[test]
-    fn the_abi_reports_two_and_the_header_agrees() {
+    fn the_abi_reports_three_and_the_header_agrees() {
         assert_eq!(omni_abi_version(), OMNI_ABI_VERSION);
         assert_eq!(
-            OMNI_ABI_VERSION, 2,
+            OMNI_ABI_VERSION, 3,
             "the header and both SDKs hard-code this"
         );
     }
@@ -1117,7 +1521,7 @@ mod tests {
     #[test]
     fn the_panic_boundary_still_covers_the_new_bodies() {
         let engine = omni_engine_new();
-        assert_eq!(omni_debug_panic(engine), OMNI_ERR_PANIC);
+        assert_eq!(unsafe { omni_debug_panic(engine) }, OMNI_ERR_PANIC);
         // The other four new bodies are guarded in the same shape, and a host
         // reaching them with an address the engine does not own must get a clean
         // zero rather than a partial write.
