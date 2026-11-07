@@ -82,6 +82,7 @@ python sdks/python/tests/test_ffi.py
 (cd sdks/nodejs && npm install koffi && npm test)
 ./scripts/verify-all.sh
 python scripts/check-versions.py --tag v0.1.0
+python -m twine check dist/*.whl          # after building the wheel
 ```
 
 `check-versions.py` reads the workspace version from `Cargo.toml`, `[project]`

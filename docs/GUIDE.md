@@ -1233,6 +1233,7 @@ Measured on this machine with the release engine:
 | `omniengine-0.1.0-py3-none-win_amd64.whl` | 541,369 bytes, 8 files |
 | contents | `omni/__init__.py`, `omni/_ffi.py`, `omni/_native/omni.dll`, LICENSE, METADATA, WHEEL, `top_level.txt`, RECORD |
 | install and run outside the repo, no `OMNI_*` set | `42.0`, `packaged wheel`, batch `[2.0, 'two']`; `load_library()` resolved to `site-packages\omni\_native\omni.dll` |
+| `twine check` | PASSED — the metadata PyPI will render, including the README and license file |
 
 **The npm tarball.** `files` is a whitelist — `index.js`, `lib/`, `native/`,
 `scripts/postinstall.js`, `README.md`, `LICENSE` — so a test file or a build

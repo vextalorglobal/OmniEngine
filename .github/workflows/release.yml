@@ -172,7 +172,7 @@ jobs:
         with:
           name: lib-${{ matrix.platform }}
           path: native-lib
-      - run: python -m pip install --upgrade "setuptools>=77" wheel build
+      - run: python -m pip install --upgrade "setuptools>=77" wheel build twine
       - name: build the wheel with the engine inside
         shell: bash
         env:
@@ -185,6 +185,8 @@ jobs:
           python -m wheel tags --python-tag py3 --abi-tag none \
             --platform-tag ${{ matrix.tag }} dist/*.whl
           rm -f dist/omniengine-*-cp*.whl
+      - name: check the metadata PyPI will render
+        run: python -m twine check dist/*.whl
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-${{ matrix.platform }}
