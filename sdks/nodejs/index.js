@@ -215,6 +215,21 @@ class Engine {
   }
 
   /**
+   * Evaluate `source` and return a native JavaScript value.
+   *
+   * The one-call form for a REPL or a template engine: a number comes back as
+   * `number`, a string as `string`, a boolean as `boolean`, and nil, undefined
+   * or an empty program as `null`. Use `run` when the tag itself matters.
+   *
+   * @param {string} source
+   * @returns {number|string|boolean|null}
+   * @throws {OmniError} when the program fails
+   */
+  eval(source) {
+    return this.run(source).value;
+  }
+
+  /**
    * Evaluate without throwing: `{ status, statusName, result, message }`.
    * For REPLs and editors, where a syntax error is a normal event.
    *
@@ -516,9 +531,14 @@ class Engine {
    * execution arena is bulk-freed per call and the egress block rewinds, so
    * `*BytesReserved` only ever grows to the largest single request.
    *
-   * @returns {{execs: number, strings: number, arenaBytesInUse: number,
-   *   arenaBytesReserved: number, arenaChunks: number, egressBytesInUse: number,
-   *   egressBytesReserved: number, egressHighWater: number}}
+   * `lastExecMicros` is the wall-clock cost of the most recent execution, or 0
+   * before the first one. It is a plain number, not a BigInt: it is a `uint32_t`
+   * and saturates rather than wrapping.
+   *
+   * @returns {{execs: number, lastExecMicros: number, strings: number,
+   *   arenaBytesInUse: number, arenaBytesReserved: number, arenaChunks: number,
+   *   egressBytesInUse: number, egressBytesReserved: number,
+   *   egressHighWater: number}}
    */
   stats() {
     const b = this._require();
@@ -540,6 +560,7 @@ class Engine {
     // has not allocated petabytes, so the conversion is lossless in practice.
     return {
       execs: Number(raw.execs),
+      lastExecMicros: Number(raw.last_exec_micros),
       strings: Number(raw.strings),
       arenaBytesInUse: Number(raw.arena_bytes_in_use),
       arenaBytesReserved: Number(raw.arena_bytes_reserved),

@@ -38,7 +38,17 @@ have() { command -v "$1" >/dev/null 2>&1; }
 CROSS_PROGRAM='"hello, " + "world" + "\u{1F600}"'
 CROSS_WANT=$(printf 'hello, world\xF0\x9F\x98\x80')
 MIX_PROGRAM='"hi" + 42'
-MIX_WANT='line 1: cannot add string to number: "hi" + 42'
+MIX_WANT='[Line 1, Col 6]: type mismatch: cannot add string to number: "hi" + 42'
+# DevPack: a runtime error on the second line must say so, and the column is a
+# byte column counted from the start of the line, so the operator lands on 13.
+DIAG_PROGRAM=$'let a = 1\nlet b = "x" + 2'
+DIAG_WANT='[Line 2, Col 13]: type mismatch: cannot add string to number: "x" + 2'
+# DevPack builtins. Kept as two programs so one row can fail on strings alone
+# and the other on numbers alone instead of blaming a single fused answer.
+STR_BUILTIN_PROGRAM='upper(trim("  abc  "))'
+STR_BUILTIN_WANT='ABC'
+NUM_BUILTIN_PROGRAM='clamp(12, 0, 10) + min(1, 2) + max(3, 4) + floor(2.9) + ceil(2.1) + round(2.5) + abs(0 - 7)'
+NUM_BUILTIN_WANT='30'
 # examples/strings.omni ends with a space before the escape, so its answer is
 # not the same bytes as CROSS_WANT. Checked against its own expectation.
 STRINGS_WANT=$(printf 'hello, world \xF0\x9F\x98\x80')
@@ -60,19 +70,21 @@ echo "   workspace: $ROOT"
 echo
 
 # ---------------------------------------------------------------- Rust
+# Run the suite once into a log: piping cargo into grep under `pipefail` makes
+# the pipeline inherit cargo's exit code, which used to turn a failing suite
+# into a PASS row. The log is also what the totals and the tail are read from,
+# so a failure cannot be hidden by a second run that got lucky.
 printf 'Rust tests... '
-if cargo test --workspace 2>&1 | grep -qE 'test result: FAILED|error\[|error:'; then
-  fail "cargo test --workspace"
-  cargo test --workspace 2>&1 | tail -20
-else
-  total=$(cargo test --workspace 2>&1 | grep -oE '[0-9]+ passed' | awk '{s += $1} END {print s+0}')
+if cargo test --workspace >"$OUT/rust.log" 2>&1; then
+  total=$(grep -oE '[0-9]+ passed' "$OUT/rust.log" | awk '{s += $1} END {print s+0}')
   pass "cargo test --workspace (${total:-0} tests)"
+else
+  fail "cargo test --workspace"
+  tail -20 "$OUT/rust.log"
 fi
 
 printf 'Shared library... '
-if cargo build -p omni-ffi 2>&1 | grep -qE 'error\[|error:'; then
-  fail "cargo build -p omni-ffi"
-else
+if cargo build -p omni-ffi >"$OUT/build.log" 2>&1; then
   lib="$ROOT/target/debug/$(case "$OSTYPE" in
     msys*|cygwin*|win32*) echo omni.dll ;;
     darwin*) echo libomni.dylib ;;
@@ -83,6 +95,9 @@ else
   else
     fail "expected artifact $lib was not produced"
   fi
+else
+  fail "cargo build -p omni-ffi"
+  tail -10 "$OUT/build.log"
 fi
 
 # ---------------------------------------------------------------- CLI
@@ -586,7 +601,7 @@ with omni.Engine() as e:
     print(" ".join(str(s) for s, _, _ in items))
     print("|", items[1][2], "|", items[3][2])
 ' 2>&1)
-  if [[ "$got" == "0 2 0 2"*"| line 1: cannot add string to number: \"a\" + 1 | line 1: undefined variable 'nothere'"* ]]; then
+  if [[ "$got" == "0 2 0 2"*"| [Line 1, Col 5]: type mismatch: cannot add string to number: \"a\" + 1 | [Line 1, Col 1]: undefined variable 'nothere'"* ]]; then
     bfail_hosts+=' python'
   else bfail_wrong+=" python='$got'"; fi
 fi
@@ -599,7 +614,7 @@ console.log(items.map((i) => i.status).join(" "));
 console.log("|", items[1].message, "|", items[3].message);
 e.close();
 ' 2>&1)
-  if [[ "$got" == "0 2 0 2"*"| line 1: cannot add string to number: \"a\" + 1 | line 1: undefined variable 'nothere'"* ]]; then
+  if [[ "$got" == "0 2 0 2"*"| [Line 1, Col 5]: type mismatch: cannot add string to number: \"a\" + 1 | [Line 1, Col 1]: undefined variable 'nothere'"* ]]; then
     bfail_hosts+=' node'
   else bfail_wrong+=" node='$got'"; fi
 fi
@@ -698,6 +713,172 @@ elif [[ -n "$bre_hosts" ]]; then
   pass "a batch from a borrowed handle errors with the shared refusal text in:$bre_hosts"
 else
   skip "batch re-entrancy guard" "python and node not available"
+fi
+
+# ---------------------------------------------------- Phase 5: the DevPack surfaces
+#
+# The builtins, the positioned diagnostics, the native-value sugar, and the
+# execution timer are each asserted by a single host's suite. These rows check
+# what those suites cannot: that a program built from the new builtins reduces
+# to the same value everywhere, that a second-line error renders the same
+# line/column text in every host, and that the two SDKs hand back values a host
+# can use without unwrapping anything.
+
+printf 'The DevPack builtins answer the same in every host... '
+builtin_hosts=''
+builtin_wrong=''
+if have cargo; then
+  s=$(cargo run -q -p omni-cli -- eval "$STR_BUILTIN_PROGRAM" 2>&1)
+  n=$(cargo run -q -p omni-cli -- eval "$NUM_BUILTIN_PROGRAM" 2>&1)
+  if [[ "$s" == "$STR_BUILTIN_WANT" && "$n" == "$NUM_BUILTIN_WANT" ]]; then builtin_hosts+=' cli'
+  else builtin_wrong+=" cli='$s|$n'"; fi
+fi
+if [[ -n "${PY:-}" ]]; then
+  # eval_str folds the integral float to a Python int, so 30 prints as "30"
+  # and not "30.0" while still being a value ordinary Python arithmetic takes.
+  got=$(cd sdks/python && S="$STR_BUILTIN_PROGRAM" N="$NUM_BUILTIN_PROGRAM" $PY -c '
+import os, sys; sys.path.insert(0, ".")
+import omni
+with omni.Engine() as e:
+    print(e.eval_str(os.environ["S"]), "|", e.eval_str(os.environ["N"]))
+' 2>&1)
+  if [[ "$got" == "$STR_BUILTIN_WANT | $NUM_BUILTIN_WANT" ]]; then builtin_hosts+=' python'
+  else builtin_wrong+=" python='$got'"; fi
+fi
+if have node && [[ -d sdks/nodejs/node_modules/koffi ]]; then
+  got=$(cd sdks/nodejs && S="$STR_BUILTIN_PROGRAM" N="$NUM_BUILTIN_PROGRAM" node -e '
+const { Engine } = require("./index.js");
+const e = new Engine();
+console.log(e.eval(process.env.S), "|", e.eval(process.env.N));
+e.close();
+' 2>&1)
+  if [[ "$got" == "$STR_BUILTIN_WANT | $NUM_BUILTIN_WANT" ]]; then builtin_hosts+=' node'
+  else builtin_wrong+=" node='$got'"; fi
+fi
+if [[ -n "$builtin_wrong" ]]; then
+  fail "the builtin answers differ:$builtin_wrong"
+elif [[ -n "$builtin_hosts" ]]; then
+  pass "math and string builtins reduce identically in:$builtin_hosts"
+else
+  skip "builtin answers" "no host available"
+fi
+
+printf 'A second-line error names line and byte column in every host... '
+diag_hosts=''
+diag_wrong=''
+if have cargo; then
+  got=$(cargo run -q -p omni-cli -- eval "$DIAG_PROGRAM" 2>&1)
+  if [[ "$got" == *"$DIAG_WANT"* ]]; then diag_hosts+=' cli'
+  else diag_wrong+=" cli='$got'"; fi
+fi
+if [[ -n "${PY:-}" ]]; then
+  got=$(cd sdks/python && P="$DIAG_PROGRAM" $PY -c '
+import os, sys; sys.path.insert(0, ".")
+import omni
+with omni.Engine() as e:
+    try:
+        e.run(os.environ["P"])
+    except omni.OmniError as err:
+        print(str(err))
+' 2>&1)
+  if [[ "$got" == *"$DIAG_WANT"* ]]; then diag_hosts+=' python'
+  else diag_wrong+=" python='$got'"; fi
+fi
+if have node && [[ -d sdks/nodejs/node_modules/koffi ]]; then
+  got=$(cd sdks/nodejs && P="$DIAG_PROGRAM" node -e '
+const { Engine } = require("./index.js");
+const e = new Engine();
+try { e.run(process.env.P); } catch (err) { console.log(String(err)); }
+e.close();
+' 2>&1)
+  if [[ "$got" == *"$DIAG_WANT"* ]]; then diag_hosts+=' node'
+  else diag_wrong+=" node='$got'"; fi
+fi
+if [[ -n "$diag_wrong" ]]; then
+  fail "the position text differs:$diag_wrong"
+elif [[ -n "$diag_hosts" ]]; then
+  pass "line 2, column 13, and the operator's message in:$diag_hosts"
+else
+  skip "position text" "no host available"
+fi
+
+printf 'eval_str and eval hand back native values... '
+native_hosts=''
+native_wrong=''
+if [[ -n "${PY:-}" ]]; then
+  got=$(cd sdks/python && $PY -c '
+import sys; sys.path.insert(0, ".")
+import omni
+with omni.Engine() as e:
+    out = []
+    for src in ("40 + 2", "\"hi\"", "1 == 1"):
+        v = e.eval_str(src)
+        out.append(f"{v} {type(v).__name__}")
+    print("|".join(out))
+' 2>&1)
+  if [[ "$got" == "42 int|hi str|True bool" ]]; then native_hosts+=' python'
+  else native_wrong+=" python='$got'"; fi
+fi
+if have node && [[ -d sdks/nodejs/node_modules/koffi ]]; then
+  got=$(cd sdks/nodejs && node -e '
+const { Engine } = require("./index.js");
+const e = new Engine();
+const out = ["40 + 2", "\"hi\"", "1 == 1"].map((src) => {
+  const v = e.eval(src);
+  return `${v} ${typeof v}`;
+});
+console.log(out.join("|"));
+e.close();
+' 2>&1)
+  if [[ "$got" == "42 number|hi string|true boolean" ]]; then native_hosts+=' node'
+  else native_wrong+=" node='$got'"; fi
+fi
+if [[ -n "$native_wrong" ]]; then
+  fail "the sugar did not return native values:$native_wrong"
+elif [[ -n "$native_hosts" ]]; then
+  pass "int/number, str/string, bool/boolean with no wrapper in:$native_hosts"
+else
+  skip "native-value sugar" "python and node not available"
+fi
+
+printf 'The last execution timer crosses as microseconds... '
+timer_hosts=''
+timer_wrong=''
+if [[ -n "${PY:-}" ]]; then
+  # A 200 KB literal spends measurable time in the lexer; a small program can
+  # legitimately time 0 on a coarse clock, so the row needs a program that is
+  # too big to round away.
+  got=$(cd sdks/python && $PY -c '
+import sys; sys.path.insert(0, ".")
+import omni
+with omni.Engine() as e:
+    e.run("\"" + "x" * 200000 + "\"")
+    s = e.stats()
+    print(s.last_exec_micros > 0, s.last_exec_micros)
+' 2>&1)
+  read -r ok us <<< "$got"
+  if [[ "$ok" == "True" && "${us:-0}" -gt 0 ]]; then timer_hosts+=" python(${us}us)"
+  else timer_wrong+=" python='$got'"; fi
+fi
+if have node && [[ -d sdks/nodejs/node_modules/koffi ]]; then
+  got=$(cd sdks/nodejs && node -e '
+const { Engine } = require("./index.js");
+const e = new Engine();
+e.run("\"" + "x".repeat(200000) + "\"");
+const s = e.stats();
+console.log(s.lastExecMicros > 0, s.lastExecMicros);
+e.close();
+' 2>&1)
+  read -r ok us <<< "$got"
+  if [[ "$ok" == "true" && "${us:-0}" -gt 0 ]]; then timer_hosts+=" node(${us}us)"
+  else timer_wrong+=" node='$got'"; fi
+fi
+if [[ -n "$timer_wrong" ]]; then
+  fail "the timer did not reach the host:$timer_wrong"
+elif [[ -n "$timer_hosts" ]]; then
+  pass "one 200 KB execution timed, non-zero and in microseconds:$timer_hosts"
+else
+  skip "exec timer" "python and node not available"
 fi
 
 # ---------------------------------------------------------------- report

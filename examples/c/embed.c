@@ -305,9 +305,10 @@ int main(void) {
     failures += expect(after.arena_chunks == warm.arena_chunks, "no new chunks were mapped");
     failures += expect(after.strings > warm.strings, "strings built is the one counter meant to grow");
     printf("       execs=%" PRIu64 " strings=%" PRIu64 " arena=%" PRIu64 "/%" PRIu64
-           " egress=%" PRIu64 "/%" PRIu64 " high=%" PRIu64 "\n",
+           " egress=%" PRIu64 "/%" PRIu64 " high=%" PRIu64 " last=%" PRIu32 "us\n",
            after.execs, after.strings, after.arena_bytes_in_use, after.arena_bytes_reserved,
-           after.egress_bytes_in_use, after.egress_bytes_reserved, after.egress_high_water);
+           after.egress_bytes_in_use, after.egress_bytes_reserved, after.egress_high_water,
+           after.last_exec_micros);
     failures += expect(omni_debug_stats(engine, NULL) == OMNI_ERR_ARG, "a NULL target is refused");
   }
 
@@ -406,7 +407,7 @@ int main(void) {
 
     char message[128];
     size_t n = omni_batch_error(engine, 2, message, sizeof message);
-    failures += expect(n > 0 && strstr(message, "line 1") != NULL,
+    failures += expect(n > 0 && strstr(message, "[Line 1, Col ") != NULL,
                        "omni_batch_error names the failing item's own message");
     printf("       item 2: %s\n", message);
     failures += expect(omni_batch_error(engine, 0, message, sizeof message) == 0,

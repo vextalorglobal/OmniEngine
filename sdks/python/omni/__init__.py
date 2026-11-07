@@ -253,6 +253,26 @@ class Engine:
             )
         return result.value  # type: ignore[return-value]  # tag checked above
 
+    def eval_str(self, source: str) -> object:
+        """Evaluate ``source`` and return plain Python data, already unwrapped.
+
+        The one-call form for a REPL or a template engine: the result is an
+        ``int``, ``float``, ``str``, ``bool`` or ``None``, never a
+        :class:`Result` and never an ``object`` that still needs a tag check.
+
+        A whole number becomes ``int`` and everything else stays ``float``. That
+        is a value-preserving rule within the safe-integer range and a widening
+        one outside it, where ``int`` holds the exact value ``float`` displayed.
+
+        Raises:
+            OmniError: the program failed. A program that simply produces a
+                value of another type is not an error here -- that is the point.
+        """
+        value = self.run(source).value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        return value
+
     def try_run(self, source: str) -> tuple[int, Result | None, str]:
         """Evaluate without exceptions: ``(status, result, message)``.
 

@@ -187,8 +187,11 @@ function declare(koffi, lib, resolvedPath) {
     payload: 'OmniPayload',
   });
 
+  // `last_exec_micros` occupies the four bytes the C compiler padded after
+  // `size`, so the struct stays 72 bytes and every other offset is unchanged.
   const OmniStats = koffi.struct('OmniStats', {
     size: 'uint32_t',
+    last_exec_micros: 'uint32_t',
     execs: 'uint64_t',
     strings: 'uint64_t',
     arena_bytes_in_use: 'uint64_t',
@@ -219,6 +222,7 @@ function declare(koffi, lib, resolvedPath) {
     ['koffi.offsetof(OmniValue, payload)', koffi.offsetof(OmniValue, 'payload'), 8],
     ['koffi.sizeof(OmniStats)', koffi.sizeof(OmniStats), 72],
     ['koffi.offsetof(OmniStats, size)', koffi.offsetof(OmniStats, 'size'), 0],
+    ['koffi.offsetof(OmniStats, last_exec_micros)', koffi.offsetof(OmniStats, 'last_exec_micros'), 4],
     ['koffi.offsetof(OmniStats, execs)', koffi.offsetof(OmniStats, 'execs'), 8],
     ['koffi.offsetof(OmniStats, egress_high_water)', koffi.offsetof(OmniStats, 'egress_high_water'), 64],
   ];

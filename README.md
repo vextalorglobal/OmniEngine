@@ -86,7 +86,7 @@ cargo run -p omni-cli -- eval '"omni" + " " + "engine"'  # -> omni engine
 
 ```bash
 # Rust
-cargo test --workspace                                  # 225 tests
+cargo test --workspace                                  # 238 tests
 cargo run -p omni-cli -- eval '"omni" + " " + "engine"'  # -> omni engine
 cargo run --release -p omni-core --example bench         # the engine, measured
 
@@ -117,8 +117,40 @@ It checks that the same bytes come out of the same program on every host, that
 all four surfaces agree on the ABI level, that string results do not grow memory
 over 2,000 executions, that a host function called from a script answers
 identically in Python and Node, and that a batch crossing answers, fails, counts,
-and refuses identically in both. Tools that are missing are reported as `SKIP`,
-not as a pass.
+and refuses identically in both. It also checks the DevPack surface across hosts:
+the math and string builtins, a second-line error rendered as
+`[Line 2, Col 13]`, `eval_str` / `eval` returning native values, and a non-zero
+`last_exec_micros`. Tools that are missing are reported as `SKIP`, not as a pass.
+
+## The standard toolkit
+
+Eleven builtins need no host registration: `abs`, `min`, `max`, `clamp`,
+`floor`, `ceil`, `round`, `len`, `trim`, `upper`, `lower`.
+
+```python
+from omni import Engine
+
+with Engine() as engine:
+    engine.eval_str("clamp(12, 0, 10) + min(1, 2) + max(3, 4)")  # 15
+    engine.eval_str('upper(trim("  omni  "))')                    # 'OMNI'
+    engine.eval_str('len("héllo")')                               # 6, bytes
+    engine.stats().last_exec_micros                               # microseconds
+```
+
+```js
+const engine = new Engine();
+engine.eval('clamp(12, 0, 10) + min(1, 2) + max(3, 4)');  // 15
+engine.eval('upper(trim("  omni  "))');                    // 'OMNI'
+engine.eval('1 == 1');                                     // true
+engine.stats().lastExecMicros;                             // microseconds
+```
+
+`eval_str` / `eval` hand back native primitives rather than a wrapper: Python
+gets `int` for an integral number and `float` otherwise; Node gets `number`,
+`string`, `boolean`, or `null`. A runtime failure raises `OmniError` / throws,
+and the message carries the position — `[Line 2, Col 13]: type mismatch: cannot
+add string to number: "x" + 2` — with a byte column that is identical in every
+host.
 
 ## Calling back into the host
 
@@ -136,8 +168,8 @@ engine.string('"say: " + shout("hey")');     // say: HEY!
 ```
 
 Numbers, booleans, strings and `nil` cross in both directions. A Python exception
-or a JavaScript `throw` becomes `host function 'shout' failed: <message>` at the
-line of the call, because an exception unwinding through the Rust frames that
+or a JavaScript `throw` becomes `[Line 1, Col 1]: host function 'shout' failed:
+<message>`, because an exception unwinding through the Rust frames that
 called it is undefined behaviour — the same reason a callback that calls back into
 its own engine gets `OMNI_ERR_REENTRANT` instead of a second mutable reference.
 See [docs/GUIDE.md](docs/GUIDE.md#47-host-callbacks-the-bridge-running-backwards)
@@ -213,21 +245,23 @@ in allocations: 0.00 per execution, 0.004 per *item* inside a 256-batch. Run
 ## Language status
 
 The engine understands numbers, arithmetic with precedence, parentheses,
-`let` bindings scoped to one execution, and line comments. Strings are
-length-delimited: literals with `\n`, `\r`, `\t`, `\"`, `\\` and `\u{…}`
-escapes, `+` concatenation that refuses a mixed-type program by naming both
-operands, and `==` / `!=` by content. A host can define a string global from
-outside the language, and can bind functions a script calls by name — up to 16
-arguments, up to 64 calls deep.
+`let` bindings scoped to one execution, line comments, and eleven builtins
+(`abs`, `min`, `max`, `clamp`, `floor`, `ceil`, `round`, `len`, `trim`, `upper`,
+`lower`). Strings are length-delimited: literals with `\n`, `\r`, `\t`, `\"`,
+`\\` and `\u{…}` escapes, `+` concatenation that refuses a mixed-type program by
+naming both operands, and `==` / `!=` by content. A host can define a string
+global from outside the language, and can bind functions a script calls by name —
+up to 16 arguments, up to 64 calls deep.
 
-Errors report the line they happened on, and that line number survives the FFI
-boundary into Python and Node.
+Errors report a 1-based line and byte column — `[Line 2, Col 13]: …` — and that
+position survives the FFI boundary into C, Python, and Node. `stats()` reports
+the last execution's wall-clock time in microseconds.
 
-What is still missing: string length, indexing, slicing, methods and
-interpolation; ordering comparisons on strings; boolean, `nil`, and `undefined`
-literals; user-defined functions, control flow, and collections. The memory model
-and the call machinery that make those cheap are already in place — the syntax is
-the next increment.
+What is still missing: indexing, slicing, string methods and interpolation;
+ordering comparisons on strings; boolean, `nil`, and `undefined` literals;
+user-defined functions, control flow, and collections. The memory model and the
+call machinery that make those cheap are already in place — the syntax is the
+next increment.
 
 ## File extensions
 

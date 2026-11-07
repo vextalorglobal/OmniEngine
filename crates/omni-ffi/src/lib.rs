@@ -257,8 +257,8 @@ impl PartialEq for OmniValue {
     }
 }
 
-/// The memory story, told in eight counters a host can read without trusting a
-/// Rust log line.
+/// The memory story, told in counters a host can read without trusting a Rust
+/// log line, plus the wall-clock cost of the most recent execution.
 ///
 /// `size` is written by the *callee* and compared by the *caller* against the
 /// size it compiled with. A struct whose layout drifted produces a mismatch the
@@ -268,6 +268,14 @@ impl PartialEq for OmniValue {
 pub struct OmniStats {
     /// `size_of::<OmniStats>()` as the callee understands it.
     pub size: u32,
+    /// Wall-clock microseconds the most recent execution spent in the engine,
+    /// lexing included. A failed execution counts too.
+    ///
+    /// This reuses the four bytes the compiler already padded after `size`, so
+    /// the struct stays 72 bytes and every other field keeps its offset — the
+    /// reason adding it did not move the ABI. It saturates at `u32::MAX` rather
+    /// than wrapping.
+    pub last_exec_micros: u32,
     /// Executions started: one per `omni_exec`, one per item of every
     /// `omni_exec_many`. Not a count of crossings — that is what ABI v4 changed
     /// about this field, and why the version moved.
@@ -284,6 +292,7 @@ pub struct OmniStats {
 const _: () = assert!(std::mem::size_of::<OmniStats>() == 72);
 const _: () = assert!(std::mem::align_of::<OmniStats>() == 8);
 const _: () = assert!(std::mem::offset_of!(OmniStats, size) == 0);
+const _: () = assert!(std::mem::offset_of!(OmniStats, last_exec_micros) == 4);
 const _: () = assert!(std::mem::offset_of!(OmniStats, execs) == 8);
 const _: () = assert!(std::mem::offset_of!(OmniStats, egress_high_water) == 64);
 
@@ -1031,6 +1040,7 @@ pub unsafe extern "C" fn omni_debug_stats(engine: *mut OmniEngine, out: *mut Omn
         let s = engine.stats();
         OmniStats {
             size: std::mem::size_of::<OmniStats>() as u32,
+            last_exec_micros: s.last_exec_micros,
             execs: s.execs,
             strings: s.strings_built,
             arena_bytes_in_use: s.arena_bytes_in_use,
@@ -1286,6 +1296,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(OmniValue, payload), 8);
         assert_eq!(std::mem::size_of::<OmniStats>(), 72);
         assert_eq!(std::mem::offset_of!(OmniStats, size), 0);
+        assert_eq!(std::mem::offset_of!(OmniStats, last_exec_micros), 4);
         assert_eq!(std::mem::offset_of!(OmniStats, execs), 8);
     }
 
@@ -1598,6 +1609,7 @@ mod tests {
         assert_eq!(unsafe { omni_debug_stats(engine, &mut before) }, OMNI_OK);
         assert_eq!(before.size, std::mem::size_of::<OmniStats>() as u32);
         assert_eq!(before.execs, 0);
+        assert_eq!(before.last_exec_micros, 0, "nothing has run yet");
         for _ in 0..50 {
             let _ = run(engine, r#""a" + "b""#);
         }
@@ -1621,6 +1633,22 @@ mod tests {
             unsafe { omni_debug_stats(engine, ptr::null_mut()) },
             OMNI_ERR_ARG
         );
+        unsafe { omni_engine_free(engine) };
+    }
+
+    #[test]
+    fn the_timer_crosses_the_boundary_in_the_four_padding_bytes() {
+        let engine = omni_engine_new();
+        let mut stats = OmniStats::default();
+        assert_eq!(unsafe { omni_debug_stats(engine, &mut stats) }, OMNI_OK);
+        assert_eq!(stats.last_exec_micros, 0, "nothing has run yet");
+        // A literal large enough that lexing it cannot round down to zero.
+        let src = format!("\"{}\"", "x".repeat(200_000));
+        let _ = run(engine, &src);
+        assert_eq!(unsafe { omni_debug_stats(engine, &mut stats) }, OMNI_OK);
+        assert!(stats.last_exec_micros > 0, "the timer did not move");
+        // The field moved into padding, so the size a v4 host checks is unchanged.
+        assert_eq!(stats.size, 72);
         unsafe { omni_engine_free(engine) };
     }
 

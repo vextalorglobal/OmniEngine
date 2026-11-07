@@ -25,18 +25,19 @@ or Phase 3.
 | Deliverable | State | Evidence |
 | --- | --- | --- |
 | Phase 1 — workspace and build policy | done | `Cargo.toml`, `.cargo/config.toml`, `rust-toolchain.toml` |
-| Phase 2 — core engine | done | 128 `omni-core` tests |
-| Phase 3 — C ABI + header | done | 45 `omni-ffi` tests, PE export table, `examples/c/embed.c` |
+| Phase 2 — core engine | done | 164 `omni-core` tests |
+| Phase 3 — C ABI + header | done | 60 `omni-ffi` tests, PE export table, `examples/c/embed.c` |
 | Phase 4 — extension and Linguist | done (tier 1) | `.gitattributes`, `examples/*.omni` |
-| Phase 5 — SDKs and DX | done | 107 Python + 93 Node tests, CLI, wasm scaffold |
+| Phase 5 — SDKs and DX | done | 120 Python + 101 Node tests, CLI, wasm scaffold |
 | Strings, egress memory, ABI v2 | done | 4 new exports, `omni_str_copy` + `omni_define_string` + `omni_debug_stats` + `omni_abi_version` tested from all four hosts |
 | Host callbacks, re-entrancy, ABI v3 | done | `omni_register_host_fn` + `omni_unregister_host_fn` + `omni_host_fn_count`, a `RefCell` borrow guard on every entry point, and call syntax in the parser |
 | Batch execution, benchmarks, ABI v4 | done | `omni_exec_many` + `omni_batch_error`, checkpointed arena reclamation, three zero-dependency benchmark harnesses and `scripts/bench.sh` (§4.8, §4.9) |
 | Packaging, distribution, release | done | platform wheels with the engine inside, an npm tarball with five engines, `scripts/package.py`, `scripts/check-versions.py`, `.github/workflows/release.yml` (§6.6, `docs/RELEASING.md`) |
-| Same answer from four hosts | done | `scripts/verify-all.sh` — 21 rows, all passing |
+| DevPack: builtins, positions, timer, sugar | done | 11 builtins, `[Line N, Col M]` errors, `last_exec_micros` in ABI-4 padding, `eval_str` / `eval` (§3.5, §4.4, §6.1–6.2) |
+| Same answer from four hosts | done | `scripts/verify-all.sh` — 25 rows, all passing |
 
 ```
-cargo test --workspace          # 225 tests
+cargo test --workspace          # 238 tests
 ./scripts/verify-all.sh         # Rust, C, Python, Node: 42, "hello, world", ABI 4
 ./scripts/bench.sh              # three hosts, one crossing each, measured
 python scripts/check-versions.py  # one version, one ABI across every surface
@@ -398,10 +399,47 @@ fallen into:
   name is stored inline in a fixed `[u8; 32]` array — a limit that exists so the
   arena copy is a single bump, and that returns a clean parse error rather than
   truncating silently.
-- Every error carries a line number, and that number survives the FFI boundary
-  (section 4.4).
+- Every error carries a 1-based line and byte column, and both survive the FFI
+  boundary (section 4.4).
 
-### 3.5 Strings: three blocks, three lifetimes
+### 3.5 Builtins, positions, and the execution timer
+
+Eleven builtins are callable from any script with the same syntax a host
+function uses. A host registration with the same name wins, and arity is
+checked before the call is entered, so a builtin can never see a call it was
+not written for.
+
+| Builtins | Arity | Semantics |
+| --- | --- | --- |
+| `abs`, `floor`, `ceil`, `round` | 1 | operate on `f64`; `round` is half away from zero |
+| `min`, `max` | 2 | `f64` |
+| `clamp(value, low, high)` | 3 | `f64`; `low > high` is a runtime error rather than a silent empty range |
+| `len(text)` | 1 | **byte** length of the UTF-8 payload, not a character count |
+| `trim`, `upper`, `lower` | 1 | Unicode-aware, so `upper("straße")` is `"STRASSE"` |
+
+The string builtins reuse one scratch buffer on the engine, then copy the result
+into the egress block: a chain such as `upper(trim(s))` builds no temporary
+string per call. A `len` of `"héllo"` is 6, and that is deliberate — the
+language's only string unit so far is a byte slice, and a character count would
+have to be defined against grapheme clusters to be stable.
+
+Every error now carries a position: a 1-based line and a 1-based **byte**
+column, rendered as `[Line 2, Col 14]: message`. The column counts bytes because
+that is the unit the lexer already stores in every token, so `"é" + 1` puts the
+operator at column 6 rather than pretending the `é` is one byte. Position
+selection is part of the contract: a binary operator error points at the
+operator, a builtin type or arity error points at the call name, an undefined
+variable points at the identifier, and an unexpected end of input points at the
+end of the source. The text is rendered by the engine, so the same bytes reach
+every host (one `verify-all.sh` row asserts it).
+
+`stats()` carries `last_exec_micros` (`lastExecMicros` in Node): the wall-clock
+time of the most recent `exec` or `exec_many` call in microseconds, saturating
+at `u32::MAX` rather than wrapping. The field lives in four bytes that were
+padding at offset 4 of `OmniStats`, so the other offsets and the 72-byte size
+are unchanged and the ABI remains 4.
+
+### 3.6 Strings: three blocks, three lifetimes
 
 A string value is still eight bytes. The `0x7FF7` pointer row addresses a box
 that holds `{ len, bytes }`, and the bytes themselves live in one of three
@@ -434,20 +472,20 @@ length-delimited, so an interior NUL is data — `Result.text` in Python and
 `+` concatenates and refuses a mixed-type program by naming both operands:
 
 ```
-line 1: cannot add string to number: "hi" + 42
+[Line 1, Col 6]: type mismatch: cannot add string to number: "hi" + 42
 ```
 
 `==` and `!=` compare content, not addresses. There is no implicit coercion in
 either direction: `42 + "hi"` is `cannot add number to string: 42 + "hi"`, and a
 boolean reaches the same arm as `cannot add boolean to string: false + "hi"` — all
 three messages asserted verbatim in `engine.rs`. `verify-all.sh` then checks that
-the `"hi" + 42` one arrives in Rust, C, Python, and Node with identical bytes.
+the `"hi" + 42` line arrives in Rust, C, Python, and Node with identical bytes.
 
 The counting allocator turns "no GC" into something a host can measure rather
 than a claim. `omni_debug_stats` fills a `#[repr(C)]` struct with `execs`,
-`strings`, arena in-use/reserved/chunks, and egress in-use/reserved/high-water.
-Measured here, 5,000 consecutive string executions of `"hello, " + "world" +
-"\u{1F600}"` (30,000 strings built):
+`last_exec_micros`, `strings`, arena in-use/reserved/chunks, and egress
+in-use/reserved/high-water. Measured here, 5,000 consecutive string executions of
+`"hello, " + "world" + "\u{1F600}"` (30,000 strings built):
 
 | Counter | Warm (200 execs) | After 5,200 execs |
 | --- | --- | --- |
@@ -462,7 +500,7 @@ Two numbers do not move, which is the point: memory is bounded by the largest
 single execution, not by how many you ran. `strings` is the counter that is
 supposed to grow.
 
-### 3.6 What the core still does not have
+### 3.7 What the core still does not have
 
 No string length, indexing, slicing, methods, or interpolation; no ordering
 comparisons on strings; no boolean, `nil`, or `undefined *literals*` (booleans
@@ -523,7 +561,7 @@ never cross a calling convention in three toolkits either. The `ptr` arm is
 opaque to every host: nothing in `omni.h`, `ctypes`, or `koffi` dereferences it.
 The one way to get at the bytes is `omni_str_copy`, which re-derives the address
 against the engine's own blocks and copies into storage the caller owns. What a
-host may point at is promoted into the egress block first (section 3.5), which is
+host may point at is promoted into the egress block first (section 3.6), which is
 what makes the copy legal to perform at all. The first bridge design stated this as
 "no arena pointer crosses the boundary"; the strings increment retired that wording in
 favour of this one, because an address does now cross — it simply cannot be used.
@@ -567,7 +605,7 @@ to read: while a callback holds them, nothing else can move the engine.
 | `omni_register_host_fn(e, name, name_len, arity, fn, user_data)` | status; binds a function a script can call (4.7) |
 | `omni_unregister_host_fn(e, name, name_len)` | entries removed, `0` or `1` |
 | `omni_host_fn_count(e)` | registrations the engine currently holds |
-| `omni_debug_stats(e, out)` | status; fills `OmniStats`, whose `size` field says which layout was written |
+| `omni_debug_stats(e, out)` | status; fills `OmniStats` (counters plus `last_exec_micros`), whose `size` field says which layout was written |
 | `omni_last_error(e, buf, cap)` | bytes written, excluding the NUL |
 | `omni_debug_panic(e)` | status — a test hook, not an API |
 
@@ -587,10 +625,11 @@ const _: () = assert!(std::mem::offset_of!(OmniValue, tag) == 0);
 const _: () = assert!(std::mem::offset_of!(OmniValue, len) == 4);
 const _: () = assert!(std::mem::offset_of!(OmniValue, payload) == 8);
 const _: () = assert!(std::mem::size_of::<OmniStats>() == 72);
+const _: () = assert!(std::mem::offset_of!(OmniStats, last_exec_micros) == 4);
 ```
 
-with `_Static_assert` in `omni.h`, nine `ctypes` offsets and sizes checked at
-Python import, and nine `koffi` offsets and sizes checked at Node load. Four
+with `_Static_assert` in `omni.h`, ten `ctypes` offsets and sizes checked at
+Python import, and ten `koffi` offsets and sizes checked at Node load. Four
 independent assertions of the same layout is the point: the Rust one catches the
 crate drifting, the C one catches the header, and the two SDK ones catch a host
 that was installed from an older tag.
@@ -602,17 +641,17 @@ The union was the spec's shape and it is now the real one: `ptr` for `STRING`, w
 always has `len` 0, and no arm is ever left holding raw engine bits that could be
 mistaken for a value: the tag alone says which of the two to read.
 
-### 4.4 Four ABI details that only showed up under testing
+### 4.4 Five ABI details that only showed up under testing
 
 **`omni_last_error` copies the rendered error, not just the message.** The first
 version copied `error.message`, so a host received `expected a name` with no line
 and no way to point at the offending token. It now copies the `Display` form
-whole — `line 1: expected a name, found ''=''` — and the contract test asserts the
-line number survives the boundary. Note the doubled quotes around `=`: that is the
-engine, not the SDK. `display_kind` renders a symbol as `'='` and the message
-template wraps it in quotes a second time. The hosts pass the text through
-untouched rather than prettifying it, and section 10 records the one-character
-fix.
+whole — `[Line 1, Col 5]: expected a name, found ''=''` — and the contract test
+asserts both the line and the column survive the boundary. Note the doubled
+quotes around `=`: that is the engine, not the SDK. `display_kind` renders a
+symbol as `'='` and the message template wraps it in quotes a second time. The
+hosts pass the text through untouched rather than prettifying it, and section 10
+records the one-character fix.
 
 **A zero-length program is legal even from a null pointer.** Node hands an empty
 `Buffer` to C as NULL, and `slice::from_raw_parts(null, 0)` is undefined
@@ -639,6 +678,16 @@ NUL-terminated name cannot express a zero-length one, and a length-delimited
 payload is the thing the engine already guarantees, so the API matches the model
 instead of forcing hosts to invent a terminator. The C header and both SDKs
 follow it.
+
+**The execution timer fits in padding, so ABI 4 did not move.** `OmniStats` had
+four bytes of padding between `size` and the first `u64`, because an eight-byte
+counter must start at offset 8. `last_exec_micros` is a `u32`, so it occupies
+exactly those bytes: every existing offset, the 72-byte size, and the ABI
+version are unchanged. The layout assertions in Rust, C, Python, and Node all
+pin offset 4, so a compiler that reordered the struct would fail four tests
+instead of silently misreading the timer. Saturation at `u32::MAX` (about 71
+minutes) is deliberate — a wrapping timer would report a fast batch after a slow
+one.
 
 ### 4.5 The header, and where it came from
 
@@ -726,8 +775,8 @@ the answer is `0`, because a `size_t` and a `bool` carry no error code.
 exception or a JavaScript `throw` that crossed into Rust would unwind through foreign
 frames, undefined behaviour in both directions. Both SDK trampolines catch
 `BaseException` / any throwable, put the message in `out` as an `OMNI_STRING`, and
-answer `OMNI_HOST_ERR` — `line 1: host function 'boom' failed: ValueError: host said
-no`. The host's own stack is gone by then, so the text is all either side keeps,
+answer `OMNI_HOST_ERR` — `[Line 1, Col 1]: host function 'boom' failed: ValueError:
+host said no`. The host's own stack is gone by then, so the text is all either side keeps,
 which is why the SDKs prefix the exception class.
 
 **And one rule the header cannot write: the host owns the trampoline's life.** A
@@ -973,7 +1022,11 @@ with Engine() as engine:
     print(engine.string(r'"omni" + " " + "\u{1F600}"'))   # omni 😀
     engine.define_string("greeting", "hello wörld")       # lives until redefined
     print(engine.run('greeting + "!"').value)             # hello wörld!
-    print(engine.stats().egress_bytes_reserved)           # 65536
+    print(engine.eval_str("let answer = 40 + 2"))          # 42, a Python int
+    print(engine.eval_str('1 == 1'))                       # True
+    print(engine.eval_str('upper(trim("  hi  "))'))        # HI
+    print(engine.stats().egress_bytes_reserved)            # 65536
+    print(engine.stats().last_exec_micros > 0)             # True
 ```
 
 A script can also call back into Python:
@@ -994,11 +1047,18 @@ not reliably knowable, and it is checked by the engine before your callable is
 entered.
 
 `run` returns a frozen `Result` (`tag`, `number`, `text`, `value`); `evaluate`
-returns a `float` and raises `OmniError` on any non-number or failure; `string`
-returns a `str` and raises on any non-string; `try_run` returns
-`(status, result | None, message)` and never raises. `close()` is idempotent and
-`__del__` is guarded by an `atexit` hook, so an engine that outlives the script
-is not a use-after-free.
+returns a `float` and raises `OmniError` on any non-number or failure;
+`eval_str` returns the language value as a native Python object — an integral
+finite number becomes `int`, everything else stays `float`, `str`, `bool`, or
+`None` — and raises only when the program itself fails; `string` returns a `str`
+and raises on any non-string; `try_run` returns `(status, result | None,
+message)` and never raises. `close()` is idempotent and `__del__` is guarded by
+an `atexit` hook, so an engine that outlives the script is not a use-after-free.
+
+`eval_str` folds integral floats to `int` because the alternative hands a caller
+`42.0` for a value it will print, index, or compare as an integer. The fold only
+happens for finite integral values, and it is a wrapper decision — `run().value`
+still reports the engine's raw `float`, and `Result.number` is unchanged.
 
 `Result.text` is the exact `bytes` of a string result — a NUL inside a string is
 data, not a terminator — and `Result.value` is those bytes decoded as UTF-8.
@@ -1008,7 +1068,7 @@ happens inside `run`, before anything can rewind the block it points into; the
 SDK never hands out an address, so there is nothing for a caller to hold past its
 lifetime.
 
-`_ffi.py` checks nine `ctypes` sizes and offsets at import and compares
+`_ffi.py` checks ten `ctypes` sizes and offsets at import and compares
 `omni_abi_version()` against its own constant, so an engine built from an older
 commit raises at import with `cargo build -p omni-ffi` in the message instead of
 returning numbers read from the wrong offsets.
@@ -1044,7 +1104,11 @@ console.log(engine.run('2 + 3 * 4').value);            // 14
 console.log(engine.string('"omni" + " " + "\\u{1F600}"'));  // omni 😀
 engine.defineString('greeting', 'hello wörld');
 console.log(engine.run('greeting + "!"').value);       // hello wörld!
+console.log(engine.eval('let answer = 40 + 2'));      // 42, a JS number
+console.log(engine.eval('1 == 1'));                   // true
+console.log(engine.eval('upper(trim("  hi  "))'));    // HI
 console.log(engine.stats().egressBytesReserved);       // 65536
+console.log(engine.stats().lastExecMicros > 0);        // true
 engine.close();
 ```
 
@@ -1057,7 +1121,7 @@ engine.registerFunction('config', () => ({ retries: 3 }), { arity: 0 });
 console.log(engine.string('"say: " + shout("hey")'));  // say: HEY!
 console.log(engine.hostFunctionCount);                  // 2
 console.log(engine.tryRun('config()').message);
-// line 1: host function 'config' failed: a host function must return a number,
+// [Line 1, Col 1]: host function 'config' failed: a host function must return a number,
 //         bool, string, Buffer or null, not object
 engine.close();                                        // releases both trampolines
 ```
@@ -1068,8 +1132,10 @@ status `5` (`host`), instead of coercing `{}` to a number and letting the progra
 continue on a lie.
 
 `run` → `Result` (`tag`, `number`, `text`, `value`, where `text` is a `Buffer`);
-`evaluate` → number; `string` → string; `tryRun` → `{ status, statusName, result,
-message }` with no throw; `stats` → plain JS numbers, never BigInt. `Symbol.dispose`
+`evaluate` → number; `eval` → the language value as a native JS primitive
+(`number`, `string`, `boolean`, or `null` for an empty program); `string` →
+string; `tryRun` → `{ status, statusName, result, message }` with no throw;
+`stats` → plain JS numbers, never BigInt. `Symbol.dispose`
 is wired onto the prototype, so `using engine = new Engine()` frees the handle at
 the closing brace — run on Node 26.12, in CommonJS, no flag. It is defined
 conditionally because the symbol does not exist on older runtimes.
@@ -1306,23 +1372,23 @@ One command, and it is the acceptance test for the whole brief:
 ./scripts/verify-all.sh
 ```
 
-Measured output on 2026-11-07, with the packaging increment in it:
+Measured output on 2026-11-07, with the DevPack increment in it:
 
 ```
 == OmniEngine cross-host verification ==
    workspace: /d/OmniEngine
 
-Rust tests... Shared library... omni-cli... C embedding... Python SDK... Node SDK... A string is the same bytes in every host... One type error, the same text everywhere... Every surface agrees on the ABI level... String results do not grow memory... A host function answers the same bytes in every host... A host failure is data, and says so identically... Re-entering the engine from a callback is refused, not crashed... The registry says the same thing from both sides... A batch answers the same items in every host... A failing item names itself identically in every host... A batch counts items, not crossings, and reserves nothing extra... A batch inside a host callback is refused, not crashed...
+Rust tests... Shared library... omni-cli... C embedding... Python SDK... Node SDK... A string is the same bytes in every host... One type error, the same text everywhere... Every surface agrees on the ABI level... String results do not grow memory... A host function answers the same bytes in every host... A host failure is data, and says so identically... Re-entering the engine from a callback is refused, not crashed... The registry says the same thing from both sides... A batch answers the same items in every host... A failing item names itself identically in every host... A batch counts items, not crossings, and reserves nothing extra... A batch inside a host callback is refused, not crashed... The DevPack builtins answer the same in every host... A second-line error names line and byte column in every host... eval_str and eval hand back native values... The last execution timer crosses as microseconds...
 == Results ==
-  PASS  cargo test --workspace (225 tests)
-  PASS  omni.dll (5.4M)
+  PASS  cargo test --workspace (238 tests)
+  PASS  omni.dll (5.5M)
   PASS  omni run examples/hello.omni -> 42
   PASS  omni run examples/strings.omni -> hello, world 😀
   PASS  examples/c/embed.c -> 42 via omni.h
   PASS  python ctypes -> 42.0
-  PASS  python SDK tests (107 tests)
+  PASS  python SDK tests (120 tests)
   PASS  node koffi -> 42
-  PASS  node SDK tests (ℹ tests 93 ℹ pass 93 ℹ fail 0 )
+  PASS  node SDK tests (ℹ tests 101 ℹ pass 101 ℹ fail 0 )
   PASS  concat + \u{...} identical in: cli python node
   PASS  the mixed-type message survives the boundary in: cli python node c
   PASS  ABI 4 declared and read identically: header=4 C=4 python=4/lib=4 node=4/lib=4
@@ -1335,6 +1401,10 @@ Rust tests... Shared library... omni-cli... C embedding... Python SDK... Node SD
   PASS  statuses 0 2 0 2 and the engine text for items 1 and 3, identically in: python node
   PASS  8000 items in 1000 crossings, execs +8000, reservation flat: python(0 B) node(0 B)
   PASS  a batch from a borrowed handle errors with the shared refusal text in: python node
+  PASS  math and string builtins reduce identically in: cli python node
+  PASS  line 2, column 13, and the operator's message in: cli python node
+  PASS  int/number, str/string, bool/boolean with no wrapper in: python node
+  PASS  one 200 KB execution timed, non-zero and in microseconds: python(914us) node(1054us)
 
 All checks that could run, passed.
 ```
@@ -1346,7 +1416,7 @@ outside the repository, an extracted npm tarball, and a C archive compiled
 against its own header. Those runs are recorded in section 6.6, with the sizes
 they produced.
 
-The last twelve rows are the ones that could not exist in one host. The string
+The last sixteen rows are the ones that could not exist in one host. The string
 comparison is byte-exact — an escape decoded differently in Rust and Node passes
 both test suites and is still a broken bridge — and the ABI row reads the number
 off the header, the loaded library as C sees it, and the library as each SDK sees
@@ -1361,13 +1431,20 @@ for `omni_exec_many`: the same four items come out of one crossing as the same
 values in both hosts, a failing item reports the same statuses and the same
 engine text, the counter proves 8,000 items in 1,000 crossings are 8,000
 executions with a flat reservation, and a batch from inside a callback meets the
-same refusal.
+same refusal. The four DevPack rows cover the toolkit surface: a program built
+from the new math and string builtins reduces to the same value in the CLI,
+Python, and Node; a second-line error renders `[Line 2, Col 13]` and the same
+message in all three; `eval_str` and `eval` hand each host a native value rather
+than a wrapper; and a 200 KB program's measured execution time crosses as a
+non-zero microsecond count in both SDKs.
 
 The script degrades to `SKIP` rather than lying. `cargo`, `gcc`, `python` and
 `node` each have their own guard, Node without `koffi` is skipped with
 `npm install koffi` in the reason, and each cross-host row skips itself when fewer
-than two hosts answered. Nothing was skipped on this machine — all twenty-one
-rows ran. `omni-wasm` has no row here because `wasm32-unknown-unknown` is not
+than two hosts answered. Nothing was skipped on this machine — all twenty-five
+rows ran. The Rust row runs the suite once into a log and reads its exit status;
+an earlier version piped cargo into `grep` under `pipefail`, which let a failing
+suite inherit a successful-looking pipeline and briefly hid a stale CLI test. `omni-wasm` has no row here because `wasm32-unknown-unknown` is not
 installed; its 7 tests run under `cargo test --workspace`, where the crate
 compiles for the host target and asserts its status codes against the same
 constants the C header declares.
@@ -1376,16 +1453,16 @@ Against the brief's five phases:
 
 | Phase | Asked for | Verified by |
 | --- | --- | --- |
-| 1 | Workspace on D:, fast compiles, managed `target/` | `cargo test --workspace` 225 tests; `target/` measured at 351 MB |
+| 1 | Workspace on D:, fast compiles, managed `target/` | `cargo test --workspace` 238 tests; `target/` measured at 351 MB |
 | 2 | Ultra-fast memory-safe core, no GC | NaN-boxed 8-byte `Value` asserted for size; arena reset is O(chunks); egress rewind keeps reservations flat over 100,000 executions; no collector exists to pause |
 | 3 | C ABI callable from Python and JavaScript | same `42` and the same `hello, world 😀` from Rust, C, Python, Node; 16 exports confirmed with `objdump -p`; `omni.h` compiles warning-free under `-Wall -Wextra` |
 | 4 | A custom extension GitHub recognises | `.gitattributes` tier 1; the tier-2 limit is stated in section 5.3 rather than glossed over |
-| 5 | `pip`/`npm` SDKs that do not move the language stats | 107 + 93 SDK tests; `linguist-vendored` on `sdks/**`; release packages carry a CI-built engine, checkouts carry none |
+| 5 | `pip`/`npm` SDKs that do not move the language stats | 120 + 101 SDK tests; `linguist-vendored` on `sdks/**`; release packages carry a CI-built engine, checkouts carry none |
 
-Test totals: **152** in `omni-core`, **59** in `omni-ffi` (18 unit, 13 in
+Test totals: **164** in `omni-core`, **60** in `omni-ffi` (19 unit, 13 in
 `tests/batch.rs`, 20 in `tests/ffi_contract.rs`, and 8 in
 `tests/host_callbacks.rs`, which drive the ABI exactly as a host does), **7** in
-`omni-cli`, **7** in `omni-wasm`, **107** Python, **93** Node. The batch and
+`omni-cli`, **7** in `omni-wasm`, **120** Python, **101** Node. The batch and
 callback suites are contract tests against the header, not unit tests of the
 implementation they sit next to.
 
@@ -1545,7 +1622,12 @@ then made the boundary carry several programs at once, and the three benchmark
 harnesses (4.9) turned every performance claim in this file into a quoted run.
 A fourth round packaged what existed: wheels and an npm tarball that carry the
 engine, a C archive per target, one tag-driven workflow, and a quickstart that
-fits in a minute. Nothing in that round changed the language or the ABI.
+fits in a minute. Nothing in that round changed the language or the ABI. A fifth
+round added the developer toolkit without moving the ABI either: eleven math and
+string builtins, errors that point at a line and byte column in every host, an
+execution timer in four bytes that were already padding, and native-value sugar
+(`eval_str` / `eval`) in both SDKs. The next language increment is still the one
+section 3.7 lists — control flow, collections, and user-defined functions.
 
 Release-side, three things are deliberately unfinished rather than unknown:
 

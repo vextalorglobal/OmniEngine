@@ -49,7 +49,7 @@ fn main() -> ExitCode {
 /// A usage/IO complaint is distinguishable from an engine one by its prefix, so
 /// the caller can pick an exit code without threading an enum through `dispatch`.
 fn message_exit_code(message: &str) -> ExitCode {
-    if message.starts_with("line ") || message.contains(": line ") {
+    if message.starts_with("[Line ") || message.contains(": [Line ") {
         ExitCode::from(EXIT_ENGINE)
     } else {
         ExitCode::from(EXIT_USAGE)
@@ -92,8 +92,8 @@ fn read_file(path: &str) -> Result<String, String> {
     String::from_utf8(buf).map_err(|_| format!("'{path}' is not valid UTF-8"))
 }
 
-/// Run `source`, mapping an engine error onto the `line N: …` prefix that
-/// [`message_exit_code`] looks for. `path` only appears in diagnostics.
+/// Run `source`, mapping an engine error onto the `[Line N, Col M]: …` prefix
+/// that [`message_exit_code`] looks for. `path` only appears in diagnostics.
 fn evaluate(source: &str, path: Option<&str>) -> Result<Option<String>, String> {
     let mut engine = Engine::new();
     match engine.exec(source) {
@@ -131,24 +131,24 @@ mod tests {
     }
 
     #[test]
-    fn engine_failures_carry_the_line_prefix() {
+    fn engine_failures_carry_the_positioned_prefix() {
         let e = dispatch(&["eval".into(), "1 / 0".into()]).unwrap_err();
-        assert!(e.starts_with("line 1: "), "got {e}");
+        assert!(e.starts_with("[Line 1, Col 3]: "), "got {e}");
     }
 
     #[test]
     fn usage_failures_are_distinguishable() {
         assert_eq!(
-            message_exit_code("line 1: division by zero"),
+            message_exit_code("[Line 1, Col 3]: division by zero"),
             ExitCode::from(EXIT_ENGINE)
         );
         assert_eq!(
             message_exit_code("missing file path"),
             ExitCode::from(EXIT_USAGE)
         );
-        // `omni run` reports the path before the engine's line prefix.
+        // `omni run` reports the path before the engine's position prefix.
         assert_eq!(
-            message_exit_code("x.omni: line 3: division by zero"),
+            message_exit_code("x.omni: [Line 3, Col 1]: division by zero"),
             ExitCode::from(EXIT_ENGINE)
         );
     }

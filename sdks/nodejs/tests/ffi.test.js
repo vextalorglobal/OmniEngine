@@ -105,7 +105,7 @@ test('a syntax error is a compile error that carries its line', () => {
       (err) => {
         assert.equal(err.status, STATUS.ERR_COMPILE);
         assert.equal(err.kind, 'compile');
-        assert.match(err.message, /line 1/);
+        assert.match(err.message, /\[Line 1, Col 5\]/);
         return true;
       }
     );
@@ -119,7 +119,7 @@ test('the line number points at the failing line', () => {
   try {
     assert.throws(
       () => engine.run('// a comment\nlet = 1'),
-      (err) => err.message.startsWith('line 2: ') && String(err).startsWith('compile: line 2: ')
+      (err) => err.message.startsWith('[Line 2, Col ') && String(err).startsWith('compile: [Line 2, Col ')
     );
   } finally {
     engine.close();
@@ -133,7 +133,7 @@ test('division by zero is a runtime error', () => {
       () => engine.evaluate('1 / 0'),
       (err) => {
         assert.equal(err.kind, 'runtime');
-        assert.equal(err.message, 'line 1: division by zero');
+        assert.equal(err.message, '[Line 1, Col 3]: division by zero');
         return true;
       }
     );
@@ -148,7 +148,7 @@ test('evaluate refuses a non-numeric program', () => {
     // The engine itself produced this one, so its text comes through.
     assert.throws(
       () => engine.evaluate('nope'),
-      (err) => err.kind === 'runtime' && err.message === "line 1: undefined variable 'nope'"
+      (err) => err.kind === 'runtime' && err.message === "[Line 1, Col 1]: undefined variable 'nope'"
     );
   } finally {
     engine.close();
@@ -224,11 +224,12 @@ test('error text is truncated to cap - 1, never past the buffer', () => {
     const tiny = Buffer.alloc(8);
     const written = b.lastError(handle, tiny, tiny.length);
     assert.equal(written, 7);
-    assert.equal(tiny.subarray(0, written).toString('utf8'), 'line 1:');
+    assert.equal(tiny.subarray(0, written).toString('utf8'), '[Line 1');
 
+    const expected = '[Line 1, Col 3]: division by zero';
     const roomy = Buffer.alloc(64);
-    assert.equal(b.lastError(handle, roomy, roomy.length), 'line 1: division by zero'.length);
-    assert.equal(roomy.subarray(0, 24).toString('utf8'), 'line 1: division by zero');
+    assert.equal(b.lastError(handle, roomy, roomy.length), expected.length);
+    assert.equal(roomy.subarray(0, expected.length).toString('utf8'), expected);
   } finally {
     b.koffi.free(out);
     b.engineFree(handle);
@@ -529,7 +530,7 @@ test('mixing a string and a number names the rule', () => {
     assert.throws(
       () => engine.run('"hi" + 42'),
       (err) =>
-        err.kind === 'runtime' && err.message === 'line 1: cannot add string to number: "hi" + 42'
+        err.kind === 'runtime' && err.message === '[Line 1, Col 6]: type mismatch: cannot add string to number: "hi" + 42'
     );
   } finally {
     engine.close();
@@ -1115,4 +1116,125 @@ test('close unregisters every host function', () => {
   // count are gone, so what matters is that no trampoline was left registered.
   assert.equal(engine._hostFns.size, 0);
   b.engineFree(handle);
+});
+
+// -- standard builtins ------------------------------------------------------
+
+test('math builtins answer with numbers', () => {
+  const engine = new Engine();
+  try {
+    assert.equal(engine.evaluate('abs(-3)'), 3);
+    assert.equal(engine.evaluate('min(2, 5)'), 2);
+    assert.equal(engine.evaluate('max(2, 5)'), 5);
+    assert.equal(engine.evaluate('clamp(12, 0, 10)'), 10);
+    assert.equal(engine.evaluate('floor(2.9)'), 2);
+    assert.equal(engine.evaluate('ceil(2.1)'), 3);
+    assert.equal(engine.evaluate('round(2.5)'), 3);
+    assert.equal(engine.evaluate('-round(-2.5)'), 3, 'half away from zero');
+  } finally {
+    engine.close();
+  }
+});
+
+test('string builtins answer with strings and count bytes', () => {
+  const engine = new Engine();
+  try {
+    assert.equal(engine.string('trim("  padded\t")'), 'padded');
+    assert.equal(engine.string('upper("MiXeD")'), 'MIXED');
+    assert.equal(engine.string('lower("MiXeD")'), 'mixed');
+    assert.equal(engine.string('upper("straße")'), 'STRASSE');
+    assert.equal(engine.evaluate('len("h\u{00E9}llo")'), 6, 'é is two bytes');
+    assert.equal(engine.string('upper(trim("  hi  "))'), 'HI');
+  } finally {
+    engine.close();
+  }
+});
+
+test('a builtin type or arity error names the builtin and its location', () => {
+  const engine = new Engine();
+  try {
+    assert.throws(
+      () => engine.evaluate('abs("x")'),
+      (err) =>
+        err.kind === 'runtime' &&
+        err.message.startsWith('[Line 1, Col 1]: type mismatch: abs() needs a number')
+    );
+    assert.throws(
+      () => engine.run('abs(1, 2)'),
+      (err) => err.message.includes("builtin 'abs' takes 1 argument, got 2")
+    );
+    assert.throws(
+      () => engine.run('clamp(1, 10, 0)'),
+      (err) => err.message.includes('lower bound')
+    );
+  } finally {
+    engine.close();
+  }
+});
+
+test('a registered function shadows a builtin of the same name', () => {
+  const engine = new Engine();
+  try {
+    engine.registerFunction('abs', () => 99, { arity: 1 });
+    assert.equal(engine.evaluate('abs(-1)'), 99);
+    engine.unregisterFunction('abs');
+    assert.equal(engine.evaluate('abs(-1)'), 1);
+  } finally {
+    engine.close();
+  }
+});
+
+// -- eval: native primitives ----------------------------------------------
+
+test('eval returns native JavaScript values', () => {
+  const engine = new Engine();
+  try {
+    assert.equal(engine.eval('1 + 1'), 2);
+    assert.equal(typeof engine.eval('1 + 1'), 'number');
+    assert.equal(engine.eval('"a" + "b"'), 'ab');
+    assert.equal(typeof engine.eval('"a" + "b"'), 'string');
+    assert.equal(engine.eval('1 == 1'), true);
+    assert.equal(typeof engine.eval('1 == 1'), 'boolean');
+    assert.equal(engine.eval(''), null, 'an empty program is undef, which is null here');
+  } finally {
+    engine.close();
+  }
+});
+
+test('eval throws where run throws', () => {
+  const engine = new Engine();
+  try {
+    assert.throws(() => engine.eval('1 / 0'), (err) => err instanceof OmniError);
+  } finally {
+    engine.close();
+  }
+});
+
+// -- positions and the timer ---------------------------------------------
+
+test('an error on the second line reports both numbers', () => {
+  const engine = new Engine();
+  try {
+    assert.throws(
+      () => engine.run('let a = 1\nlet b = "x" + 2'),
+      (err) =>
+        err.message ===
+        '[Line 2, Col 13]: type mismatch: cannot add string to number: "x" + 2'
+    );
+  } finally {
+    engine.close();
+  }
+});
+
+test('stats reports the last execution timer in microseconds', () => {
+  const engine = new Engine();
+  try {
+    assert.equal(engine.stats().lastExecMicros, 0, 'nothing has run yet');
+    engine.run(`"${'x'.repeat(200_000)}"`);
+    const stats = engine.stats();
+    assert.ok(stats.lastExecMicros > 0, `timer was ${stats.lastExecMicros}`);
+    assert.equal(stats.execs, 1);
+  } finally {
+    engine.close();
+  }
 });

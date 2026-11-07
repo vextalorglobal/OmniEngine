@@ -208,7 +208,7 @@ fn batch_error_names_the_item_and_a_single_exec_ends_its_currency() {
         batch(engine, &["1 + 1", "let = 2", "1 / 0"]);
         assert_eq!(batch_error(engine, 0), "", "a success has no message");
         assert!(
-            batch_error(engine, 1).starts_with("line 1:"),
+            batch_error(engine, 1).starts_with("[Line 1, Col "),
             "rendered, not raw"
         );
         assert!(batch_error(engine, 2).contains("division by zero"));

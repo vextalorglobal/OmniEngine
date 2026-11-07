@@ -9,7 +9,7 @@ it. The short version:
 
 ```bash
 python scripts/check-versions.py          # one version, one ABI
-./scripts/verify-all.sh                   # 225 Rust, 107 Python, 93 Node checks
+./scripts/verify-all.sh                   # 238 Rust, 120 Python, 101 Node checks
 ./scripts/bench.sh                        # measured numbers, not regressions
 git tag v0.1.0 && git push origin v0.1.0  # the only release action
 ```

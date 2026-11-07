@@ -81,9 +81,17 @@ engine.run('20 / 3').value;                       // 6.666666666666667
 engine.run('"omni" + " " + "engine"').value;      // 'omni engine'
 engine.run('"ab" == "a" + "b"').value;            // true
 engine.string('"a" + "\\n" + "b"');               // 'a\nb'
+engine.eval('clamp(12, 0, 10) + min(1, 2) + max(3, 4)');  // 15
+engine.eval('upper(trim("  omni  "))');           // 'OMNI'
+engine.eval('len("héllo")');                      // 6 (bytes)
 ```
 
-A `Result` is `{ tag, number, text, value }`. `text` is a `Buffer` with the
+A `Result` is `{ tag, number, text, value }`. `eval` skips the wrapper and
+returns the language value as a native JS primitive: `number`, `string`,
+`boolean`, or `null` for an empty program. Eleven builtins — `abs`, `min`,
+`max`, `clamp`, `floor`, `ceil`, `round`, `len`, `trim`, `upper`, `lower` — need
+no registration, and `stats().lastExecMicros` reports the most recent execution
+in microseconds. `text` is a `Buffer` with the
 exact bytes of a string result — NULs included, because OmniEngine strings are
 length-delimited rather than C strings — and `value` is those bytes decoded as
 UTF-8. `number` is `0` for a string, on purpose: those eight payload bytes are
@@ -125,8 +133,8 @@ try {
 } catch (err) {
   err.kind;    // 'compile'
   err.status;  // 1
-  err.message; // "line 1: expected a name, found ''=''"
-  String(err); // "compile: line 1: expected a name, found ''=''"
+  err.message; // "[Line 1, Col 5]: expected a name, found ''=''"
+  String(err); // "compile: [Line 1, Col 5]: expected a name, found ''=''"
 }
 ```
 
@@ -194,7 +202,7 @@ engine.runMany(['1 + 1', '"two"', "shout('hey')"]);
 Each item is an independent program — item *N* cannot read item *N−1*'s `let` —
 and every string result is copied out before the array is returned, so nothing
 in it expires. A failing item throws `OmniError` naming its index and its own
-message (`item 1 of 3: line 1: …`); the items after it still ran. For REPL-style
+message (`item 1 of 3: [Line 1, Col 1]: …`); the items after it still ran. For REPL-style
 callers, `tryRunMany` returns one `{ status, statusName, result, message }` per
 item instead of throwing — the per-item shape of `tryRun`.
 
@@ -266,7 +274,7 @@ rule above. Measure it with `engine.stats()` before optimising around it.
 ```bash
 cd sdks/nodejs
 npm install koffi
-npm test                                   # 93 tests, node:test
+npm test                                   # 101 tests, node:test
 node bench.js                              # measured numbers for this machine
 ```
 

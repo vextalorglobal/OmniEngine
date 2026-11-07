@@ -214,14 +214,17 @@ fn error_text_is_copied_into_caller_storage_and_truncates_safely() {
         assert!(text.contains("division by zero"), "text was {text}");
         // The location has to survive the boundary, or a host cannot tell the
         // user which line broke.
-        assert!(text.contains("line 1"), "text lost its line number: {text}");
+        assert!(
+            text.contains("[Line 1, Col 3]"),
+            "text lost its location: {text}"
+        );
 
         // A four-byte buffer holds three bytes plus a NUL rather than writing
         // past the caller's allocation.
         let mut tiny = [0 as c_char; 4];
         assert_eq!(omni_last_error(engine, tiny.as_mut_ptr(), tiny.len()), 3);
         assert_eq!(tiny[3], 0);
-        assert_eq!(CStr::from_ptr(tiny.as_ptr()).to_str().unwrap(), "lin");
+        assert_eq!(CStr::from_ptr(tiny.as_ptr()).to_str().unwrap(), "[Li");
 
         omni_engine_free(engine);
     }

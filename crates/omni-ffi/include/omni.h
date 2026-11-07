@@ -163,6 +163,11 @@ extern "C" {
  * "number of omni_exec() calls" would draw a wrong conclusion from a correct
  * number. That is why the version moved rather than staying at 3.
  *
+ * The DevPack update added OmniStats.last_exec_micros inside version 4 rather
+ * than after it: the field reuses the compiler padding after `size`, so sizeof
+ * and every other offset are unchanged and a v4 host stays correct. A field that
+ * had grown the struct would have moved the version to 5.
+ *
  * Version 3 was the callback increment: the omni_host_fn type, the three
  * registration functions, and statuses 5 and 6. */
 #define OMNI_ABI_VERSION 4u
@@ -229,9 +234,18 @@ typedef struct OmniValue {
  *
  * `size` is written by the callee with sizeof(OmniStats). A host that compiled
  * against a different layout reads back a size it does not recognise and knows
- * to stop, rather than reading a counter from the wrong offset forever. */
+ * to stop, rather than reading a counter from the wrong offset forever.
+ *
+ * `last_exec_micros` occupies bytes the compiler already padded after `size`, so
+ * adding it kept the struct at 72 bytes and every other field at its v4 offset.
+ * That is why this is still ABI 4: a host compiled against the original header
+ * reads the same size and the same fields, and only sees a counter it did not
+ * ask for in bytes it was already skipping. */
 typedef struct OmniStats {
   uint32_t size;                /* sizeof(OmniStats), written by the callee */
+  uint32_t last_exec_micros;    /* wall-clock us the last execution spent in
+                                 * the engine, lexing included; saturates at
+                                 * UINT32_MAX. Zero before the first run.     */
   uint64_t execs;               /* executions started: one per omni_exec(),
                                  * one per item of every omni_exec_many()   */
   uint64_t strings;             /* string blocks built, cumulative          */
@@ -264,6 +278,8 @@ OMNI_STATIC_ASSERT(offsetof(OmniPayload, number) == 0, "OmniPayload::number star
 OMNI_STATIC_ASSERT(offsetof(OmniPayload, ptr) == 0, "both arms of OmniPayload start at 0");
 OMNI_STATIC_ASSERT(sizeof(OmniStats) == 72, "OmniStats must stay 72 bytes");
 OMNI_STATIC_ASSERT(offsetof(OmniStats, size) == 0, "OmniStats::size must stay at offset 0");
+OMNI_STATIC_ASSERT(offsetof(OmniStats, last_exec_micros) == 4,
+                   "OmniStats::last_exec_micros reuses the padding at offset 4");
 OMNI_STATIC_ASSERT(offsetof(OmniStats, execs) == 8, "OmniStats::execs must stay at offset 8");
 OMNI_STATIC_ASSERT(offsetof(OmniStats, egress_high_water) == 64, "OmniStats tail must stay at 64");
 

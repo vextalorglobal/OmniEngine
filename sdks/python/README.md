@@ -70,9 +70,17 @@ with omni.Engine() as engine:
     engine.run(r'"omni" + " " + "engine"').value    # 'omni engine'
     engine.run(r'"ab" == "a" + "b"').value          # True
     engine.string(r'"\u{1F600}" + " " + "omni"')    # '😀 omni'
+    engine.eval_str("clamp(12, 0, 10) + min(1, 2) + max(3, 4)")  # 15
+    engine.eval_str('upper(trim("  omni  "))')       # 'OMNI'
+    engine.eval_str('len("héllo")')                  # 6 (bytes)
 ```
 
-A `Result` carries `tag`, `number`, `text` and `value`. `text` is the exact bytes
+A `Result` carries `tag`, `number`, `text` and `value`. `eval_str` skips the
+wrapper and returns the language value as a native Python object: `int` for an
+integral finite number, otherwise `float`, `str`, `bool`, or `None`. Eleven
+builtins — `abs`, `min`, `max`, `clamp`, `floor`, `ceil`, `round`, `len`,
+`trim`, `upper`, `lower` — need no registration, and
+`stats().last_exec_micros` reports the most recent execution in microseconds. `text` is the exact bytes
 of a string result — NUL bytes included, because OmniEngine strings are
 length-delimited rather than C strings — and `value` is the same bytes decoded as
 UTF-8. `number` is `0.0` for a string, on purpose: those eight payload bytes are
@@ -94,12 +102,12 @@ Three ways to handle a bad program, for three kinds of caller:
 ```python
 engine.evaluate("1 / 0")   # raises OmniError(kind="runtime")
 engine.run("let = 1")      # raises OmniError(kind="compile")
-engine.try_run("###")      # returns (1, None, "line 1: unexpected character '#'")
+engine.try_run("###")      # returns (1, None, "[Line 1, Col 1]: unexpected character '#'")
 ```
 
 `OmniError.status` is the raw ABI code and `OmniError.message` is the engine's
-own text, including the line number — that context survives the C boundary on
-purpose.
+own text, including the 1-based line and byte column — that context survives the
+C boundary on purpose.
 
 ## Batching: several programs, one crossing
 
@@ -115,7 +123,7 @@ engine.run_many(["1 + 1", '"two"', "shout('hey')"])
 Each item is an independent program — item *N* cannot read item *N−1*'s `let` —
 and every string result is copied out before the list is returned, so nothing in
 it expires. A failing item raises `OmniError` naming its index and its own
-message (`item 1 of 3: line 1: …`); the items after it still ran. For REPL-style
+message (`item 1 of 3: [Line 1, Col 1]: …`); the items after it still ran. For REPL-style
 callers, `try_run_many` returns one `(status, result, message)` per item instead
 of raising — the per-item shape of `try_run`.
 
@@ -221,7 +229,7 @@ the safety rule above; measure it with `engine.stats()` — or run
 ## Tests
 
 ```bash
-python sdks/python/tests/test_ffi.py        # 107 tests, stdlib unittest
+python sdks/python/tests/test_ffi.py        # 120 tests, stdlib unittest
 python sdks/python/bench.py                 # ns/call, gc/call, batch speed-up
 ```
 

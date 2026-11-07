@@ -156,7 +156,7 @@ class Strings(unittest.TestCase):
         with self.assertRaises(omni.OmniError) as caught:
             self.engine.run(r'"hi" + 42')
         self.assertEqual(caught.exception.kind, "runtime")
-        self.assertEqual(caught.exception.message, r'line 1: cannot add string to number: "hi" + 42')
+        self.assertEqual(caught.exception.message, r'[Line 1, Col 6]: type mismatch: cannot add string to number: "hi" + 42')
 
     def test_evaluate_refuses_a_string_and_string_refuses_a_number(self) -> None:
         with self.assertRaises(omni.OmniError) as caught:
@@ -395,7 +395,7 @@ class HostFunctions(unittest.TestCase):
             self.engine.run("boom(1) + 1")
         self.assertEqual(caught.exception.kind, "host")
         self.assertEqual(caught.exception.status, _ffi.OMNI_ERR_HOST)
-        self.assertIn("line 1", caught.exception.message)
+        self.assertIn("[Line 1, Col 1]", caught.exception.message)
         self.assertIn("host function 'boom' failed", caught.exception.message)
         self.assertIn("RuntimeError: the host said no", caught.exception.message)
         # The engine is still standing, and still knows the function.
@@ -651,14 +651,14 @@ class Errors(unittest.TestCase):
             self.engine.run("let = 1")
         self.assertEqual(caught.exception.status, 1)
         self.assertEqual(caught.exception.kind, "compile")
-        self.assertIn("line", caught.exception.message)
+        self.assertIn("[Line 1, Col 5]", caught.exception.message)
 
     def test_division_by_zero_is_a_runtime_error(self) -> None:
         with self.assertRaises(omni.OmniError) as caught:
             self.engine.evaluate("1 / 0")
         self.assertEqual(caught.exception.kind, "runtime")
         # The line number crosses the ABI boundary, so a host can point at source.
-        self.assertEqual(caught.exception.message, "line 1: division by zero")
+        self.assertEqual(caught.exception.message, "[Line 1, Col 3]: division by zero")
 
     def test_evaluate_refuses_a_non_numeric_program(self) -> None:
         with self.assertRaises(omni.OmniError) as caught:
@@ -671,7 +671,7 @@ class Errors(unittest.TestCase):
     def test_the_line_number_points_at_the_failing_line(self) -> None:
         with self.assertRaises(omni.OmniError) as caught:
             self.engine.run("// a comment\nlet = 1")
-        self.assertTrue(caught.exception.message.startswith("line 2: "), caught.exception.message)
+        self.assertTrue(caught.exception.message.startswith("[Line 2, Col "), caught.exception.message)
 
     def test_an_empty_program_is_undef_not_an_error(self) -> None:
         self.assertEqual(self.engine.run("").tag, "undef")
@@ -867,10 +867,10 @@ class SafetyBoundaries(unittest.TestCase):
     def test_error_text_is_copied_out_and_truncates(self) -> None:
         raw = _ffi.RawEngine()
         self.addCleanup(raw.close)
-        raw.exec("1 / 0")  # "line 1: division by zero"
-        self.assertEqual(raw.last_error(cap=100), "line 1: division by zero")
+        raw.exec("1 / 0")  # "[Line 1, Col 3]: division by zero"
+        self.assertEqual(raw.last_error(cap=100), "[Line 1, Col 3]: division by zero")
         # The ABI writes at most cap - 1 bytes so there is always room for a NUL.
-        self.assertEqual(raw.last_error(cap=8), "line 1:")
+        self.assertEqual(raw.last_error(cap=8), "[Line 1")
         self.assertEqual(raw.last_error(cap=1), "")
         self.assertEqual(raw.last_error(cap=0), "")
 
@@ -1074,6 +1074,119 @@ class AbiLayout(unittest.TestCase):
         raw.tag, raw.len = _ffi.OMNI_STRING, 2
         self.assertEqual(omni._convert(raw, b"\xff\xfe").text, b"\xff\xfe")
         self.assertTrue(omni._convert(raw, b"\xff\xfe").value)
+
+
+class Builtins(unittest.TestCase):
+    """The standard helpers every host gets without registering anything."""
+
+    def setUp(self) -> None:
+        self.engine = omni.Engine()
+        self.addCleanup(self.engine.close)
+
+    def test_math_builtins(self) -> None:
+        e = self.engine
+        self.assertEqual(e.evaluate("abs(-3)"), 3.0)
+        self.assertEqual(e.evaluate("min(2, 5)"), 2.0)
+        self.assertEqual(e.evaluate("max(2, 5)"), 5.0)
+        self.assertEqual(e.evaluate("clamp(12, 0, 10)"), 10.0)
+        self.assertEqual(e.evaluate("floor(2.9)"), 2.0)
+        self.assertEqual(e.evaluate("ceil(2.1)"), 3.0)
+        self.assertEqual(e.evaluate("round(2.5)"), 3.0)
+        self.assertEqual(e.evaluate("-round(-2.5)"), 3.0)
+
+    def test_string_builtins(self) -> None:
+        e = self.engine
+        self.assertEqual(e.string(r'trim("  padded\t")'), "padded")
+        self.assertEqual(e.string('upper("MiXeD")'), "MIXED")
+        self.assertEqual(e.string('lower("MiXeD")'), "mixed")
+        self.assertEqual(e.string(r'upper("stra\u{00DF}e")'), "STRASSE")
+        self.assertEqual(e.evaluate(r'len("h\u{00E9}llo")'), 6.0, "é is two bytes")
+        self.assertEqual(e.string(r'upper(trim("  hi  "))'), "HI")
+
+    def test_a_wrong_type_names_the_builtin_and_the_location(self) -> None:
+        with self.assertRaises(omni.OmniError) as caught:
+            self.engine.run('abs("x")')
+        self.assertEqual(caught.exception.kind, "runtime")
+        self.assertTrue(
+            caught.exception.message.startswith(
+                "[Line 1, Col 1]: type mismatch: abs() needs a number"
+            ),
+            caught.exception.message,
+        )
+
+    def test_a_wrong_arity_names_the_builtin(self) -> None:
+        with self.assertRaises(omni.OmniError) as caught:
+            self.engine.run("min(1)")
+        self.assertEqual(
+            caught.exception.message,
+            "[Line 1, Col 1]: builtin 'min' takes 2 arguments, got 1",
+        )
+
+    def test_clamp_refuses_an_inverted_range(self) -> None:
+        with self.assertRaises(omni.OmniError) as caught:
+            self.engine.run("clamp(1, 10, 0)")
+        self.assertIn("lower bound", caught.exception.message)
+
+    def test_a_registered_function_shadows_a_builtin(self) -> None:
+        self.engine.register_function("abs", lambda _: 99.0, arity=1)
+        self.assertEqual(self.engine.evaluate("abs(-1)"), 99.0)
+        self.assertTrue(self.engine.unregister_function("abs"))
+        self.assertEqual(self.engine.evaluate("abs(-1)"), 1.0)
+
+
+class EvalStr(unittest.TestCase):
+    """``eval_str`` returns Python data, not a Result."""
+
+    def setUp(self) -> None:
+        self.engine = omni.Engine()
+        self.addCleanup(self.engine.close)
+
+    def test_whole_numbers_become_int(self) -> None:
+        result = self.engine.eval_str("1 + 1")
+        self.assertIsInstance(result, int)
+        self.assertEqual(result, 2)
+
+    def test_fractional_numbers_stay_float(self) -> None:
+        result = self.engine.eval_str("1 / 2")
+        self.assertIsInstance(result, float)
+        self.assertEqual(result, 0.5)
+
+    def test_strings_booleans_and_nothing_come_back_native(self) -> None:
+        self.assertEqual(self.engine.eval_str('"a" + "b"'), "ab")
+        self.assertIs(self.engine.eval_str("1 == 1"), True)
+        self.assertIsNone(self.engine.eval_str(""))
+
+    def test_an_error_still_raises(self) -> None:
+        with self.assertRaises(omni.OmniError):
+            self.engine.eval_str("1 / 0")
+
+
+class PositionsAndTimer(unittest.TestCase):
+    def setUp(self) -> None:
+        self.engine = omni.Engine()
+        self.addCleanup(self.engine.close)
+
+    def test_an_error_on_the_second_line_reports_both_numbers(self) -> None:
+        with self.assertRaises(omni.OmniError) as caught:
+            self.engine.run('let a = 1\nlet b = "x" + 2')
+        self.assertEqual(
+            caught.exception.message,
+            '[Line 2, Col 13]: type mismatch: cannot add string to number: "x" + 2',
+        )
+
+    def test_columns_count_bytes(self) -> None:
+        # The '+' after a two-byte 'é' is at byte column 6, not character column 5.
+        with self.assertRaises(omni.OmniError) as caught:
+            self.engine.run('"\u00e9" + 1')
+        self.assertIn("[Line 1, Col 6]", caught.exception.message)
+
+    def test_stats_carry_the_last_execution_timer(self) -> None:
+        self.assertEqual(self.engine.stats().last_exec_micros, 0)
+        self.engine.run('"' + "x" * 200_000 + '"')
+        stats = self.engine.stats()
+        self.assertGreater(stats.last_exec_micros, 0)
+        self.assertEqual(stats.execs, 1)
+        self.assertIsInstance(stats.last_exec_micros, int)
 
 
 if __name__ == "__main__":

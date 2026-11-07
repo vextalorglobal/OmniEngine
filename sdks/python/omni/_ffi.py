@@ -224,10 +224,16 @@ HOST_FN = ctypes.CFUNCTYPE(
 
 
 class OmniStats(Structure):
-    """Mirror of ``OmniStats``: a size word plus eight 64-bit counters."""
+    """Mirror of ``OmniStats``: a size word, a microsecond timer, eight counters.
+
+    ``last_exec_micros`` sits in the four bytes the C compiler padded after
+    ``size``, so the struct stays 72 bytes and every other field keeps its
+    offset -- which is why the ABI stayed at 4.
+    """
 
     _fields_ = [
         ("size", c_uint32),
+        ("last_exec_micros", c_uint32),
         ("execs", c_uint64),
         ("strings", c_uint64),
         ("arena_bytes_in_use", c_uint64),
@@ -250,6 +256,7 @@ class Stats:
     """
 
     execs: int
+    last_exec_micros: int
     strings: int
     arena_bytes_in_use: int
     arena_bytes_reserved: int
@@ -271,6 +278,7 @@ _LAYOUT = [
     ("OmniValue.payload.offset", OmniValue.payload.offset, 8),
     ("ctypes.sizeof(OmniStats)", ctypes.sizeof(OmniStats), 72),
     ("OmniStats.size.offset", OmniStats.size.offset, 0),
+    ("OmniStats.last_exec_micros.offset", OmniStats.last_exec_micros.offset, 4),
     ("OmniStats.execs.offset", OmniStats.execs.offset, 8),
     ("OmniStats.egress_high_water.offset", OmniStats.egress_high_water.offset, 64),
 ]
@@ -919,6 +927,7 @@ class RawEngine:
             )
         return Stats(
             execs=out.execs,
+            last_exec_micros=out.last_exec_micros,
             strings=out.strings,
             arena_bytes_in_use=out.arena_bytes_in_use,
             arena_bytes_reserved=out.arena_bytes_reserved,

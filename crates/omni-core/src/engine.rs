@@ -29,6 +29,7 @@
 
 use std::borrow::Cow;
 use std::fmt;
+use std::time::{Duration, Instant};
 
 use crate::Value;
 use crate::arena::{Arena, Slot};
@@ -70,18 +71,39 @@ pub enum ErrorKind {
     Host,
 }
 
+/// A one-based line and byte column in the source a program came from.
+///
+/// The column is a byte offset, not a character count: the lexer indexes bytes,
+/// and a token's `start` is the same number, so nothing has to decode UTF-8 to
+/// report where an error was. A line whose text is ASCII before the error reads
+/// the same either way; one with a multi-byte character earlier on it reports
+/// the byte the reader's editor moves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Pos {
+    pub line: u32,
+    pub column: u32,
+}
+
+impl Pos {
+    fn new(line: u32, column: u32) -> Pos {
+        Pos { line, column }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OmniError {
     pub kind: ErrorKind,
     pub line: u32,
+    pub column: u32,
     pub message: String,
 }
 
 impl OmniError {
-    fn new(kind: ErrorKind, line: u32, message: impl Into<String>) -> OmniError {
+    fn new(kind: ErrorKind, at: Pos, message: impl Into<String>) -> OmniError {
         OmniError {
             kind,
-            line,
+            line: at.line,
+            column: at.column,
             message: message.into(),
         }
     }
@@ -89,7 +111,11 @@ impl OmniError {
 
 impl fmt::Display for OmniError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "line {}: {}", self.line, self.message)
+        write!(
+            f,
+            "[Line {}, Col {}]: {}",
+            self.line, self.column, self.message
+        )
     }
 }
 
@@ -97,7 +123,7 @@ impl std::error::Error for OmniError {}
 
 impl From<LexError> for OmniError {
     fn from(e: LexError) -> OmniError {
-        OmniError::new(ErrorKind::Lex, e.line, e.message)
+        OmniError::new(ErrorKind::Lex, Pos::new(e.line, e.column), e.message)
     }
 }
 
@@ -205,6 +231,43 @@ impl<'a> Tokens<'a> {
     fn text(&self, token: Token) -> &'a str {
         token.text(self.source)
     }
+
+    /// Where a token starts, as a line and byte column.
+    fn pos(&self, token: Token) -> Pos {
+        Pos::new(token.line, column_at(self.source, token.start as usize))
+    }
+
+    /// Where the token at `index` starts; the end of input for an index past it,
+    /// which is what an "unexpected end" error has to point at.
+    fn pos_at(&self, index: usize) -> Pos {
+        match self.tokens.get(index) {
+            Some(token) => self.pos(*token),
+            None => self.end_pos(),
+        }
+    }
+
+    fn end_pos(&self) -> Pos {
+        let line = self.tokens.last().map_or(1, |token| token.line);
+        let column = self
+            .source
+            .rsplit('\n')
+            .next()
+            .map_or(1, |tail| tail.len() as u32 + 1);
+        Pos::new(line, column)
+    }
+}
+
+/// One-based byte column of `offset` in `source`.
+///
+/// `offset` is always a token boundary the lexer produced, and every such
+/// boundary is a `char` boundary, so slicing is safe; a caller that pairs an
+/// offset with the wrong source gets column 1 rather than a panic.
+fn column_at(source: &str, offset: usize) -> u32 {
+    let Some(before) = source.get(..offset) else {
+        return 1;
+    };
+    let line_start = before.rfind('\n').map_or(0, |newline| newline + 1);
+    (offset - line_start + 1) as u32
 }
 
 /// The arguments of one call, held on the stack.
@@ -310,6 +373,13 @@ impl BatchItem {
 pub struct Stats {
     /// Executions started, successful or not: one per `exec`, one per batch item.
     pub execs: u64,
+    /// Wall-clock microseconds the most recent execution spent in [`Engine::run`],
+    /// including lexing. A failed execution counts too: latency is latency.
+    ///
+    /// `u32` because the C ABI spends the four padding bytes after its `size`
+    /// field on this counter; 4,294 seconds is far past any single program, and
+    /// the value saturates rather than wrapping.
+    pub last_exec_micros: u32,
     /// String blocks built, cumulative. The one counter that is *supposed* to grow.
     pub strings_built: u64,
     pub arena_bytes_in_use: u64,
@@ -357,6 +427,7 @@ pub struct Engine {
     last_value: Value,
     last_error: Option<OmniError>,
     execs: u64,
+    last_exec_micros: u32,
     strings_built: u64,
 }
 
@@ -374,6 +445,7 @@ impl Engine {
             last_value: Value::UNDEF,
             last_error: None,
             execs: 0,
+            last_exec_micros: 0,
             strings_built: 0,
         }
     }
@@ -387,7 +459,9 @@ impl Engine {
     pub fn exec(&mut self, source: &str) -> Result<Value, OmniError> {
         self.reclaim();
         self.execs += 1;
+        let started = Instant::now();
         let result = self.run(source);
+        self.last_exec_micros = elapsed_micros(started.elapsed());
         match result {
             Ok(v) => {
                 let v = self.promote(v);
@@ -436,7 +510,10 @@ impl Engine {
             self.bindings.clear();
             self.call_depth = 0;
             self.execs += 1;
-            items.push(match self.run(source) {
+            let started = Instant::now();
+            let result = self.run(source);
+            self.last_exec_micros = elapsed_micros(started.elapsed());
+            items.push(match result {
                 Ok(v) => {
                     let v = self.promote(v);
                     self.last_value = v;
@@ -692,6 +769,7 @@ impl Engine {
         let u64_from = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
         Stats {
             execs: self.execs,
+            last_exec_micros: self.last_exec_micros,
             strings_built: self.strings_built,
             arena_bytes_in_use: u64_from(self.arena.bytes_in_use()),
             arena_bytes_reserved: u64_from(self.arena.bytes_reserved()),
@@ -730,11 +808,11 @@ impl Engine {
                 None | Some(TokenKind::Eof) => break,
                 Some(TokenKind::Let) => {
                     self.advance(&mut index);
-                    let line = self.peek_line(&t, index);
+                    let name_pos = t.pos_at(index);
                     let name = self.expect_ident(&t, &mut index)?;
                     self.expect(&t, &mut index, TokenKind::Eq)?;
                     let value = self.parse_expr(&t, &mut index)?;
-                    self.bind(name, value, line)?;
+                    self.bind(name, value, name_pos)?;
                     last = value;
                 }
                 _ => last = self.parse_expr(&t, &mut index)?,
@@ -746,11 +824,11 @@ impl Engine {
     /// Allocate the binding's cell in the arena. A name longer than the fixed
     /// inline field is a language error, never a silent truncation — two
     /// different identifiers comparing equal would be far worse than a limit.
-    fn bind(&mut self, name: &str, value: Value, line: u32) -> Result<(), OmniError> {
+    fn bind(&mut self, name: &str, value: Value, at: Pos) -> Result<(), OmniError> {
         let binding = Binding::new(name, value).ok_or_else(|| {
             OmniError::new(
                 ErrorKind::Parse,
-                line,
+                at,
                 format!(
                     "identifier is longer than the {MAX_IDENTIFIER_LEN}-character limit \
                      ({} characters)",
@@ -806,10 +884,10 @@ impl Engine {
                 Some(TokenKind::BinOp(BinOp::Sub)) => BinOp::Sub,
                 _ => break,
             };
-            let line = self.peek_line(t, *i);
+            let at = t.pos_at(*i);
             self.advance(i);
             let rhs = self.parse_term(t, i)?;
-            acc = self.arith(acc, op, rhs, line)?;
+            acc = self.arith(acc, op, rhs, at)?;
         }
         Ok(acc)
     }
@@ -823,10 +901,10 @@ impl Engine {
                 Some(TokenKind::BinOp(BinOp::Mod)) => BinOp::Mod,
                 _ => break,
             };
-            let line = self.peek_line(t, *i);
+            let at = t.pos_at(*i);
             self.advance(i);
             let rhs = self.parse_factor(t, i)?;
-            acc = self.arith(acc, op, rhs, line)?;
+            acc = self.arith(acc, op, rhs, at)?;
         }
         Ok(acc)
     }
@@ -845,14 +923,15 @@ impl Engine {
                 _ => break,
             }
         }
+        let operand_pos = t.pos_at(*i);
         let value = self.parse_primary(t, i)?;
         if negate {
             let n = value.as_f64().ok_or_else(|| {
                 OmniError::new(
                     ErrorKind::Runtime,
-                    self.peek_line(t, *i),
+                    operand_pos,
                     format!(
-                        "cannot apply unary '-' to {}: {}",
+                        "type mismatch: cannot apply unary '-' to {}: {}",
                         kind_of(value),
                         self.show(value)
                     ),
@@ -865,11 +944,7 @@ impl Engine {
 
     fn parse_primary(&mut self, t: &Tokens<'_>, i: &mut usize) -> Result<Value, OmniError> {
         let token = self.peek(t, *i).ok_or_else(|| {
-            OmniError::new(
-                ErrorKind::Parse,
-                self.last_line(t),
-                "unexpected end of input",
-            )
+            OmniError::new(ErrorKind::Parse, t.pos_at(*i), "unexpected end of input")
         })?;
         match token.kind {
             TokenKind::Number => {
@@ -880,7 +955,7 @@ impl Engine {
                     .map_err(|_| {
                         OmniError::new(
                             ErrorKind::Parse,
-                            token.line,
+                            t.pos(token),
                             format!("'{}' is not a valid number", t.text(token)),
                         )
                     })
@@ -888,10 +963,11 @@ impl Engine {
             TokenKind::Str => {
                 self.advance(i);
                 // Decoding happens here, not in the lexer, so a token stays a
-                // pair of offsets and lexing allocates nothing. The line number
-                // survives the deferral because the token carries it.
-                let bytes = decode_literal(t.text(token), token.line)?;
-                self.new_string(&bytes, token.line, ErrorKind::Runtime)
+                // pair of offsets and lexing allocates nothing. The position
+                // survives the deferral because the token carries both numbers.
+                let at = t.pos(token);
+                let bytes = decode_literal(t.text(token), at)?;
+                self.new_string(&bytes, at, ErrorKind::Runtime)
             }
             TokenKind::Ident => {
                 let name = t.text(token);
@@ -901,12 +977,12 @@ impl Engine {
                 // only disambiguation, which is what lets a host register `print`
                 // without reserving the identifier.
                 if self.peek_kind(t, *i) == Some(TokenKind::LParen) {
-                    return self.parse_call(t, i, name, token.line);
+                    return self.parse_call(t, i, name, t.pos(token));
                 }
                 self.lookup(name).ok_or_else(|| {
                     OmniError::new(
                         ErrorKind::Runtime,
-                        token.line,
+                        t.pos(token),
                         format!("undefined variable '{name}'"),
                     )
                 })
@@ -919,46 +995,52 @@ impl Engine {
             }
             TokenKind::Eof => Err(OmniError::new(
                 ErrorKind::Parse,
-                token.line,
+                t.pos(token),
                 "unexpected end of input",
             )),
             other => Err(self.parse_error_kind(t, *i, other, "expected a value")),
         }
     }
 
-    /// `name(arg, …)` with the call already resolved to a host function.
+    /// `name(arg, …)` with the call already resolved to a host function or one
+    /// of the standard helpers.
     ///
-    /// Arity is checked against the registration rather than inferred from what
-    /// arrived, so `len("a", "b")` names the function and both counts. The depth
-    /// guard wraps argument evaluation too: `f(g(x))` nests here, and the stack
-    /// the recursion spends is the thing being limited.
+    /// Arity is checked against the registration or the builtin's definition
+    /// rather than inferred from what arrived, so `len("a", "b")` names the
+    /// function and both counts. A host registration wins over a builtin of the
+    /// same name, which is what lets a host instrument `len` without the language
+    /// reserving it. The depth guard wraps argument evaluation too: `f(g(x))`
+    /// nests here, and the stack the recursion spends is the thing being limited.
     fn parse_call(
         &mut self,
         t: &Tokens<'_>,
         i: &mut usize,
         name: &str,
-        line: u32,
+        at: Pos,
     ) -> Result<Value, OmniError> {
         if self.call_depth >= MAX_CALL_DEPTH {
             return Err(OmniError::new(
                 ErrorKind::Runtime,
-                line,
+                at,
                 format!(
                     "calls are nested {MAX_CALL_DEPTH} deep, the limit; a host function \
                      cannot call itself"
                 ),
             ));
         }
-        let index = self.find_host_fn(name).ok_or_else(|| {
-            OmniError::new(
+        let host = self.find_host_fn(name);
+        let builtin = builtin_for(name);
+        if host.is_none() && builtin.is_none() {
+            return Err(OmniError::new(
                 ErrorKind::Runtime,
-                line,
-                format!(
-                    "unknown function '{name}' (no host function is registered with that name)"
-                ),
-            )
-        })?;
-        let arity = self.host_fns[index].arity as usize;
+                at,
+                format!("unknown function '{name}' (no host function or builtin has that name)"),
+            ));
+        }
+        let arity = match host {
+            Some(index) => self.host_fns[index].arity as usize,
+            None => builtin.expect("checked above").1,
+        };
         self.advance(i); // the '(' that made this a call
 
         self.call_depth += 1;
@@ -966,17 +1048,28 @@ impl Engine {
         self.call_depth -= 1;
         let args = outcome?;
         if args.len() != arity {
+            let what = if host.is_some() {
+                "host function"
+            } else {
+                "builtin"
+            };
             return Err(OmniError::new(
                 ErrorKind::Runtime,
-                line,
+                at,
                 format!(
-                    "host function '{name}' takes {arity} argument{}, got {}",
+                    "{what} '{name}' takes {arity} argument{}, got {}",
                     if arity == 1 { "" } else { "s" },
                     args.len()
                 ),
             ));
         }
-        self.invoke_host(index, name, args.as_slice(), line)
+        match host {
+            Some(index) => self.invoke_host(index, name, args.as_slice(), at),
+            None => {
+                let (which, _) = builtin.expect("checked above");
+                self.invoke_builtin(which, name, args.as_slice(), at)
+            }
+        }
     }
 
     /// Read `arg, arg, …` up to and including the closing paren.
@@ -993,14 +1086,14 @@ impl Engine {
         if self.peek_kind(t, *i) != Some(TokenKind::RParen) {
             loop {
                 // The last argument's expression is where an error most often
-                // lives, so the line number moves with the cursor instead of
+                // lives, so the position moves with the cursor instead of
                 // staying on the function name.
-                let arg_line = self.peek_line(t, *i);
+                let arg_pos = t.pos_at(*i);
                 args.push(self.parse_expr(t, i)?);
                 if args.len() > MAX_ARGS {
                     return Err(OmniError::new(
                         ErrorKind::Parse,
-                        arg_line,
+                        arg_pos,
                         format!("a call takes at most {MAX_ARGS} arguments"),
                     ));
                 }
@@ -1033,7 +1126,7 @@ impl Engine {
         index: usize,
         name: &str,
         args: &[Value],
-        line: u32,
+        at: Pos,
     ) -> Result<Value, OmniError> {
         let outcome = {
             let host = &self.host_fns[index];
@@ -1044,7 +1137,7 @@ impl Engine {
             HostOutcome::Bool(b) => Ok(Value::bool(b)),
             HostOutcome::Nil => Ok(Value::NIL),
             HostOutcome::Undefined => Ok(Value::UNDEF),
-            HostOutcome::String(bytes) => self.new_string(&bytes, line, ErrorKind::Runtime),
+            HostOutcome::String(bytes) => self.new_string(&bytes, at, ErrorKind::Runtime),
             HostOutcome::Failure(message) => {
                 // The host's own text, if it sent any. A callback that fails with
                 // nothing to say still produces a message that names the function,
@@ -1057,20 +1150,174 @@ impl Engine {
                 };
                 Err(OmniError::new(
                     ErrorKind::Host,
-                    line,
+                    at,
                     format!("host function '{name}' failed{detail}"),
                 ))
             }
         }
     }
 
+    /// Run one of the standard helpers.
+    ///
+    /// Every numeric builtin reads its arguments through the same door as `+`,
+    /// so a program that passes a string to `abs` gets the same shaped message
+    /// it gets from `"a" * 2`, pointing at the call site rather than at the
+    /// argument's own expression. String helpers write into the engine's scratch
+    /// buffer and hand it to `new_string`, which keeps the warm path allocation
+    /// free in the same way `+` does.
+    fn invoke_builtin(
+        &mut self,
+        which: Builtin,
+        name: &str,
+        args: &[Value],
+        at: Pos,
+    ) -> Result<Value, OmniError> {
+        match which {
+            Builtin::Abs => Ok(Value::from_f64(self.number_arg(name, args, 0, at)?.abs())),
+            Builtin::Floor => Ok(Value::from_f64(self.number_arg(name, args, 0, at)?.floor())),
+            Builtin::Ceil => Ok(Value::from_f64(self.number_arg(name, args, 0, at)?.ceil())),
+            Builtin::Round => Ok(Value::from_f64(self.number_arg(name, args, 0, at)?.round())),
+            Builtin::Min => {
+                let a = self.number_arg(name, args, 0, at)?;
+                let b = self.number_arg(name, args, 1, at)?;
+                Ok(Value::from_f64(a.min(b)))
+            }
+            Builtin::Max => {
+                let a = self.number_arg(name, args, 0, at)?;
+                let b = self.number_arg(name, args, 1, at)?;
+                Ok(Value::from_f64(a.max(b)))
+            }
+            Builtin::Clamp => {
+                let value = self.number_arg(name, args, 0, at)?;
+                let low = self.number_arg(name, args, 1, at)?;
+                let high = self.number_arg(name, args, 2, at)?;
+                if low > high {
+                    return Err(OmniError::new(
+                        ErrorKind::Runtime,
+                        at,
+                        format!(
+                            "clamp() needs a lower bound that is not above the upper one \
+                             (got {low} and {high})"
+                        ),
+                    ));
+                }
+                Ok(Value::from_f64(value.max(low).min(high)))
+            }
+            Builtin::Len => {
+                let bytes = self.string_arg(name, args, 0, at)?;
+                Ok(Value::from_f64(bytes.len() as f64))
+            }
+            Builtin::Trim => self.map_string(name, args, at, |text, out| {
+                out.extend_from_slice(text.trim().as_bytes());
+            }),
+            Builtin::Upper => self.map_string(name, args, at, |text, out| {
+                for ch in text.chars() {
+                    for mapped in ch.to_uppercase() {
+                        push_char(out, mapped);
+                    }
+                }
+            }),
+            Builtin::Lower => self.map_string(name, args, at, |text, out| {
+                for ch in text.chars() {
+                    for mapped in ch.to_lowercase() {
+                        push_char(out, mapped);
+                    }
+                }
+            }),
+        }
+    }
+
+    /// One argument as a number, or the message a type mismatch deserves.
+    fn number_arg(
+        &self,
+        name: &str,
+        args: &[Value],
+        index: usize,
+        at: Pos,
+    ) -> Result<f64, OmniError> {
+        let value = args[index];
+        value.as_f64().ok_or_else(|| {
+            OmniError::new(
+                ErrorKind::Runtime,
+                at,
+                format!(
+                    "type mismatch: {name}() needs a number for argument {}, found {}: {}",
+                    index + 1,
+                    kind_of(value),
+                    self.show(value)
+                ),
+            )
+        })
+    }
+
+    /// One argument as a string's bytes, or the message a type mismatch deserves.
+    ///
+    /// A string this engine cannot read is reported as the expiry it is rather
+    /// than as "not a string", because that is the mistake the caller made.
+    fn string_arg<'v>(
+        &'v self,
+        name: &str,
+        args: &[Value],
+        index: usize,
+        at: Pos,
+    ) -> Result<&'v [u8], OmniError> {
+        let value = args[index];
+        if let Some(bytes) = self.string_of(value) {
+            return Ok(bytes);
+        }
+        Err(if value.is_string() {
+            unreadable_string(at, value)
+        } else {
+            OmniError::new(
+                ErrorKind::Runtime,
+                at,
+                format!(
+                    "type mismatch: {name}() needs a string for argument {}, found {}: {}",
+                    index + 1,
+                    kind_of(value),
+                    self.show(value)
+                ),
+            )
+        })
+    }
+
+    /// Rebuild a string argument through `map`, reusing the scratch buffer.
+    ///
+    /// `map` sees the decoded text and writes UTF-8 into the buffer. Taking the
+    /// buffer out first is what lets `string_arg` borrow the engine while the
+    /// result is still built with `&mut self`.
+    fn map_string(
+        &mut self,
+        name: &str,
+        args: &[Value],
+        at: Pos,
+        map: impl FnOnce(&str, &mut Vec<u8>),
+    ) -> Result<Value, OmniError> {
+        let mut buf = std::mem::take(&mut self.scratch);
+        let result = (|| {
+            let bytes = self.string_arg(name, args, 0, at)?;
+            let text = std::str::from_utf8(bytes).map_err(|_| {
+                OmniError::new(
+                    ErrorKind::Runtime,
+                    at,
+                    format!("type mismatch: {name}() needs a UTF-8 string"),
+                )
+            })?;
+            buf.clear();
+            map(text, &mut buf);
+            self.new_string(&buf, at, ErrorKind::Runtime)
+        })();
+        self.scratch = buf;
+        result
+    }
+
     /// The one place a string block enters the execution arena, and so the one
     /// place the length limit is enforced.
-    fn new_string(&mut self, bytes: &[u8], line: u32, kind: ErrorKind) -> Result<Value, OmniError> {
+    fn new_string(&mut self, bytes: &[u8], at: Pos, kind: ErrorKind) -> Result<Value, OmniError> {
         if bytes.len() > MAX_STRING_LEN {
             return Err(OmniError::new(
                 kind,
-                line,
+                at,
                 format!(
                     "string is {} bytes, over the {} MiB limit",
                     bytes.len(),
@@ -1089,16 +1336,16 @@ impl Engine {
     /// Zero division is an error rather than IEEE infinity, because an `inf`
     /// returning through the FFI would be indistinguishable from a successful
     /// computation, and a silent wrong answer is worse than a loud failure.
-    fn arith(&mut self, lhs: Value, op: BinOp, rhs: Value, line: u32) -> Result<Value, OmniError> {
+    fn arith(&mut self, lhs: Value, op: BinOp, rhs: Value, at: Pos) -> Result<Value, OmniError> {
         if op == BinOp::Add {
             return match (lhs.is_string(), rhs.is_string()) {
-                (true, true) => self.concat(lhs, rhs, line),
-                (false, false) => self.numeric(lhs, op, rhs, line),
+                (true, true) => self.concat(lhs, rhs, at),
+                (false, false) => self.numeric(lhs, op, rhs, at),
                 _ => Err(OmniError::new(
                     ErrorKind::Runtime,
-                    line,
+                    at,
                     format!(
-                        "cannot add {} to {}: {} + {}",
+                        "type mismatch: cannot add {} to {}: {} + {}",
                         kind_of(lhs),
                         kind_of(rhs),
                         self.show(lhs),
@@ -1107,7 +1354,7 @@ impl Engine {
                 )),
             };
         }
-        self.numeric(lhs, op, rhs, line)
+        self.numeric(lhs, op, rhs, at)
     }
 
     /// `string + string`, newly allocated in the execution arena.
@@ -1118,9 +1365,9 @@ impl Engine {
     /// borrows the engine and `new_string` needs it mutably. The buffer goes back
     /// afterwards with its capacity intact, so the next `+` reuses it instead of
     /// asking the system allocator for one per concatenation.
-    fn concat(&mut self, lhs: Value, rhs: Value, line: u32) -> Result<Value, OmniError> {
+    fn concat(&mut self, lhs: Value, rhs: Value, at: Pos) -> Result<Value, OmniError> {
         let mut buf = std::mem::take(&mut self.scratch);
-        let result = self.concat_into(lhs, rhs, line, &mut buf);
+        let result = self.concat_into(lhs, rhs, at, &mut buf);
         self.scratch = buf;
         result
     }
@@ -1129,22 +1376,22 @@ impl Engine {
         &mut self,
         lhs: Value,
         rhs: Value,
-        line: u32,
+        at: Pos,
         buf: &mut Vec<u8>,
     ) -> Result<Value, OmniError> {
         // Scoped so both shared borrows end before the arena is claimed.
         {
             let Some(a) = self.string_of(lhs) else {
-                return Err(unreadable_string(line, lhs));
+                return Err(unreadable_string(at, lhs));
             };
             let Some(b) = self.string_of(rhs) else {
-                return Err(unreadable_string(line, rhs));
+                return Err(unreadable_string(at, rhs));
             };
             let total = a.len() + b.len();
             if total > MAX_STRING_LEN {
                 return Err(OmniError::new(
                     ErrorKind::Runtime,
-                    line,
+                    at,
                     format!(
                         "concatenation would make a {total}-byte string, over the {} MiB limit",
                         MAX_STRING_LEN / (1024 * 1024)
@@ -1156,18 +1403,18 @@ impl Engine {
             buf.extend_from_slice(a);
             buf.extend_from_slice(b);
         }
-        self.new_string(buf, line, ErrorKind::Runtime)
+        self.new_string(buf, at, ErrorKind::Runtime)
     }
 
-    fn numeric(&self, lhs: Value, op: BinOp, rhs: Value, line: u32) -> Result<Value, OmniError> {
+    fn numeric(&self, lhs: Value, op: BinOp, rhs: Value, at: Pos) -> Result<Value, OmniError> {
         let (a, b) = match (lhs.as_f64(), rhs.as_f64()) {
             (Some(a), Some(b)) => (a, b),
             _ => {
                 return Err(OmniError::new(
                     ErrorKind::Runtime,
-                    line,
+                    at,
                     format!(
-                        "'{}' needs numbers on both sides (found {} and {})",
+                        "type mismatch: '{}' needs numbers on both sides (found {} and {})",
                         op.symbol(),
                         kind_of(lhs),
                         kind_of(rhs)
@@ -1180,14 +1427,10 @@ impl Engine {
             BinOp::Sub => a - b,
             BinOp::Mul => a * b,
             BinOp::Div if b == 0.0 => {
-                return Err(OmniError::new(ErrorKind::Runtime, line, "division by zero"));
+                return Err(OmniError::new(ErrorKind::Runtime, at, "division by zero"));
             }
             BinOp::Mod if b == 0.0 => {
-                return Err(OmniError::new(
-                    ErrorKind::Runtime,
-                    line,
-                    "remainder by zero",
-                ));
+                return Err(OmniError::new(ErrorKind::Runtime, at, "remainder by zero"));
             }
             BinOp::Div => a / b,
             BinOp::Mod => a % b,
@@ -1207,14 +1450,6 @@ impl Engine {
         t.tokens.get(i).map(|tok| tok.kind)
     }
 
-    fn peek_line(&self, t: &Tokens<'_>, i: usize) -> u32 {
-        t.tokens.get(i).map_or(0, |tok| tok.line)
-    }
-
-    fn last_line(&self, t: &Tokens<'_>) -> u32 {
-        t.tokens.last().map_or(1, |tok| tok.line)
-    }
-
     fn advance(&self, i: &mut usize) {
         *i += 1;
     }
@@ -1228,7 +1463,7 @@ impl Engine {
             Some(tok) => Err(self.parse_error_kind(t, *i, tok.kind, "unexpected token")),
             None => Err(OmniError::new(
                 ErrorKind::Parse,
-                self.last_line(t),
+                t.end_pos(),
                 "unexpected end of input",
             )),
         }
@@ -1243,12 +1478,12 @@ impl Engine {
             }
             Some(tok) => Err(OmniError::new(
                 ErrorKind::Parse,
-                tok.line,
+                t.pos(*tok),
                 format!("expected a name, found '{}'", display_kind(tok.kind)),
             )),
             None => Err(OmniError::new(
                 ErrorKind::Parse,
-                self.last_line(t),
+                t.end_pos(),
                 "expected a name",
             )),
         }
@@ -1263,7 +1498,7 @@ impl Engine {
     ) -> OmniError {
         OmniError::new(
             ErrorKind::Parse,
-            self.peek_line(t, i),
+            t.pos_at(i),
             format!("{context} (found '{}')", display_kind(kind)),
         )
     }
@@ -1273,6 +1508,63 @@ impl Default for Engine {
     fn default() -> Engine {
         Engine::new()
     }
+}
+
+/// Whole microseconds, saturating where the ABI's counter cannot go further.
+///
+/// `Duration::as_micros` is a `u128`; a single execution cannot reach the `u32`
+/// ceiling in any real program, but converting with `try_from` and a fallback is
+/// what makes that a stated limit rather than a silent wrap.
+fn elapsed_micros(elapsed: Duration) -> u32 {
+    u32::try_from(elapsed.as_micros()).unwrap_or(u32::MAX)
+}
+
+/// One of the helpers every host gets without registering anything.
+///
+/// A host registration of the same name wins, so these are a floor rather than a
+/// reserved namespace: an embedder that wants `len` to count characters instead
+/// of bytes registers its own and gets it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Builtin {
+    Abs,
+    Min,
+    Max,
+    Clamp,
+    Floor,
+    Ceil,
+    Round,
+    Len,
+    Trim,
+    Upper,
+    Lower,
+}
+
+/// The builtin a call name means, and how many arguments it takes.
+///
+/// The arity lives here rather than in `invoke_builtin` so the call site can
+/// reject a wrong count before any argument is *used*, naming the function and
+/// both counts — the same contract a host registration gets.
+fn builtin_for(name: &str) -> Option<(Builtin, usize)> {
+    Some(match name {
+        "abs" => (Builtin::Abs, 1),
+        "min" => (Builtin::Min, 2),
+        "max" => (Builtin::Max, 2),
+        "clamp" => (Builtin::Clamp, 3),
+        "floor" => (Builtin::Floor, 1),
+        "ceil" => (Builtin::Ceil, 1),
+        "round" => (Builtin::Round, 1),
+        "len" => (Builtin::Len, 1),
+        "trim" => (Builtin::Trim, 1),
+        "upper" => (Builtin::Upper, 1),
+        "lower" => (Builtin::Lower, 1),
+        _ => return None,
+    })
+}
+
+/// Append one character to a byte buffer.
+fn push_char(out: &mut Vec<u8>, ch: char) {
+    let mut tmp = [0u8; 4];
+    out.extend_from_slice(ch.encode_utf8(&mut tmp).as_bytes());
 }
 
 /// The name a type error uses for one value's kind. Written on `Value`'s tags
@@ -1296,10 +1588,10 @@ fn kind_of(value: Value) -> &'static str {
 
 /// The error for a string box this engine cannot read: reported as the type
 /// problem it looks like, because from the caller's side that is what it is.
-fn unreadable_string(line: u32, value: Value) -> OmniError {
+fn unreadable_string(at: Pos, value: Value) -> OmniError {
     OmniError::new(
         ErrorKind::Runtime,
-        line,
+        at,
         format!(
             "this string was produced by an earlier execution and its bytes are gone; \
              re-run to get a readable one ({value})"
@@ -1318,7 +1610,7 @@ fn unreadable_string(line: u32, value: Value) -> OmniError {
 /// surrogate and anything above `0x10FFFF` as out of range. There is no
 /// surrogate-pair joining, because these strings are UTF-8 and a code-unit escape
 /// would be a second encoding rule nobody asked for — write `"😀"` or `"\u{1F600}"`.
-fn decode_literal(raw: &str, line: u32) -> Result<Cow<'_, [u8]>, OmniError> {
+fn decode_literal(raw: &str, at: Pos) -> Result<Cow<'_, [u8]>, OmniError> {
     let bytes = raw.as_bytes();
     // Most literals contain no escape at all, and for those the decoded value
     // *is* the source text. Borrowing it skips both the allocation and the copy
@@ -1340,7 +1632,7 @@ fn decode_literal(raw: &str, line: u32) -> Result<Cow<'_, [u8]>, OmniError> {
             // cross-module assumption, checked instead of trusted.
             return Err(OmniError::new(
                 ErrorKind::Parse,
-                line,
+                at,
                 "a string literal ends with a backslash",
             ));
         };
@@ -1353,7 +1645,7 @@ fn decode_literal(raw: &str, line: u32) -> Result<Cow<'_, [u8]>, OmniError> {
             b'u' => {
                 // `end` is an index into `bytes`, so the caller lands on the first
                 // byte after the closing brace.
-                let (end, cp) = decode_unicode_escape(bytes, pos + 2, line)?;
+                let (end, cp) = decode_unicode_escape(bytes, pos + 2, at)?;
                 let mut buf = [0u8; 4];
                 out.extend_from_slice(cp.encode_utf8(&mut buf).as_bytes());
                 pos = end;
@@ -1365,7 +1657,7 @@ fn decode_literal(raw: &str, line: u32) -> Result<Cow<'_, [u8]>, OmniError> {
                 let shown = raw[pos + 1..].chars().next().unwrap_or(other as char);
                 return Err(OmniError::new(
                     ErrorKind::Parse,
-                    line,
+                    at,
                     format!("unknown escape '\\{shown}' in a string literal"),
                 ));
             }
@@ -1381,8 +1673,8 @@ fn decode_literal(raw: &str, line: u32) -> Result<Cow<'_, [u8]>, OmniError> {
 /// Only scalars are accepted: a surrogate or an over-large value is a parse error
 /// that quotes the digits it found, because "invalid unicode escape" tells a
 /// reader nothing they can act on.
-fn decode_unicode_escape(bytes: &[u8], pos: usize, line: u32) -> Result<(usize, char), OmniError> {
-    let parse_error = |message: String| OmniError::new(ErrorKind::Parse, line, message);
+fn decode_unicode_escape(bytes: &[u8], pos: usize, at: Pos) -> Result<(usize, char), OmniError> {
+    let parse_error = |message: String| OmniError::new(ErrorKind::Parse, at, message);
     if bytes.get(pos) != Some(&b'{') {
         return Err(parse_error(
             "expected '{' after '\\u' — the form is \\u{1F600}".to_string(),
@@ -1653,7 +1945,7 @@ mod tests {
     #[test]
     fn errors_render_with_a_line_prefix() {
         let e = Engine::new().exec("1 / 0").unwrap_err();
-        assert_eq!(e.to_string(), "line 1: division by zero");
+        assert_eq!(e.to_string(), "[Line 1, Col 3]: division by zero");
     }
 
     // -- strings --------------------------------------------------------------
@@ -1763,16 +2055,22 @@ mod tests {
         let e = Engine::new().exec(r#""hi" + 42"#).unwrap_err();
         assert_eq!(e.kind, ErrorKind::Runtime);
         assert_eq!(
-            e.message, r#"cannot add string to number: "hi" + 42"#,
+            e.message, r#"type mismatch: cannot add string to number: "hi" + 42"#,
             "the message the requester asked for, verbatim"
         );
         let e = Engine::new().exec(r#"42 + "hi""#).unwrap_err();
-        assert_eq!(e.message, r#"cannot add number to string: 42 + "hi""#);
+        assert_eq!(
+            e.message,
+            r#"type mismatch: cannot add number to string: 42 + "hi""#
+        );
         // A boolean operand reaches the same arm. `("a" == "b")` rather than a
         // `true` literal, because the grammar has no boolean literals yet — the
         // only booleans a program can write come out of a comparison.
         let e = Engine::new().exec(r#"("a" == "b") + "hi""#).unwrap_err();
-        assert_eq!(e.message, r#"cannot add boolean to string: false + "hi""#);
+        assert_eq!(
+            e.message,
+            r#"type mismatch: cannot add boolean to string: false + "hi""#
+        );
     }
 
     #[test]
@@ -1781,12 +2079,12 @@ mod tests {
         assert_eq!(e.kind, ErrorKind::Runtime);
         assert_eq!(
             e.message,
-            "'-' needs numbers on both sides (found string and string)"
+            "type mismatch: '-' needs numbers on both sides (found string and string)"
         );
         let e = Engine::new().exec(r#"6 / "b""#).unwrap_err();
         assert_eq!(
             e.message,
-            "'/' needs numbers on both sides (found number and string)"
+            "type mismatch: '/' needs numbers on both sides (found number and string)"
         );
     }
 
@@ -1798,8 +2096,12 @@ mod tests {
         // cursor at the same address every time and two identical boxes would then
         // compare equal by accident rather than by design.
         let mut e = Engine::new();
-        let one = e.new_string(b"ab", 1, ErrorKind::Runtime).unwrap();
-        let two = e.new_string(b"ab", 1, ErrorKind::Runtime).unwrap();
+        let one = e
+            .new_string(b"ab", Pos::new(1, 1), ErrorKind::Runtime)
+            .unwrap();
+        let two = e
+            .new_string(b"ab", Pos::new(1, 1), ErrorKind::Runtime)
+            .unwrap();
         assert_ne!(one, two, "the boxes are different allocations");
         assert!(e.eq_values(one, two), "and the language calls them equal");
         assert_eq!(e.exec(r#""ab" == "a" + "b""#).unwrap(), Value::TRUE);
@@ -2008,10 +2310,18 @@ mod tests {
             1024,
             "under the limit works"
         );
-        let at_the_limit = engine.new_string(&vec![b'x'; MAX_STRING_LEN], 1, ErrorKind::Runtime);
+        let at_the_limit = engine.new_string(
+            &vec![b'x'; MAX_STRING_LEN],
+            Pos::new(1, 1),
+            ErrorKind::Runtime,
+        );
         assert!(at_the_limit.is_ok(), "the limit is inclusive");
         let over = engine
-            .new_string(&vec![b'x'; MAX_STRING_LEN + 1], 1, ErrorKind::Runtime)
+            .new_string(
+                &vec![b'x'; MAX_STRING_LEN + 1],
+                Pos::new(1, 1),
+                ErrorKind::Runtime,
+            )
             .unwrap_err();
         assert_eq!(over.kind, ErrorKind::Runtime);
         assert!(over.message.contains("16 MiB"), "message was {over}");
@@ -2422,7 +2732,7 @@ mod tests {
             e.exec("pi(1)"),
             Err(OmniError::new(
                 ErrorKind::Runtime,
-                1,
+                Pos::new(1, 1),
                 "host function 'pi' takes 0 arguments, got 1",
             ))
         );
@@ -2500,7 +2810,7 @@ mod tests {
         assert_eq!(err.kind, ErrorKind::Runtime);
         assert_eq!(
             err.message,
-            "unknown function 'nope' (no host function is registered with that name)"
+            "unknown function 'nope' (no host function or builtin has that name)"
         );
     }
 
@@ -2620,5 +2930,140 @@ mod tests {
         e.define("square", num(7.0));
         assert_eq!(e.exec("square"), Ok(num(7.0)));
         assert_eq!(e.exec("square(4)"), Ok(num(16.0)));
+    }
+
+    // -- builtins -------------------------------------------------------------
+
+    #[test]
+    fn math_builtins_cover_the_standard_set() {
+        assert_eq!(ev("abs(-3)"), num(3.0));
+        assert_eq!(ev("abs(3)"), num(3.0));
+        assert_eq!(ev("min(2, 5)"), num(2.0));
+        assert_eq!(ev("max(2, 5)"), num(5.0));
+        assert_eq!(ev("clamp(12, 0, 10)"), num(10.0));
+        assert_eq!(ev("clamp(-1, 0, 10)"), num(0.0));
+        assert_eq!(ev("clamp(4, 0, 10)"), num(4.0));
+        assert_eq!(ev("floor(2.9)"), num(2.0));
+        assert_eq!(ev("ceil(2.1)"), num(3.0));
+        assert_eq!(ev("round(2.5)"), num(3.0));
+        assert_eq!(ev("round(-2.5)"), num(-3.0), "half away from zero");
+        // Results are ordinary numbers and compose with the rest of the grammar.
+        assert_eq!(ev("abs(-2) + max(1, 2) * floor(2.9)"), num(6.0));
+    }
+
+    #[test]
+    fn clamp_refuses_an_inverted_range() {
+        let e = Engine::new().exec("clamp(1, 10, 0)").unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Runtime);
+        assert_eq!((e.line, e.column), (1, 1), "the error points at the call");
+        assert!(e.message.contains("lower bound"), "message was {e}");
+    }
+
+    #[test]
+    fn string_builtins_cover_the_standard_set() {
+        assert_eq!(text("len(\"hello\")"), "5");
+        // Bytes, not characters: "é" is two bytes in UTF-8.
+        assert_eq!(text("len(\"héllo\")"), "6");
+        assert_eq!(text("trim(\"  padded\\t\\n\")"), "padded");
+        assert_eq!(text("upper(\"MiXeD\")"), "MIXED");
+        assert_eq!(text("lower(\"MiXeD\")"), "mixed");
+        // Case mapping is Unicode, so this expands rather than passing through.
+        assert_eq!(text("upper(\"straße\")"), "STRASSE");
+        // Helpers compose, and the inner result stays readable for the outer.
+        assert_eq!(text("upper(trim(\"  hi  \"))"), "HI");
+    }
+
+    #[test]
+    fn string_builtins_reuse_the_scratch_buffer() {
+        let mut e = Engine::new();
+        let warm = e.exec("upper(\"warm\")").unwrap();
+        assert_eq!(e.render(warm), "WARM");
+        let warmed = e.scratch.capacity();
+        for _ in 0..100 {
+            let value = e.exec("upper(\"again\")").unwrap();
+            assert_eq!(e.render(value), "AGAIN");
+        }
+        assert_eq!(e.scratch.capacity(), warmed, "no per-call growth");
+    }
+
+    #[test]
+    fn builtins_report_a_type_mismatch_at_the_call_site() {
+        let e = Engine::new().exec("abs(\"x\")").unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Runtime);
+        assert_eq!((e.line, e.column), (1, 1));
+        assert!(e.message.starts_with("type mismatch: abs() needs a number"));
+        let e = Engine::new().exec("trim(1)").unwrap_err();
+        assert!(
+            e.message
+                .starts_with("type mismatch: trim() needs a string")
+        );
+        let e = Engine::new().exec("len(1)").unwrap_err();
+        assert!(e.message.starts_with("type mismatch: len() needs a string"));
+    }
+
+    #[test]
+    fn a_builtin_arity_mismatch_names_the_builtin() {
+        let e = Engine::new().exec("abs(1, 2)").unwrap_err();
+        assert_eq!(e.message, "builtin 'abs' takes 1 argument, got 2");
+        let e = Engine::new().exec("min(1)").unwrap_err();
+        assert_eq!(e.message, "builtin 'min' takes 2 arguments, got 1");
+    }
+
+    #[test]
+    fn a_host_registration_shadows_a_builtin_of_the_same_name() {
+        let mut e = Engine::new();
+        e.register_host_fn("abs", 1, |_, _| HostOutcome::Number(99.0))
+            .unwrap();
+        assert_eq!(e.exec("abs(-1)"), Ok(num(99.0)));
+        assert!(e.unregister_host_fn("abs"));
+        assert_eq!(e.exec("abs(-1)"), Ok(num(1.0)));
+    }
+
+    // -- positions and the timer ---------------------------------------------
+
+    #[test]
+    fn a_runtime_error_points_at_the_operator_on_its_own_line() {
+        let e = Engine::new()
+            .exec("let a = 1\nlet b = \"x\" + 2")
+            .unwrap_err();
+        assert_eq!((e.line, e.column), (2, 13), "the '+' on the second line");
+        assert_eq!(
+            e.to_string(),
+            "[Line 2, Col 13]: type mismatch: cannot add string to number: \"x\" + 2"
+        );
+    }
+
+    #[test]
+    fn columns_count_bytes_so_multibyte_text_does_not_shift_the_operator() {
+        // `"é" + 1`: the quote, two bytes of é, the closing quote, a space, then
+        // the '+'. A character column would say 5; the lexer's byte column says 6.
+        let e = Engine::new().exec("\"é\" + 1").unwrap_err();
+        assert_eq!((e.line, e.column), (1, 6));
+    }
+
+    #[test]
+    fn a_lex_error_carries_the_position_the_lexer_reported() {
+        let e = Engine::new().exec("1\n\n@").unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Lex);
+        assert_eq!((e.line, e.column), (3, 1));
+        assert_eq!(e.to_string(), "[Line 3, Col 1]: unexpected character '@'");
+    }
+
+    #[test]
+    fn the_timer_saturates_instead_of_wrapping() {
+        assert_eq!(elapsed_micros(Duration::from_micros(0)), 0);
+        assert_eq!(elapsed_micros(Duration::from_micros(1_500)), 1_500);
+        assert_eq!(elapsed_micros(Duration::from_secs(100_000)), u32::MAX);
+    }
+
+    #[test]
+    fn stats_report_the_timer_of_the_most_recent_execution() {
+        let mut e = Engine::new();
+        assert_eq!(e.stats().last_exec_micros, 0, "nothing has run yet");
+        let src = format!("\"{}\"", "x".repeat(200_000));
+        e.exec(&src).unwrap();
+        let micros = e.stats().last_exec_micros;
+        assert!(micros > 0, "a 200 KB program takes measurable time");
+        assert_eq!(micros, e.last_exec_micros);
     }
 }
