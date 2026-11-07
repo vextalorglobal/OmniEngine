@@ -71,15 +71,21 @@ with omni.Engine() as engine:
     engine.run(r'"ab" == "a" + "b"').value          # True
     engine.string(r'"\u{1F600}" + " " + "omni"')    # '😀 omni'
     engine.eval_str("clamp(12, 0, 10) + min(1, 2) + max(3, 4)")  # 15
-    engine.eval_str('upper(trim("  omni  "))')       # 'OMNI'
+    engine.eval('upper(trim("  omni  "))')           # 'OMNI'
+    engine.eval('replace("a-b-a", "-", "+")')        # 'a+b+a'
+    engine.eval('slice("héllo", 1, 3)')              # 'él'
+    engine.eval('type_of(2)')                        # 'number'
     engine.eval_str('len("héllo")')                  # 6 (bytes)
 ```
 
 A `Result` carries `tag`, `number`, `text` and `value`. `eval_str` skips the
 wrapper and returns the language value as a native Python object: `int` for an
-integral finite number, otherwise `float`, `str`, `bool`, or `None`. Eleven
-builtins — `abs`, `min`, `max`, `clamp`, `floor`, `ceil`, `round`, `len`,
-`trim`, `upper`, `lower` — need no registration, and
+integral finite number, otherwise `float`, `str`, `bool`, or `None`. `eval` is
+the same unwrapping under the name the Node SDK uses. Neither produces a `list`
+or `dict`: ABI 4 has no collection type for a program to return. Seventeen
+builtins — `abs`, `min`, `max`, `clamp`, `floor`, `ceil`, `round`, `pow`,
+`sqrt`, `len`, `trim`, `upper`, `lower`, `contains`, `replace`, `slice`,
+`type_of` — need no registration, and
 `stats().last_exec_micros` reports the most recent execution in microseconds. `text` is the exact bytes
 of a string result — NUL bytes included, because OmniEngine strings are
 length-delimited rather than C strings — and `value` is the same bytes decoded as
@@ -264,7 +270,7 @@ the safety rule above; measure it with `engine.stats()` — or run
 ## Tests
 
 ```bash
-python sdks/python/tests/test_ffi.py        # 120 tests, stdlib unittest
+python sdks/python/tests/test_ffi.py        # 122 tests, stdlib unittest
 python sdks/python/bench.py                 # ns/call, gc/call, batch speed-up
 ```
 

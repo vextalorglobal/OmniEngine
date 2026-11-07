@@ -25,20 +25,20 @@ or Phase 3.
 | Deliverable | State | Evidence |
 | --- | --- | --- |
 | Phase 1 — workspace and build policy | done | `Cargo.toml`, `.cargo/config.toml`, `rust-toolchain.toml` |
-| Phase 2 — core engine | done | 164 `omni-core` tests |
-| Phase 3 — C ABI + header | done | 60 `omni-ffi` tests, PE export table, `examples/c/embed.c` |
+| Phase 2 — core engine | done | 176 `omni-core` tests |
+| Phase 3 — C ABI + header | done | 62 `omni-ffi` tests, PE export table, `examples/c/embed.c` |
 | Phase 4 — extension and Linguist | done (tier 1) | `.gitattributes`, `examples/*.omni` |
-| Phase 5 — SDKs and DX | done | 120 Python + 114 Node tests, CLI, wasm scaffold |
+| Phase 5 — SDKs and DX | done | 122 Python + 116 Node tests, CLI, wasm scaffold |
 | Strings, egress memory, ABI v2 | done | 4 new exports, `omni_str_copy` + `omni_define_string` + `omni_debug_stats` + `omni_abi_version` tested from all four hosts |
 | Host callbacks, re-entrancy, ABI v3 | done | `omni_register_host_fn` + `omni_unregister_host_fn` + `omni_host_fn_count`, a `RefCell` borrow guard on every entry point, and call syntax in the parser |
 | Batch execution, benchmarks, ABI v4 | done | `omni_exec_many` + `omni_batch_error`, checkpointed arena reclamation, three zero-dependency benchmark harnesses and `scripts/bench.sh` (§4.8, §4.9) |
 | Packaging, distribution, release | done | platform wheels with the engine inside, an npm tarball with five engines, `scripts/package.py`, `scripts/check-versions.py`, `.github/workflows/release.yml` (§6.7, `docs/RELEASING.md`) |
-| DevPack: builtins, positions, timer, sugar | done | 11 builtins, `[Line N, Col M]` errors, `last_exec_micros` in ABI-4 padding, `eval_str` / `eval` (§3.5, §4.4, §6.1–6.2) |
+| DevPack: builtins, positions, timer, sugar | done | 17 builtins, `[Line N, Col M]` errors, `last_exec_micros` in ABI-4 padding, `eval_str` / `eval` (§3.5, §4.4, §6.1–6.2) |
 | Auto-updater and CLI manager | done | `omni_check_update` in the C ABI, `omni update` / `omni check-update` / `omniup`, `omni.check_updates()` and `checkUpdates()`, `scripts/cli-binaries.py` + `scripts/make-manifest.py` (§6.4–6.5) |
-| Same answer from four hosts | done | `scripts/verify-all.sh` — 33 rows, all passing |
+| Same answer from four hosts | done | `scripts/verify-all.sh` — 34 rows, all passing |
 
 ```
-cargo test --workspace          # 269 tests
+cargo test --workspace          # 272 tests
 ./scripts/verify-all.sh         # Rust, C, Python, Node: 42, "hello, world", ABI 4
 ./scripts/bench.sh              # three hosts, one crossing each, measured
 python scripts/check-versions.py  # one version, one ABI across every surface
@@ -405,7 +405,7 @@ fallen into:
 
 ### 3.5 Builtins, positions, and the execution timer
 
-Eleven builtins are callable from any script with the same syntax a host
+Seventeen builtins are callable from any script with the same syntax a host
 function uses. A host registration with the same name wins, and arity is
 checked before the call is entered, so a builtin can never see a call it was
 not written for.
@@ -413,16 +413,31 @@ not written for.
 | Builtins | Arity | Semantics |
 | --- | --- | --- |
 | `abs`, `floor`, `ceil`, `round` | 1 | operate on `f64`; `round` is half away from zero |
+| `sqrt(x)` | 1 | `f64`; a negative argument is a runtime error, not `NaN` |
 | `min`, `max` | 2 | `f64` |
+| `pow(base, exp)` | 2 | `f64`; a result that is not finite is a runtime error, not `inf` |
 | `clamp(value, low, high)` | 3 | `f64`; `low > high` is a runtime error rather than a silent empty range |
 | `len(text)` | 1 | **byte** length of the UTF-8 payload, not a character count |
 | `trim`, `upper`, `lower` | 1 | Unicode-aware, so `upper("straße")` is `"STRASSE"` |
+| `contains(haystack, needle)` | 2 | boolean; the empty needle is in every string |
+| `replace(text, old, new)` | 3 | leftmost-first; an empty `old` is a no-op, not an insertion between characters |
+| `slice(text, start, end)` | 3 | **character** offsets, clamped to the string; an inverted range is empty |
+| `type_of(value)` | 1 | `"number"`, `"string"`, `"boolean"`, or `"null"` |
+
+`slice` deliberately counts characters while `len` counts bytes: a byte cut can
+land inside a multi-byte character and produce text no host can decode, so the
+cutting operation pays for a character walk and the measuring operation keeps
+reporting the storage a caller allocates for. `type_of` answers `"null"` only
+for a value a host callback produced, because the grammar has no `null` literal
+yet; there is no `"array"` or `"object"` because ABI 4 has no collection type.
 
 The string builtins reuse one scratch buffer on the engine, then copy the result
 into the egress block: a chain such as `upper(trim(s))` builds no temporary
-string per call. A `len` of `"héllo"` is 6, and that is deliberate — the
-language's only string unit so far is a byte slice, and a character count would
-have to be defined against grapheme clusters to be stable.
+string per call. The buffer is cleared before each use, so an editing builtin
+can never inherit the previous call's prefix. A `len` of `"héllo"` is 6, and
+that is deliberate — the language's only string unit so far is a byte slice, and
+a character count would have to be defined against grapheme clusters to be
+stable.
 
 Every error now carries a position: a 1-based line and a 1-based **byte**
 column, rendered as `[Line 2, Col 14]: message`. The column counts bytes because
@@ -431,8 +446,10 @@ operator at column 6 rather than pretending the `é` is one byte. Position
 selection is part of the contract: a binary operator error points at the
 operator, a builtin type or arity error points at the call name, an undefined
 variable points at the identifier, and an unexpected end of input points at the
-end of the source. The text is rendered by the engine, so the same bytes reach
-every host (one `verify-all.sh` row asserts it).
+end of the source. A wrong argument count names the call:
+`[Line 1, Col 1]: Mismatched arity in call 'clamp': takes 3 arguments, got 2`.
+The text is rendered by the engine, so the same bytes reach every host (one
+`verify-all.sh` row asserts it).
 
 `stats()` carries `last_exec_micros` (`lastExecMicros` in Node): the wall-clock
 time of the most recent `exec` or `exec_many` call in microseconds, saturating
@@ -1025,7 +1042,8 @@ with Engine() as engine:
     print(engine.run('greeting + "!"').value)             # hello wörld!
     print(engine.eval_str("let answer = 40 + 2"))          # 42, a Python int
     print(engine.eval_str('1 == 1'))                       # True
-    print(engine.eval_str('upper(trim("  hi  "))'))        # HI
+    print(engine.eval('upper(trim("  hi  "))'))            # HI
+    print(engine.eval('type_of(2)'))                       # number
     print(engine.stats().egress_bytes_reserved)            # 65536
     print(engine.stats().last_exec_micros > 0)             # True
 ```
@@ -1051,10 +1069,17 @@ entered.
 returns a `float` and raises `OmniError` on any non-number or failure;
 `eval_str` returns the language value as a native Python object — an integral
 finite number becomes `int`, everything else stays `float`, `str`, `bool`, or
-`None` — and raises only when the program itself fails; `string` returns a `str`
-and raises on any non-string; `try_run` returns `(status, result | None,
-message)` and never raises. `close()` is idempotent and `__del__` is guarded by
-an `atexit` hook, so an engine that outlives the script is not a use-after-free.
+`None` — and raises only when the program itself fails; `eval` is that same
+unwrapping under the name Node already used, so a program can be pasted between
+the two SDKs; `string` returns a `str` and raises on any non-string; `try_run`
+returns `(status, result | None, message)` and never raises. `close()` is
+idempotent and `__del__` is guarded by an `atexit` hook, so an engine that
+outlives the script is not a use-after-free.
+
+Neither `eval_str` nor `eval` produces a `list` or `dict`: ABI 4 has no
+collection type for a program to return, so converting one would be inventing a
+value the engine never made. When collections land, the conversion belongs in
+`Result.value`, which both names read.
 
 `eval_str` folds integral floats to `int` because the alternative hands a caller
 `42.0` for a value it will print, index, or compare as an integer. The fold only
@@ -1531,17 +1556,17 @@ Measured output on 2026-11-07, with the DevPack and updater increments in it:
 == OmniEngine cross-host verification ==
    workspace: /d/OmniEngine
 
-Rust tests... Shared library... omni-cli... C embedding... Python SDK... Node SDK... A string is the same bytes in every host... One type error, the same text everywhere... Every surface agrees on the ABI level... String results do not grow memory... A host function answers the same bytes in every host... A host failure is data, and says so identically... Re-entering the engine from a callback is refused, not crashed... The registry says the same thing from both sides... A batch answers the same items in every host... A failing item names itself identically in every host... A batch counts items, not crossings, and reserves nothing extra... A batch inside a host callback is refused, not crashed... The DevPack builtins answer the same in every host... A second-line error names line and byte column in every host... eval_str and eval hand back native values... The last execution timer crosses as microseconds...
+Rust tests... Shared library... omni-cli... C embedding... Python SDK... Node SDK... A string is the same bytes in every host... One type error, the same text everywhere... Every surface agrees on the ABI level... String results do not grow memory... A host function answers the same bytes in every host... A host failure is data, and says so identically... Re-entering the engine from a callback is refused, not crashed... The registry says the same thing from both sides... A batch answers the same items in every host... A failing item names itself identically in every host... A batch counts items, not crossings, and reserves nothing extra... A batch inside a host callback is refused, not crashed... The DevPack math, string and type builtins answer the same in every host... A second-line error names line and byte column in every host... eval_str and eval hand back native values... The last execution timer crosses as microseconds...
 == Results ==
-  PASS  cargo test --workspace (269 tests)
-  PASS  omni.dll (5.5M)
+  PASS  cargo test --workspace (272 tests)
+  PASS  omni.dll (5.8M)
   PASS  omni run examples/hello.omni -> 42
   PASS  omni run examples/strings.omni -> hello, world 😀
   PASS  examples/c/embed.c -> 42 via omni.h
   PASS  python ctypes -> 42.0
-  PASS  python SDK tests (120 tests)
+  PASS  python SDK tests (122 tests)
   PASS  node koffi -> 42
-  PASS  node SDK tests (ℹ tests 114 ℹ pass 114 ℹ fail 0 )
+  PASS  node SDK tests (ℹ tests 116 ℹ pass 116 ℹ fail 0 )
   PASS  concat + \u{...} identical in: cli python node
   PASS  the mixed-type message survives the boundary in: cli python node c
   PASS  ABI 4 declared and read identically: header=4 C=4 python=4/lib=4 node=4/lib=4
@@ -1554,10 +1579,10 @@ Rust tests... Shared library... omni-cli... C embedding... Python SDK... Node SD
   PASS  statuses 0 2 0 2 and the engine text for items 1 and 3, identically in: python node
   PASS  8000 items in 1000 crossings, execs +8000, reservation flat: python(0 B) node(0 B)
   PASS  a batch from a borrowed handle errors with the shared refusal text in: python node
-  PASS  math and string builtins reduce identically in: cli python node
+  PASS  math, string and type builtins reduce identically in: cli python node
   PASS  line 2, column 13, and the operator's message in: cli python node
   PASS  int/number, str/string, bool/boolean with no wrapper in: python node
-  PASS  one 200 KB execution timed, non-zero and in microseconds: python(914us) node(1054us)
+  PASS  one 200 KB execution timed, non-zero and in microseconds: python(857us) node(883us)
   PASS  omni --version -> omni 0.1.0 (language v1, ABI 4)
   PASS  omni check-update -> 0, omni 0.1.0 is up to date (ABI 4)
   PASS  omni check-update -> 10, omni 99.0.0 is available; this build is 0.1.0
@@ -1594,7 +1619,7 @@ values in both hosts, a failing item reports the same statuses and the same
 engine text, the counter proves 8,000 items in 1,000 crossings are 8,000
 executions with a flat reservation, and a batch from inside a callback meets the
 same refusal. The four DevPack rows cover the toolkit surface: a program built
-from the new math and string builtins reduces to the same value in the CLI,
+from the new math, string and type builtins reduces to the same value in the CLI,
 Python, and Node; a second-line error renders `[Line 2, Col 13]` and the same
 message in all three; `eval_str` and `eval` hand each host a native value rather
 than a wrapper; and a 200 KB program's measured execution time crosses as a
@@ -1613,7 +1638,7 @@ deleted. On Unix the same row asserts no backup is left.
 The script degrades to `SKIP` rather than lying. `cargo`, `gcc`, `python` and
 `node` each have their own guard, Node without `koffi` is skipped with
 `npm install koffi` in the reason, and each cross-host row skips itself when fewer
-than two hosts answered. Nothing was skipped on this machine — all thirty-three
+than two hosts answered. Nothing was skipped on this machine — all thirty-four
 rows ran. The Rust row runs the suite once into a log and reads its exit status;
 an earlier version piped cargo into `grep` under `pipefail`, which let a failing
 suite inherit a successful-looking pipeline and briefly hid a stale CLI test. `omni-wasm` has no row here because `wasm32-unknown-unknown` is not
@@ -1625,11 +1650,11 @@ Against the brief's five phases:
 
 | Phase | Asked for | Verified by |
 | --- | --- | --- |
-| 1 | Workspace on D:, fast compiles, managed `target/` | `cargo test --workspace` 269 tests; `target/` measured at 351 MB |
+| 1 | Workspace on D:, fast compiles, managed `target/` | `cargo test --workspace` 272 tests; `target/` measured at 351 MB |
 | 2 | Ultra-fast memory-safe core, no GC | NaN-boxed 8-byte `Value` asserted for size; arena reset is O(chunks); egress rewind keeps reservations flat over 100,000 executions; no collector exists to pause |
 | 3 | C ABI callable from Python and JavaScript | same `42` and the same `hello, world 😀` from Rust, C, Python, Node; 16 exports confirmed with `objdump -p`; `omni.h` compiles warning-free under `-Wall -Wextra` |
 | 4 | A custom extension GitHub recognises | `.gitattributes` tier 1; the tier-2 limit is stated in section 5.3 rather than glossed over |
-| 5 | `pip`/`npm` SDKs that do not move the language stats | 120 + 114 SDK tests; `linguist-vendored` on `sdks/**`; release packages carry a CI-built engine, checkouts carry none |
+| 5 | `pip`/`npm` SDKs that do not move the language stats | 122 + 116 SDK tests; `linguist-vendored` on `sdks/**`; release packages carry a CI-built engine, checkouts carry none |
 
 Test totals: **173** in `omni-core`, **62** in `omni-ffi` (21 unit, 13 in
 `tests/batch.rs`, 20 in `tests/ffi_contract.rs`, and 8 in
@@ -1796,8 +1821,8 @@ harnesses (4.9) turned every performance claim in this file into a quoted run.
 A fourth round packaged what existed: wheels and an npm tarball that carry the
 engine, a C archive per target, one tag-driven workflow, and a quickstart that
 fits in a minute. Nothing in that round changed the language or the ABI. A fifth
-round added the developer toolkit without moving the ABI either: eleven math and
-string builtins, errors that point at a line and byte column in every host, an
+round added the developer toolkit without moving the ABI either: seventeen
+math, string and type builtins, errors that point at a line and byte column in every host, an
 execution timer in four bytes that were already padding, and native-value sugar
 (`eval_str` / `eval`) in both SDKs. The next language increment is still the one
 section 3.7 lists — control flow, collections, and user-defined functions.

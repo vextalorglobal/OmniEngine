@@ -1093,6 +1093,8 @@ class Builtins(unittest.TestCase):
         self.assertEqual(e.evaluate("ceil(2.1)"), 3.0)
         self.assertEqual(e.evaluate("round(2.5)"), 3.0)
         self.assertEqual(e.evaluate("-round(-2.5)"), 3.0)
+        self.assertEqual(e.evaluate("pow(2, 10)"), 1024.0)
+        self.assertEqual(e.evaluate("sqrt(16)"), 4.0)
 
     def test_string_builtins(self) -> None:
         e = self.engine
@@ -1102,6 +1104,22 @@ class Builtins(unittest.TestCase):
         self.assertEqual(e.string(r'upper("stra\u{00DF}e")'), "STRASSE")
         self.assertEqual(e.evaluate(r'len("h\u{00E9}llo")'), 6.0, "é is two bytes")
         self.assertEqual(e.string(r'upper(trim("  hi  "))'), "HI")
+        self.assertIs(e.eval('contains("omni engine", "engine")'), True)
+        self.assertIs(e.eval('contains("omni", "zz")'), False)
+        self.assertEqual(e.string('replace("a-b-a", "-", "+")'), "a+b+a")
+        self.assertEqual(e.string('replace("abc", "", "x")'), "abc")
+        # Character offsets, so a multi-byte character is never cut in half.
+        self.assertEqual(e.string(r'slice("h\u{00E9}llo", 1, 3)'), "\u00e9l")
+        self.assertEqual(e.string('slice("hello", 2, 99)'), "llo")
+        self.assertEqual(e.string('slice("hello", 3, 1)'), "")
+
+    def test_type_of_names_number_string_boolean_and_null(self) -> None:
+        e = self.engine
+        self.assertEqual(e.eval("type_of(2)"), "number")
+        self.assertEqual(e.eval('type_of("x")'), "string")
+        self.assertEqual(e.eval("type_of(1 == 1)"), "boolean")
+        e.register_function("nothing", lambda: None, arity=0)
+        self.assertEqual(e.eval("type_of(nothing())"), "null")
 
     def test_a_wrong_type_names_the_builtin_and_the_location(self) -> None:
         with self.assertRaises(omni.OmniError) as caught:
@@ -1114,12 +1132,12 @@ class Builtins(unittest.TestCase):
             caught.exception.message,
         )
 
-    def test_a_wrong_arity_names_the_builtin(self) -> None:
+    def test_a_wrong_arity_names_the_call(self) -> None:
         with self.assertRaises(omni.OmniError) as caught:
             self.engine.run("min(1)")
         self.assertEqual(
             caught.exception.message,
-            "[Line 1, Col 1]: builtin 'min' takes 2 arguments, got 1",
+            "[Line 1, Col 1]: Mismatched arity in call 'min': takes 2 arguments, got 1",
         )
 
     def test_clamp_refuses_an_inverted_range(self) -> None:
@@ -1155,6 +1173,14 @@ class EvalStr(unittest.TestCase):
         self.assertEqual(self.engine.eval_str('"a" + "b"'), "ab")
         self.assertIs(self.engine.eval_str("1 == 1"), True)
         self.assertIsNone(self.engine.eval_str(""))
+
+    def test_eval_is_the_same_unwrapping_under_the_node_name(self) -> None:
+        result = self.engine.eval("40 + 2")
+        self.assertIsInstance(result, int)
+        self.assertEqual(result, 42)
+        self.assertEqual(self.engine.eval('"hi"'), "hi")
+        self.assertIs(self.engine.eval("1 == 1"), True)
+        self.assertIsNone(self.engine.eval(""))
 
     def test_an_error_still_raises(self) -> None:
         with self.assertRaises(omni.OmniError):

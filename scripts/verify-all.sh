@@ -46,10 +46,10 @@ DIAG_PROGRAM=$'let a = 1\nlet b = "x" + 2'
 DIAG_WANT='[Line 2, Col 13]: type mismatch: cannot add string to number: "x" + 2'
 # DevPack builtins. Kept as two programs so one row can fail on strings alone
 # and the other on numbers alone instead of blaming a single fused answer.
-STR_BUILTIN_PROGRAM='upper(trim("  abc  "))'
-STR_BUILTIN_WANT='ABC'
-NUM_BUILTIN_PROGRAM='clamp(12, 0, 10) + min(1, 2) + max(3, 4) + floor(2.9) + ceil(2.1) + round(2.5) + abs(0 - 7)'
-NUM_BUILTIN_WANT='30'
+STR_BUILTIN_PROGRAM='replace(slice("  abcdef  ", 2, 5), "c", "C") + "/" + type_of(1 == 1) + "/" + type_of("x") + "/" + type_of(contains("abc", "b"))'
+STR_BUILTIN_WANT='abC/boolean/string/boolean'
+NUM_BUILTIN_PROGRAM='clamp(12, 0, 10) + min(1, 2) + max(3, 4) + floor(2.9) + ceil(2.1) + round(2.5) + abs(0 - 7) + pow(2, 10) + sqrt(16)'
+NUM_BUILTIN_WANT='1058'
 # examples/strings.omni ends with a space before the escape, so its answer is
 # not the same bytes as CROSS_WANT. Checked against its own expectation.
 STRINGS_WANT=$(printf 'hello, world \xF0\x9F\x98\x80')
@@ -725,7 +725,7 @@ fi
 # line/column text in every host, and that the two SDKs hand back values a host
 # can use without unwrapping anything.
 
-printf 'The DevPack builtins answer the same in every host... '
+printf 'The DevPack math, string and type builtins answer the same in every host... '
 builtin_hosts=''
 builtin_wrong=''
 if have cargo; then
@@ -759,7 +759,7 @@ fi
 if [[ -n "$builtin_wrong" ]]; then
   fail "the builtin answers differ:$builtin_wrong"
 elif [[ -n "$builtin_hosts" ]]; then
-  pass "math and string builtins reduce identically in:$builtin_hosts"
+  pass "math, string and type builtins reduce identically in:$builtin_hosts"
 else
   skip "builtin answers" "no host available"
 fi

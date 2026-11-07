@@ -1048,16 +1048,11 @@ impl Engine {
         self.call_depth -= 1;
         let args = outcome?;
         if args.len() != arity {
-            let what = if host.is_some() {
-                "host function"
-            } else {
-                "builtin"
-            };
             return Err(OmniError::new(
                 ErrorKind::Runtime,
                 at,
                 format!(
-                    "{what} '{name}' takes {arity} argument{}, got {}",
+                    "Mismatched arity in call '{name}': takes {arity} argument{}, got {}",
                     if arity == 1 { "" } else { "s" },
                     args.len()
                 ),
@@ -1177,6 +1172,34 @@ impl Engine {
             Builtin::Floor => Ok(Value::from_f64(self.number_arg(name, args, 0, at)?.floor())),
             Builtin::Ceil => Ok(Value::from_f64(self.number_arg(name, args, 0, at)?.ceil())),
             Builtin::Round => Ok(Value::from_f64(self.number_arg(name, args, 0, at)?.round())),
+            Builtin::Pow => {
+                let base = self.number_arg(name, args, 0, at)?;
+                let exponent = self.number_arg(name, args, 1, at)?;
+                let n = base.powf(exponent);
+                // The engine rejects the infinities it can name (division by
+                // zero) rather than passing them off as answers. `pow` is the
+                // one builtin that can reach an infinity from finite inputs,
+                // so it is the one that has to say so.
+                if !n.is_finite() {
+                    return Err(OmniError::new(
+                        ErrorKind::Runtime,
+                        at,
+                        format!("{name}() has no finite result for {base} and {exponent}"),
+                    ));
+                }
+                Ok(Value::from_f64(n))
+            }
+            Builtin::Sqrt => {
+                let x = self.number_arg(name, args, 0, at)?;
+                if x < 0.0 {
+                    return Err(OmniError::new(
+                        ErrorKind::Runtime,
+                        at,
+                        format!("{name}() needs a number that is not negative (got {x})"),
+                    ));
+                }
+                Ok(Value::from_f64(x.sqrt()))
+            }
             Builtin::Min => {
                 let a = self.number_arg(name, args, 0, at)?;
                 let b = self.number_arg(name, args, 1, at)?;
@@ -1224,7 +1247,93 @@ impl Engine {
                     }
                 }
             }),
+            Builtin::Contains => {
+                let haystack = self.string_arg(name, args, 0, at)?;
+                let needle = self.string_arg(name, args, 1, at)?;
+                let found = needle.is_empty() || find_bytes(haystack, needle).is_some();
+                Ok(Value::bool(found))
+            }
+            Builtin::Replace => {
+                let mut buf = std::mem::take(&mut self.scratch);
+                let result = (|| {
+                    let haystack = self.string_arg(name, args, 0, at)?;
+                    let old = self.string_arg(name, args, 1, at)?;
+                    let new = self.string_arg(name, args, 2, at)?;
+                    buf.clear();
+                    if old.is_empty() {
+                        // Inserting between every character is a footgun with
+                        // no common production use; an empty needle leaves the
+                        // text alone instead of multiplying it.
+                        buf.extend_from_slice(haystack);
+                    } else {
+                        let mut rest = haystack;
+                        while let Some(index) = find_bytes(rest, old) {
+                            buf.extend_from_slice(&rest[..index]);
+                            buf.extend_from_slice(new);
+                            rest = &rest[index + old.len()..];
+                        }
+                        buf.extend_from_slice(rest);
+                    }
+                    self.new_string(&buf, at, ErrorKind::Runtime)
+                })();
+                self.scratch = buf;
+                result
+            }
+            Builtin::Slice => {
+                let mut buf = std::mem::take(&mut self.scratch);
+                let result = (|| {
+                    let bytes = self.string_arg(name, args, 0, at)?;
+                    buf.clear();
+                    let text = std::str::from_utf8(bytes).map_err(|_| {
+                        OmniError::new(
+                            ErrorKind::Runtime,
+                            at,
+                            format!("type mismatch: {name}() needs a UTF-8 string"),
+                        )
+                    })?;
+                    // Character offsets, not byte offsets: a byte cut can land
+                    // inside a multi-byte character and produce a string no
+                    // host can decode. `len()` still reports bytes, because
+                    // that is the storage a caller allocates for.
+                    let chars = text.chars().count();
+                    let start = self.count_arg(name, args, 1, at)?.min(chars);
+                    let end = self.count_arg(name, args, 2, at)?.min(chars).max(start);
+                    let begin = char_offset(text, start);
+                    let stop = char_offset(text, end);
+                    buf.extend_from_slice(&text.as_bytes()[begin..stop]);
+                    self.new_string(&buf, at, ErrorKind::Runtime)
+                })();
+                self.scratch = buf;
+                result
+            }
+            Builtin::TypeOf => {
+                Ok(self.new_string(kind_of(args[0]).as_bytes(), at, ErrorKind::Runtime)?)
+            }
         }
+    }
+
+    /// One argument as a character offset: finite, truncated, and clamped at
+    /// zero. A negative or absurd index gets a defined answer (the start or the
+    /// end) rather than an error, because that is how the range reads.
+    fn count_arg(
+        &self,
+        name: &str,
+        args: &[Value],
+        index: usize,
+        at: Pos,
+    ) -> Result<usize, OmniError> {
+        let n = self.number_arg(name, args, index, at)?;
+        if !n.is_finite() {
+            return Err(OmniError::new(
+                ErrorKind::Runtime,
+                at,
+                format!("{name}() needs a finite index for argument {}", index + 1),
+            ));
+        }
+        if n <= 0.0 {
+            return Ok(0);
+        }
+        Ok(n.trunc() as usize)
     }
 
     /// One argument as a number, or the message a type mismatch deserves.
@@ -1533,10 +1642,16 @@ enum Builtin {
     Floor,
     Ceil,
     Round,
+    Pow,
+    Sqrt,
     Len,
     Trim,
     Upper,
     Lower,
+    Contains,
+    Replace,
+    Slice,
+    TypeOf,
 }
 
 /// The builtin a call name means, and how many arguments it takes.
@@ -1553,10 +1668,16 @@ fn builtin_for(name: &str) -> Option<(Builtin, usize)> {
         "floor" => (Builtin::Floor, 1),
         "ceil" => (Builtin::Ceil, 1),
         "round" => (Builtin::Round, 1),
+        "pow" => (Builtin::Pow, 2),
+        "sqrt" => (Builtin::Sqrt, 1),
         "len" => (Builtin::Len, 1),
         "trim" => (Builtin::Trim, 1),
         "upper" => (Builtin::Upper, 1),
         "lower" => (Builtin::Lower, 1),
+        "contains" => (Builtin::Contains, 2),
+        "replace" => (Builtin::Replace, 3),
+        "slice" => (Builtin::Slice, 3),
+        "type_of" => (Builtin::TypeOf, 1),
         _ => return None,
     })
 }
@@ -1565,6 +1686,23 @@ fn builtin_for(name: &str) -> Option<(Builtin, usize)> {
 fn push_char(out: &mut Vec<u8>, ch: char) {
     let mut tmp = [0u8; 4];
     out.extend_from_slice(ch.encode_utf8(&mut tmp).as_bytes());
+}
+
+/// The byte offset of the first occurrence of `needle` in `haystack`.
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// The byte offset of the `index`-th character, or the end of the text.
+fn char_offset(text: &str, index: usize) -> usize {
+    text.char_indices()
+        .nth(index)
+        .map_or(text.len(), |(offset, _)| offset)
 }
 
 /// The name a type error uses for one value's kind. Written on `Value`'s tags
@@ -2733,7 +2871,7 @@ mod tests {
             Err(OmniError::new(
                 ErrorKind::Runtime,
                 Pos::new(1, 1),
-                "host function 'pi' takes 0 arguments, got 1",
+                "Mismatched arity in call 'pi': takes 0 arguments, got 1",
             ))
         );
         let src = format!(
@@ -2798,7 +2936,7 @@ mod tests {
         assert_eq!(err.kind, ErrorKind::Runtime);
         assert_eq!(
             err.message,
-            "host function 'square' takes 1 argument, got 2"
+            "Mismatched arity in call 'square': takes 1 argument, got 2"
         );
         assert_eq!(err.line, 1);
     }
@@ -2947,8 +3085,23 @@ mod tests {
         assert_eq!(ev("ceil(2.1)"), num(3.0));
         assert_eq!(ev("round(2.5)"), num(3.0));
         assert_eq!(ev("round(-2.5)"), num(-3.0), "half away from zero");
+        assert_eq!(ev("pow(2, 10)"), num(1024.0));
+        assert_eq!(ev("pow(9, 0.5)"), num(3.0));
+        assert_eq!(ev("sqrt(16)"), num(4.0));
+        assert_eq!(ev("round(sqrt(2) * sqrt(2))"), num(2.0));
         // Results are ordinary numbers and compose with the rest of the grammar.
         assert_eq!(ev("abs(-2) + max(1, 2) * floor(2.9)"), num(6.0));
+    }
+
+    #[test]
+    fn sqrt_refuses_a_negative_and_pow_refuses_an_infinity() {
+        let e = Engine::new().exec("sqrt(0 - 1)").unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Runtime);
+        assert_eq!((e.line, e.column), (1, 1), "the error points at the call");
+        assert!(e.message.contains("not negative"), "{e}");
+
+        let e = Engine::new().exec("pow(10, 400)").unwrap_err();
+        assert!(e.message.contains("no finite result"), "{e}");
     }
 
     #[test]
@@ -2971,6 +3124,57 @@ mod tests {
         assert_eq!(text("upper(\"straße\")"), "STRASSE");
         // Helpers compose, and the inner result stays readable for the outer.
         assert_eq!(text("upper(trim(\"  hi  \"))"), "HI");
+    }
+
+    #[test]
+    fn lookup_and_editing_builtins_work_on_bytes_not_surprises() {
+        assert_eq!(ev("contains(\"omni engine\", \"engine\")"), Value::TRUE);
+        assert_eq!(ev("contains(\"omni\", \"zz\")"), Value::FALSE);
+        // The empty needle is contained in every string, including an empty one.
+        assert_eq!(ev("contains(\"\", \"\")"), Value::TRUE);
+        assert_eq!(text("replace(\"a-b-a\", \"-\", \"+\")"), "a+b+a");
+        assert_eq!(
+            text("replace(\"aaa\", \"aa\", \"b\")"),
+            "ba",
+            "left to right"
+        );
+        assert_eq!(text("replace(\"abc\", \"z\", \"y\")"), "abc");
+        // An empty needle is a no-op rather than an insertion everywhere.
+        assert_eq!(text("replace(\"abc\", \"\", \"x\")"), "abc");
+        // Character offsets: "héllo" sliced at 1..3 is "él", not half of "é".
+        assert_eq!(text("slice(\"héllo\", 1, 3)"), "él");
+        assert_eq!(text("slice(\"hello\", 0, 2)"), "he");
+        assert_eq!(text("slice(\"hello\", 2, 99)"), "llo", "clamped to the end");
+        assert_eq!(
+            text("slice(\"hello\", 3, 1)"),
+            "",
+            "an inverted range is empty"
+        );
+        assert_eq!(
+            text("slice(\"hello\", 0 - 4, 2)"),
+            "he",
+            "a negative start clamps"
+        );
+
+        // One engine, two calls: the scratch buffer the edit builtins share must
+        // not carry the previous answer into the next prefix.
+        let mut e = Engine::new();
+        let replaced = e.exec("replace(\"abc\", \"\", \"x\")").unwrap();
+        assert_eq!(e.render(replaced), "abc");
+        let sliced = e.exec("slice(\"héllo\", 1, 3)").unwrap();
+        assert_eq!(e.render(sliced), "él");
+    }
+
+    #[test]
+    fn type_of_names_every_kind_the_language_can_carry() {
+        assert_eq!(text("type_of(2)"), "number");
+        assert_eq!(text("type_of(\"x\")"), "string");
+        assert_eq!(text("type_of(1 == 1)"), "boolean");
+        // No literal exists for nil yet, so the host is the way to get one.
+        let mut e = Engine::new();
+        e.register_host_fn("nothing", 0, nil_call).unwrap();
+        let value = e.exec("type_of(nothing())").unwrap();
+        assert_eq!(e.render(value), "null");
     }
 
     #[test]
@@ -3002,11 +3206,18 @@ mod tests {
     }
 
     #[test]
-    fn a_builtin_arity_mismatch_names_the_builtin() {
+    fn a_builtin_arity_mismatch_names_the_call() {
         let e = Engine::new().exec("abs(1, 2)").unwrap_err();
-        assert_eq!(e.message, "builtin 'abs' takes 1 argument, got 2");
+        assert_eq!(
+            e.message,
+            "Mismatched arity in call 'abs': takes 1 argument, got 2"
+        );
+        assert_eq!((e.line, e.column), (1, 1), "the error points at the call");
         let e = Engine::new().exec("min(1)").unwrap_err();
-        assert_eq!(e.message, "builtin 'min' takes 2 arguments, got 1");
+        assert_eq!(
+            e.message,
+            "Mismatched arity in call 'min': takes 2 arguments, got 1"
+        );
     }
 
     #[test]

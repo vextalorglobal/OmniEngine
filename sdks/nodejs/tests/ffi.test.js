@@ -1131,6 +1131,10 @@ test('math builtins answer with numbers', () => {
     assert.equal(engine.evaluate('ceil(2.1)'), 3);
     assert.equal(engine.evaluate('round(2.5)'), 3);
     assert.equal(engine.evaluate('-round(-2.5)'), 3, 'half away from zero');
+    assert.equal(engine.evaluate('pow(2, 10)'), 1024);
+    assert.equal(engine.evaluate('pow(9, 0.5)'), 3);
+    assert.equal(engine.evaluate('sqrt(16)'), 4);
+    assert.equal(engine.evaluate('round(sqrt(2) * sqrt(2))'), 2);
   } finally {
     engine.close();
   }
@@ -1150,6 +1154,37 @@ test('string builtins answer with strings and count bytes', () => {
   }
 });
 
+test('lookup and editing builtins work on bytes, not surprises', () => {
+  const engine = new Engine();
+  try {
+    assert.equal(engine.eval('contains("omni engine", "engine")'), true);
+    assert.equal(engine.eval('contains("omni engine", "rust")'), false);
+    assert.equal(engine.eval('contains("anything", "")'), true, 'empty needle');
+    assert.equal(engine.string('replace("a-b-a", "-", "+")'), 'a+b+a', 'leftmost first');
+    assert.equal(engine.string('replace("abc", "z", "y")'), 'abc', 'no match is a copy');
+    assert.equal(engine.string('replace("abc", "", "-")'), 'abc', 'empty old matches nowhere');
+    assert.equal(engine.string('slice("h\u{00E9}llo", 1, 3)'), '\u00E9l', 'character offsets');
+    assert.equal(engine.string('slice("hello", 2, 99)'), 'llo', 'end clamps');
+    assert.equal(engine.string('slice("hello", 3, 1)'), '', 'inverted range is empty');
+    assert.equal(engine.string('slice("hello", 0 - 5, 2)'), 'he', 'start clamps at zero');
+  } finally {
+    engine.close();
+  }
+});
+
+test('type_of names every kind the language can carry', () => {
+  const engine = new Engine();
+  try {
+    assert.equal(engine.string('type_of(1)'), 'number');
+    assert.equal(engine.string('type_of("x")'), 'string');
+    assert.equal(engine.string('type_of(1 == 1)'), 'boolean');
+    engine.registerFunction('nothing', () => null, { arity: 0 });
+    assert.equal(engine.string('type_of(nothing())'), 'null');
+  } finally {
+    engine.close();
+  }
+});
+
 test('a builtin type or arity error names the builtin and its location', () => {
   const engine = new Engine();
   try {
@@ -1161,11 +1196,22 @@ test('a builtin type or arity error names the builtin and its location', () => {
     );
     assert.throws(
       () => engine.run('abs(1, 2)'),
-      (err) => err.message.includes("builtin 'abs' takes 1 argument, got 2")
+      (err) =>
+        err.message.startsWith(
+          "[Line 1, Col 1]: Mismatched arity in call 'abs': takes 1 argument, got 2"
+        )
     );
     assert.throws(
       () => engine.run('clamp(1, 10, 0)'),
       (err) => err.message.includes('lower bound')
+    );
+    assert.throws(
+      () => engine.evaluate('sqrt(0 - 1)'),
+      (err) => err.message.includes('not negative')
+    );
+    assert.throws(
+      () => engine.evaluate('pow(10, 400)'),
+      (err) => err.message.includes('no finite result')
     );
   } finally {
     engine.close();
@@ -1195,6 +1241,8 @@ test('eval returns native JavaScript values', () => {
     assert.equal(typeof engine.eval('"a" + "b"'), 'string');
     assert.equal(engine.eval('1 == 1'), true);
     assert.equal(typeof engine.eval('1 == 1'), 'boolean');
+    assert.equal(engine.eval('type_of(1 == 1)'), 'boolean');
+    assert.equal(engine.eval('pow(2, 10)'), 1024);
     assert.equal(engine.eval(''), null, 'an empty program is undef, which is null here');
   } finally {
     engine.close();

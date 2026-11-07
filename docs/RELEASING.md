@@ -9,7 +9,7 @@ it. The short version:
 
 ```bash
 python scripts/check-versions.py          # one version, one ABI
-./scripts/verify-all.sh                   # 269 Rust, 120 Python, 114 Node checks
+./scripts/verify-all.sh                   # 272 Rust, 122 Python, 116 Node checks
 ./scripts/bench.sh                        # measured numbers, not regressions
 git tag v0.1.0 && git push origin v0.1.0  # the only release action
 ```
@@ -136,7 +136,7 @@ git push origin v0.1.0
 The tag push runs the workflow. Jobs, in order:
 
 1. **guard** — versions and ABI agree, tag matches the manifests.
-2. **verify** — fmt, clippy, 269 Rust tests, both SDK suites.
+2. **verify** — fmt, clippy, 272 Rust tests, both SDK suites.
 3. **native** — five platforms, in parallel; each archive is smoke-tested with
    `omni run examples/hello.omni` before upload, and the same job stages that
    platform's `omni` and `omniup` with their checksums.

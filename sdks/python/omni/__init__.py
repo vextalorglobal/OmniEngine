@@ -571,6 +571,21 @@ class Engine:
             return int(value)
         return value
 
+    def eval(self, source: str) -> object:
+        """Evaluate ``source`` and return plain Python data. Alias of :meth:`eval_str`.
+
+        Same rules, and the name Node already uses, so a program written against
+        one SDK reads the same against the other: an integral number is an
+        ``int``, everything else stays ``float``, and strings and booleans come
+        back as ``str`` and ``bool``.
+
+        ``list`` and ``dict`` are not in that list because ABI 4 has no collection
+        type for a program to produce yet; there is nothing to unwrap into them.
+        When the language grows one, the conversion belongs in
+        :attr:`Result.value`, which this method and ``eval_str`` both read.
+        """
+        return self.eval_str(source)
+
     def try_run(self, source: str) -> tuple[int, Result | None, str]:
         """Evaluate without exceptions: ``(status, result, message)``.
 

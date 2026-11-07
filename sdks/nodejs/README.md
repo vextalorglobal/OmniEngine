@@ -83,14 +83,16 @@ engine.run('"ab" == "a" + "b"').value;            // true
 engine.string('"a" + "\\n" + "b"');               // 'a\nb'
 engine.eval('clamp(12, 0, 10) + min(1, 2) + max(3, 4)');  // 15
 engine.eval('upper(trim("  omni  "))');           // 'OMNI'
+engine.eval('pow(2, 10) + sqrt(16)');             // 1028
+engine.eval('contains("omni engine", "engine")'); // true
 engine.eval('len("héllo")');                      // 6 (bytes)
 ```
 
 A `Result` is `{ tag, number, text, value }`. `eval` skips the wrapper and
 returns the language value as a native JS primitive: `number`, `string`,
-`boolean`, or `null` for an empty program. Eleven builtins — `abs`, `min`,
-`max`, `clamp`, `floor`, `ceil`, `round`, `len`, `trim`, `upper`, `lower` — need
-no registration, and `stats().lastExecMicros` reports the most recent execution
+`boolean`, or `null` for an empty program. Seventeen builtins — `abs`, `min`,
+`max`, `clamp`, `floor`, `ceil`, `round`, `pow`, `sqrt`, `len`, `trim`, `upper`,
+`lower`, `contains`, `replace`, `slice`, `type_of` — need no registration, and `stats().lastExecMicros` reports the most recent execution
 in microseconds. `text` is a `Buffer` with the
 exact bytes of a string result — NULs included, because OmniEngine strings are
 length-delimited rather than C strings — and `value` is those bytes decoded as
@@ -305,7 +307,7 @@ rule above. Measure it with `engine.stats()` before optimising around it.
 ```bash
 cd sdks/nodejs
 npm install koffi
-npm test                                   # 114 tests, node:test
+npm test                                   # 116 tests, node:test
 node bench.js                              # measured numbers for this machine
 ```
 

@@ -27,12 +27,19 @@ mutable reference. `omni_exec_many` / `run_many` / `runMany` carries up to 4,096
 programs in one crossing; a failing item reports its own status and text without
 stopping the rest.
 
-**A standard toolkit.** Eleven builtins need no host registration — `abs`,
-`min`, `max`, `clamp`, `floor`, `ceil`, `round`, `len`, `trim`, `upper`,
-`lower`. A runtime error names its position as `[Line 2, Col 13]` with a byte
-column that reads identically in every host, `last_exec_micros` carries the most
-recent execution time through bytes that were already padding, and `eval_str` /
-`eval` hand back native platform values instead of a wrapper.
+**A standard toolkit.** Seventeen builtins need no host registration. Math:
+`abs`, `min`, `max`, `clamp`, `floor`, `ceil`, `round`, `pow`, `sqrt`. Text:
+`len`, `trim`, `upper`, `lower`, `contains`, `replace`, `slice`. Inspection:
+`type_of`. `slice` takes character offsets so it cannot cut a UTF-8 character in
+half, while `len` still counts bytes; `sqrt` of a negative and a `pow` that
+overflows fail loudly instead of returning `NaN` or infinity. A runtime error
+names its position as `[Line 2, Col 13]` with a byte column that reads
+identically in every host, a wrong argument count says
+`[Line 1, Col 1]: Mismatched arity in call 'clamp': takes 3 arguments, got 2`,
+`last_exec_micros` carries the most recent execution time in microseconds
+through bytes that were already padding, and `eval_str` / `eval` hand back
+native platform values instead of a wrapper. Neither SDK unwraps into a list or
+a dictionary, because ABI 4 has no collection type for a program to produce.
 
 **Staying current.** `omni update` reads a release manifest over HTTPS, verifies
 the SHA-256 it names, and replaces the binary by rename, restoring the old file
@@ -42,8 +49,8 @@ Both SDKs can report the same answer (`omni.check_updates()`,
 in the engine's `omni_check_update` export so every surface agrees on what
 "newer" means. Plain HTTP is refused by default.
 
-**Quality.** 33 of 33 cross-host verification rows pass on this machine: 269 Rust
-tests, 120 Python, 114 Node, plus the C embedding example. `cargo fmt --check` and
+**Quality.** 34 of 34 cross-host verification rows pass on this machine: 272 Rust
+tests, 122 Python, 116 Node, plus the C embedding example. `cargo fmt --check` and
 `cargo clippy -- -D warnings` are clean.
 
 **Packaging.** A platform wheel carries the engine in `omni/_native/`; the npm

@@ -91,7 +91,7 @@ omni run examples/hello.omni                        # -> 42
 
 ```bash
 # Rust
-cargo test --workspace                                  # 269 tests
+cargo test --workspace                                  # 272 tests
 cargo run -p omni-cli -- eval '"omni" + " " + "engine"'  # -> omni engine
 cargo run --release -p omni-core --example bench         # the engine, measured
 
@@ -125,21 +125,25 @@ identically in Python and Node, that a batch crossing answers, fails, counts,
 and refuses identically in both, and that the updater refuses a wrong checksum,
 does not fetch during a dry run, and replaces a binary only with verified bytes.
 It also checks the DevPack surface across hosts:
-the math and string builtins, a second-line error rendered as
+the math, string and type builtins, a second-line error rendered as
 `[Line 2, Col 13]`, `eval_str` / `eval` returning native values, and a non-zero
 `last_exec_micros`. Tools that are missing are reported as `SKIP`, not as a pass.
 
 ## The standard toolkit
 
-Eleven builtins need no host registration: `abs`, `min`, `max`, `clamp`,
-`floor`, `ceil`, `round`, `len`, `trim`, `upper`, `lower`.
+Seventeen builtins need no host registration. Math: `abs`, `min`, `max`,
+`clamp`, `floor`, `ceil`, `round`, `pow`, `sqrt`. Text: `len`, `trim`,
+`upper`, `lower`, `contains`, `replace`, `slice`. Inspection: `type_of`.
 
 ```python
 from omni import Engine
 
 with Engine() as engine:
     engine.eval_str("clamp(12, 0, 10) + min(1, 2) + max(3, 4)")  # 15
-    engine.eval_str('upper(trim("  omni  "))')                    # 'OMNI'
+    engine.eval('upper(trim("  omni  "))')                        # 'OMNI'
+    engine.eval('replace("a-b-a", "-", "+")')                     # 'a+b+a'
+    engine.eval('slice("héllo", 1, 3)')                           # 'él'
+    engine.eval('type_of(2)')                                     # 'number'
     engine.eval_str('len("héllo")')                               # 6, bytes
     engine.stats().last_exec_micros                               # microseconds
 ```
@@ -148,6 +152,8 @@ with Engine() as engine:
 const engine = new Engine();
 engine.eval('clamp(12, 0, 10) + min(1, 2) + max(3, 4)');  // 15
 engine.eval('upper(trim("  omni  "))');                    // 'OMNI'
+engine.eval('pow(2, 10) + sqrt(16)');                      // 1028
+engine.eval('contains("omni engine", "engine")');          // true
 engine.eval('1 == 1');                                     // true
 engine.stats().lastExecMicros;                             // microseconds
 ```
@@ -157,7 +163,18 @@ gets `int` for an integral number and `float` otherwise; Node gets `number`,
 `string`, `boolean`, or `null`. A runtime failure raises `OmniError` / throws,
 and the message carries the position — `[Line 2, Col 13]: type mismatch: cannot
 add string to number: "x" + 2` — with a byte column that is identical in every
-host.
+host. A wrong argument count names the call the same way:
+`[Line 1, Col 1]: Mismatched arity in call 'clamp': takes 3 arguments, got 2`.
+
+`slice` takes character offsets so it can never cut a UTF-8 character in half;
+`len` still counts bytes, because bytes are what a caller allocates for.
+`contains` and `replace` work on bytes, and an empty needle is contained in
+every string while an empty `replace` needle changes nothing. `sqrt` of a
+negative number and a `pow` that overflows fail with a positioned error rather
+than returning `NaN` or infinity. `type_of` answers `"number"`, `"string"`,
+`"boolean"`, or `"null"` — `null` is reachable through a host callback, since
+the grammar has no literal for it yet. Neither SDK unwraps into `list` or `dict`:
+ABI 4 has no collection type for a program to produce.
 
 ## Calling back into the host
 
@@ -289,7 +306,7 @@ zero dependencies. See
 ## Language status
 
 The engine understands numbers, arithmetic with precedence, parentheses,
-`let` bindings scoped to one execution, line comments, and eleven builtins
+`let` bindings scoped to one execution, line comments, and seventeen builtins
 (`abs`, `min`, `max`, `clamp`, `floor`, `ceil`, `round`, `len`, `trim`, `upper`,
 `lower`). Strings are length-delimited: literals with `\n`, `\r`, `\t`, `\"`,
 `\\` and `\u{…}` escapes, `+` concatenation that refuses a mixed-type program by
