@@ -4,7 +4,7 @@ description = "OmniEngine language core: NaN-boxed values, a bump arena, and the
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 
 # Zero dependencies is a load-bearing property, not minimalism for its own sake:

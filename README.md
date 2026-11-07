@@ -79,6 +79,7 @@ cargo run -p omni-cli -- eval '"omni" + " " + "engine"'  # -> omni engine
 | `.github/workflows/release.yml` | Tag-driven build of five platforms, platform wheels, npm tarball, PyPI and GitHub Release. |
 | `docs/GUIDE.md` | The initialization and execution guide, with measured numbers. |
 | `docs/RELEASING.md` | The release runbook: versions, secrets, artefacts, rollback. |
+| `docs/RELEASE-0.1.0.md` | The 0.1.0 release notes: what was verified, and the license. |
 | `docs/superpowers/` | The approved design specs and the implementation plan. |
 
 ## Verify the checkout
@@ -235,4 +236,13 @@ for what GitHub shows today and what it takes to get a custom language name.
 
 ## License
 
-MIT.
+Vextalor Global Public & Integration License (VGPIL) 1.0 — see [LICENSE](LICENSE).
+
+OmniEngine is owned by Tamjid Abdur Rahman and was engineered by Vextalor
+Global. You may integrate, run, and embed it — including in commercial
+applications and inside Python, Node, and C packages — free of charge. You may
+not sell or re-license the raw source or core binary as a standalone or
+rebranded product, and attribution and this license must stay intact.
+
+Code published before this license was applied (through commit `9aab27b`) was
+released under MIT; those grants are not retroactively withdrawn.

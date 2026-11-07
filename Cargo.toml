@@ -11,7 +11,9 @@ default-members = ["crates/omni-core", "crates/omni-ffi", "crates/omni-cli"]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-license = "MIT"
+# VGPIL is not an SPDX identifier, so the license travels as a file rather
+# than a `license` expression. Paths resolve from the workspace root.
+license-file = "LICENSE"
 authors = ["Tamzid Abdur Rahman <fahim5536>"]
 repository = "https://github.com/fahim5536/omniengine"
 description = "OmniEngine: a high-performance custom language with a zero-dependency core and a C ABI for every host."

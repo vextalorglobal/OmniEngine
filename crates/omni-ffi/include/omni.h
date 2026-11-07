@@ -1,6 +1,9 @@
 /*
  * omni.h -- the C ABI of OmniEngine, version 4.
  *
+ * Copyright (c) 2026 Tamjid Abdur Rahman. All Rights Reserved.
+ * Engineered by Vextalor Global. Licensed under VGPIL 1.0; see LICENSE.
+ *
  * Hand-written and authoritative. It mirrors
  * crates/omni-ffi/src/lib.rs, and the Rust side has compile-time asserts
  * pinning OmniValue's and OmniStats' size and field offsets so the two cannot

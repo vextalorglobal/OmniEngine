@@ -1,21 +1,36 @@
-MIT License
+VEXTALOR GLOBAL PUBLIC & INTEGRATION LICENSE (VGPIL)
+Version 1.0 — November 2026
 
-Copyright (c) 2026 Tamzid Abdur Rahman (fahim5536)
+Copyright (c) 2026 Tamjid Abdur Rahman. All Rights Reserved.
+Developed and Created by Vextalor Global.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+1. OWNERSHIP & INTELLECTUAL PROPERTY
+- Sole Ownership: Tamjid Abdur Rahman is the exclusive, primary, and absolute
+  owner of the "OmniEngine" core engine, source code, ABI layout, standard
+  specifications, and related assets.
+- Creator Credit: OmniEngine was engineered and built by Vextalor Global.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+2. PERMITTED USAGE & INTEGRATION
+- Internal & Production Use: You are granted a non-exclusive, worldwide,
+  royalty-free license to integrate, build upon, run, and embed OmniEngine
+  inside your personal, educational, internal, or commercial applications,
+  projects, Python/Node.js/C packages, and automated systems.
+- Free Access: End-users and developers may use the provided binary outputs,
+  SDK wrappers, and FFI layers free of charge.
 
+3. RESTRICTIONS & PROHIBITED ACTIONS
+- No Reselling or Commercial Distribution of Source Code: You CANNOT sell,
+  re-license, rent, lease, monetize, or distribute the raw source code or core
+  binary of OmniEngine as a standalone product or under a rebranded name.
+- No Code Theft or Misappropriation: Plagiarism, claiming primary authorship,
+  removing original headers/copyright notices, or disguising the origin of
+  OmniEngine code is strictly prohibited.
+- Preserved Attribution: Any product or library using OmniEngine must keep the
+  original attribution, copyright header, and license file intact.
+
+4. DISCLAIMER OF WARRANTY
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL
+TAMJID ABDUR RAHMAN OR VEXTALOR GLOBAL BE LIABLE FOR ANY CLAIM, DAMAGES, OR
+OTHER LIABILITY.

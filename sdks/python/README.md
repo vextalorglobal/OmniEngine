@@ -230,4 +230,6 @@ the artifact on disk).
 
 ## License
 
-MIT.
+Vextalor Global Public & Integration License (VGPIL) 1.0 — see
+[LICENSE](LICENSE). Integration and production use are free; reselling the
+source or core binary as a standalone or rebranded product is not permitted.

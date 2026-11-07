@@ -1,6 +1,6 @@
 [build-system]
-# 77 is the first release that understands `license = "MIT"` (PEP 639). Pinning
-# higher than that would needlessly break older, perfectly good toolchains.
+# 77 is the first release that understands `license-files` under PEP 639.
+# Pinning higher than that would needlessly break older, good toolchains.
 requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
@@ -10,7 +10,9 @@ version = "0.1.0"
 description = "Python bindings for OmniEngine, using only the standard library's ctypes."
 readme = "README.md"
 requires-python = ">=3.9"
-license = "MIT"
+# VGPIL is a custom license, not an SPDX expression, so it travels as a file
+# and PyPI shows it as such. `license-files` is the PEP 639 spelling; the
+# deprecated `license = {file = ...}` table would emit a warning.
 license-files = ["LICENSE"]
 keywords = ["omni", "omniengine", "language", "interpreter", "ffi", "embed"]
 classifiers = [

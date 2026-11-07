@@ -1017,9 +1017,12 @@ The dependency list in `pyproject.toml` is empty and that is load-bearing: the
 binding is `ctypes`. `cffi`, `pybind11`, and a build-time compiler would each add
 an install failure mode to a package whose entire job is to find one DLL.
 
-License metadata uses PEP 639 (`license = "MIT"` plus `license-files`), which
-needs `setuptools>=77`; the table-form `license = {text = "MIT"}` emits a
-deprecation warning on current setuptools.
+The license is VGPIL 1.0, which is not an SPDX identifier, so the metadata
+declares no `License-Expression` at all and ships the text under PEP 639
+`license-files`; `setuptools>=77` is what understands that field. `twine check`
+accepts a wheel with `License-File` and no expression. Cargo has the same rule
+from the other side: the workspace uses `license-file = "LICENSE"` instead of a
+`license` string, and the crates inherit it.
 
 ### 6.2 Node.js
 
@@ -1230,7 +1233,7 @@ Measured on this machine with the release engine:
 | | |
 | --- | --- |
 | `target/release/omni.dll` | 1,289,387 bytes |
-| `omniengine-0.1.0-py3-none-win_amd64.whl` | 541,369 bytes, 8 files |
+| `omniengine-0.1.0-py3-none-win_amd64.whl` | 541,892 bytes, 8 files |
 | contents | `omni/__init__.py`, `omni/_ffi.py`, `omni/_native/omni.dll`, LICENSE, METADATA, WHEEL, `top_level.txt`, RECORD |
 | install and run outside the repo, no `OMNI_*` set | `42.0`, `packaged wheel`, batch `[2.0, 'two']`; `load_library()` resolved to `site-packages\omni\_native\omni.dll` |
 | `twine check` | PASSED — the metadata PyPI will render, including the README and license file |
@@ -1251,13 +1254,13 @@ Measured, with the Windows release engine staged:
 
 | | |
 | --- | --- |
-| `npm pack --dry-run` | 8 files, 535.7 kB packed, 1.4 MB unpacked |
+| `npm pack --dry-run` | 8 files, 536.5 kB packed, 1.4 MB unpacked |
 | contents | `LICENSE`, `README.md`, `index.js`, `lib/bindings.js`, `lib/discover.js`, `native/win32-x64/omni.dll`, `package.json`, `scripts/postinstall.js` |
 | `postinstall` | `bundled engine verified (win32-x64, ABI 4)` |
 | extracted tarball, koffi on `NODE_PATH` | `42 | packaged npm | [ 2, 'two' ]` |
 
 The published tarball carries five engines, not one, so its packed size is
-larger than the 535.7 kB measured here; the four non-Windows libraries cannot be
+larger than the 536.5 kB measured here; the four non-Windows libraries cannot be
 built on this machine, and no number for them is claimed. The same is true of
 the wheel: one platform is measured, the other four are produced by the
 workflow on their own runners.
@@ -1270,10 +1273,11 @@ python scripts/package.py                       # host target, release build
 python scripts/package.py --target aarch64-apple-darwin --skip-build
 ```
 
-Measured for the host target (`x86_64-pc-windows-gnu`): the zip is 538,510
-bytes and the tar.gz 537,745 bytes, 6 files each — `include/omni.h`,
-`lib/omni.dll` and `lib/libomni.dll.a`, `examples/c/embed.c`, `README.md`,
-`LICENSE` — and `sha256sum -c` agrees with the `.sha256` sidecar. The shipped
+Measured for the host target (`x86_64-pc-windows-gnu`): the zip is 539,357
+bytes and the tar.gz 538,422 bytes, 6 files each — `include/omni.h` (which now
+carries the VGPIL copyright line), `lib/omni.dll` and `lib/libomni.dll.a`,
+`examples/c/embed.c`, `README.md`, `LICENSE` — and `sha256sum -c` agrees with
+the `.sha256` sidecar. The shipped
 C example was compiled against the extracted archive's header and import
 library and printed `all C embedding checks passed`, so the archive is not just
 a file listing.

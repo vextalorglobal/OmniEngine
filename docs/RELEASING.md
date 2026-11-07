@@ -193,7 +193,7 @@ exercises the header, the import library, and the DLL together.
   was compiled and run here against the GNU archive (`lib/libomni.dll.a`), not
   against an MSVC import library — no MSVC C session was run from this machine.
 - The npm tarball carries five engines. Measured with the Windows engine only,
-  it is 535.7 kB packed / 1.4 MB unpacked; the four cross-built libraries add
+  it is 536.5 kB packed / 1.4 MB unpacked; the four cross-built libraries add
   unknown bytes to that, and no five-platform number is claimed from this
   machine. Splitting into per-platform optional packages would make installs
   smaller; it also makes five packages to version and publish. One tarball is
