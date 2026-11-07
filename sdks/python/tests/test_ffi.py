@@ -932,6 +932,20 @@ class Discovery(unittest.TestCase):
             f"expected a workspace target/debug search among {paths}",
         )
 
+    def test_a_wheel_bundled_engine_is_searched_before_the_workspace(self) -> None:
+        # A release wheel stages the artifact in omni/_native. It has to win
+        # over any target/ directory above the installed package, or a checkout
+        # that happens to sit nearby would serve a different build.
+        paths = _ffi._candidate_paths()
+        name = _ffi.library_file_name()
+        packaged = _ffi.os.path.dirname(_ffi.os.path.abspath(_ffi.__file__))
+        bundled = _ffi.os.path.join(packaged, "_native", name)
+        self.assertIn(bundled, paths)
+        target_at = next(
+            i for i, p in enumerate(paths) if f"{_ffi.os.sep}target{_ffi.os.sep}" in p
+        )
+        self.assertLess(paths.index(bundled), target_at)
+
     def test_the_directory_you_pass_in_counts_not_only_its_parents(self) -> None:
         # Running from the repository root is the case that must work with no
         # environment setup, so the walk starts at the base rather than above it.

@@ -312,6 +312,23 @@ test('discovery prefers an explicit library, then the home tree', () => {
   assert.ok(paths.includes(path.join(repo, 'target', 'release', name)));
 });
 
+test('a bundled native directory is searched before the workspace', () => {
+  const name = discover.libraryFileName();
+  const paths = discover.candidatePaths({
+    env: {},
+    basedir: '/pkg/node_modules/omniengine/lib',
+    cwd: '/elsewhere',
+  });
+  const bundled = path.join(
+    path.resolve('/pkg/node_modules/omniengine/native'),
+    `${process.platform}-${process.arch}`,
+    name
+  );
+  assert.ok(paths.includes(bundled), paths.join('\n'));
+  const targetAt = paths.findIndex((p) => p.includes(`${path.sep}target${path.sep}`));
+  assert.ok(paths.indexOf(bundled) < targetAt, 'a packaged engine must beat a nearby checkout');
+});
+
 test('a missing library names the build command', () => {
   // Somewhere with no OmniEngine build among its ancestors: a path inside this
   // repository would be found by the upward walk, which is the intended behaviour.

@@ -6,12 +6,14 @@
  * Order, most explicit first:
  *   1. OMNI_ENGINE_LIBRARY  -- a full path to the artifact
  *   2. OMNI_ENGINE_HOME     -- a project root to search inside
- *   3. the workspace this SDK was checked out with, target/debug then release
- *   4. the bare platform name, which lets the OS loader use PATH
+ *   3. native/<platform>-<arch>/ beside this package -- bundled by a release
+ *   4. the workspace this SDK was checked out with, target/debug then release
+ *   5. the bare platform name, which lets the OS loader use PATH
  *
- * Nothing here downloads or builds a binary. The engine is a native artifact
- * produced by cargo, and silently shipping one inside the npm package would
- * mean a stale binary that no test caught.
+ * Nothing here downloads or builds a binary. From a checkout the engine is the
+ * cargo artifact; a release tarball carries one built from the tagged commit by
+ * CI, per platform, so the bundled file cannot be older than the package that
+ * names it.
  */
 
 const fs = require('node:fs');
@@ -68,8 +70,13 @@ function candidatePaths(options = {}) {
     }
   }
 
+  // A release package bundles one directory per platform and architecture;
+  // `native/win32-x64/omni.dll` is the file a Windows x64 install loads.
+  const packageRoot = path.resolve(packageDir, '..');
+  found.push(path.join(packageRoot, 'native', `${process.platform}-${process.arch}`, name));
+
   // A package that bundles the native artifact puts it next to index.js.
-  found.push(path.join(path.resolve(packageDir, '..'), name));
+  found.push(path.join(packageRoot, name));
   found.push(path.join(packageDir, name));
 
   // A checkout or a linked install resolves outwards from the package itself;
@@ -110,7 +117,9 @@ function resolveLibrary(options = {}) {
 
   throw new OmniLibraryError(
     `could not find ${bare}.\n` +
-      'Build it first:\n' +
+      'A release install carries the engine in native/<platform>-<arch>/; if\n' +
+      'that file is missing, reinstall the package for this platform.\n' +
+      'From a checkout, build it first:\n' +
       '    cargo build -p omni-ffi\n' +
       'The SDK then finds it in any target/debug or target/release directory\n' +
       'above this package or above the current working directory.\n' +

@@ -342,9 +342,10 @@ def _candidate_paths() -> list[str]:
     ``OMNI_ENGINE_LIBRARY`` names a file, so it wins outright.
     ``OMNI_ENGINE_HOME`` names a project root, and we look in the directories a
     build could reasonably have written to.
-    Then, so an installed wheel works with no configuration at all: the package
-    directory itself (a wheel that bundles the native artifact), the tree the
-    package sits in, and the tree the current command was run from.
+    Then, so an installed wheel works with no configuration at all: the
+    ``omni/_native`` directory a release wheel stages the artifact in, the
+    package directory itself (a wheel that puts it beside the module), the tree
+    the package sits in, and the tree the current command was run from.
     """
     name = library_file_name()
     found: list[str] = []
@@ -360,7 +361,8 @@ def _candidate_paths() -> list[str]:
             found.append(os.path.join(*parts, name))
 
     package_dir = os.path.dirname(os.path.abspath(__file__))
-    found.append(os.path.join(package_dir, name))  # bundled inside the wheel
+    found.append(os.path.join(package_dir, "_native", name))  # bundled in a wheel
+    found.append(os.path.join(package_dir, name))  # bundled beside the module
     found.extend(_upward(package_dir, name))  # a checkout or an editable install
     found.extend(_upward(os.getcwd(), name))  # run from anywhere inside the repo
 
@@ -397,7 +399,9 @@ def load_library() -> ctypes.CDLL:
     except OSError as exc:
         raise OmniLibraryError(
             f"could not find {name}.\n"
-            "Build it first:\n"
+            "A release wheel carries the engine in omni/_native; if that file\n"
+            "is missing, reinstall the wheel for this platform.\n"
+            "From a checkout, build it first:\n"
             "    cargo build -p omni-ffi\n"
             "The SDK then finds it on its own in any target/debug or\n"
             "target/release directory above this package or above the current\n"
