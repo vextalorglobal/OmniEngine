@@ -1,0 +1,295 @@
+name: release
+
+# One tag, every artefact. Push `vX.Y.Z` and this workflow:
+#
+#   guard         one version and one ABI across Cargo, PyPI and npm metadata
+#   verify        fmt, clippy, 225 Rust tests, both SDK suites
+#   native        the engine for Windows x64, Linux x64/arm64, macOS x64/arm64
+#   python-wheels one py3-none-<platform> wheel per platform, engine inside
+#   npm-package   one tarball carrying all five platform binaries
+#   pypi          wheels via Trusted Publishing (no API token)
+#   release       GitHub Release with archives, wheels and the npm tarball
+#
+# Publishing needs two things configured once, outside this file:
+#   - PyPI Trusted Publisher for this repository, environment name `pypi`
+#   - npm automation token in the repository secret NPM_TOKEN
+#
+# The committed rust-toolchain.toml pins a Windows-GNU toolchain for local
+# builds (Git's link.exe shadows MSVC on the author's machine). RUSTUP_TOOLCHAIN
+# below overrides it for CI, where each runner uses its native toolchain.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: stable
+  RUST_BACKTRACE: 1
+
+jobs:
+  guard:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: one version, one ABI
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            python scripts/check-versions.py --tag "${GITHUB_REF_NAME}"
+          else
+            python scripts/check-versions.py
+          fi
+
+  verify:
+    needs: guard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo build -p omni-ffi
+      - run: python sdks/python/tests/test_ffi.py
+      - name: Node SDK tests
+        working-directory: sdks/nodejs
+        run: |
+          npm install koffi
+          npm test
+
+  native:
+    needs: guard
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: win32-x64
+            archive: zip
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x64
+            archive: tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            platform: linux-arm64
+            archive: tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            platform: darwin-x64
+            archive: tar.gz
+          - os: macos-15
+            target: aarch64-apple-darwin
+            platform: darwin-arm64
+            archive: tar.gz
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: build and archive
+        run: python scripts/package.py --target ${{ matrix.target }} --format ${{ matrix.archive }}
+      - name: the archive's engine runs
+        run: cargo run --release -p omni-cli --target ${{ matrix.target }} -- run examples/hello.omni
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lib-${{ matrix.platform }}
+          path: |
+            target/${{ matrix.target }}/release/*.dll
+            target/${{ matrix.target }}/release/*.dll.lib
+            target/${{ matrix.target }}/release/*.so
+            target/${{ matrix.target }}/release/*.dylib
+          if-no-files-found: error
+
+  # Linux wheels are tagged manylinux_2_39 because they are built on Ubuntu
+  # 24.04. To support older glibc, build the same artifact in a
+  # manylinux_2_28 container and change the tag here; nothing else moves.
+  python-wheels:
+    needs: native
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: win32-x64
+            lib: omni.dll
+            tag: win_amd64
+          - os: ubuntu-24.04
+            platform: linux-x64
+            lib: libomni.so
+            tag: manylinux_2_39_x86_64
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+            lib: libomni.so
+            tag: manylinux_2_39_aarch64
+          - os: macos-15-intel
+            platform: darwin-x64
+            lib: libomni.dylib
+            tag: macosx_10_12_x86_64
+          - os: macos-15
+            platform: darwin-arm64
+            lib: libomni.dylib
+            tag: macosx_11_0_arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: lib-${{ matrix.platform }}
+          path: native-lib
+      - run: python -m pip install --upgrade "setuptools>=77" wheel build
+      - name: build the wheel with the engine inside
+        shell: bash
+        env:
+          OMNI_NATIVE: native-lib/${{ matrix.lib }}
+          OMNI_REQUIRE_NATIVE: "1"
+        run: python -m build --wheel --no-isolation sdks/python --outdir dist
+      - name: retag for any Python 3 on this platform
+        shell: bash
+        run: |
+          python -m wheel tags --python-tag py3 --abi-tag none \
+            --platform-tag ${{ matrix.tag }} dist/*.whl
+          rm -f dist/omniengine-*-cp*.whl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.platform }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  npm-package:
+    needs: native
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write   # npm provenance signs with the workflow's OIDC identity
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: lib-*
+          path: libs
+      - name: stage native/<platform>/ for all five packages
+        shell: bash
+        run: |
+          mkdir -p sdks/nodejs/native/win32-x64 sdks/nodejs/native/linux-x64 \
+                   sdks/nodejs/native/linux-arm64 sdks/nodejs/native/darwin-x64 \
+                   sdks/nodejs/native/darwin-arm64
+          cp libs/lib-win32-x64/omni.dll          sdks/nodejs/native/win32-x64/
+          cp libs/lib-linux-x64/libomni.so        sdks/nodejs/native/linux-x64/
+          cp libs/lib-linux-arm64/libomni.so      sdks/nodejs/native/linux-arm64/
+          cp libs/lib-darwin-x64/libomni.dylib    sdks/nodejs/native/darwin-x64/
+          cp libs/lib-darwin-arm64/libomni.dylib  sdks/nodejs/native/darwin-arm64/
+      - name: guard the tarball
+        working-directory: sdks/nodejs
+        env:
+          OMNI_REQUIRE_NATIVE: "1"
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: node scripts/prepack.js
+      - name: pack
+        working-directory: sdks/nodejs
+        env:
+          OMNI_REQUIRE_NATIVE: "1"
+        run: npm pack
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarball
+          path: sdks/nodejs/omniengine-*.tgz
+          if-no-files-found: error
+      - name: publish to npm
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: sdks/nodejs
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          OMNI_REQUIRE_NATIVE: "1"
+        run: npm publish --provenance --access public
+
+  pypi:
+    needs: python-wheels
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: pypi
+      url: https://pypi.org/p/omniengine
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+      - run: ls -la dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  github-release:
+    needs: [native, python-wheels, npm-package]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: collect release assets
+        shell: bash
+        run: |
+          mkdir -p assets
+          find artifacts -type f \( -name '*.zip' -o -name '*.tar.gz' \
+            -o -name '*.whl' -o -name '*.tgz' -o -name '*.sha256' \) \
+            -exec cp {} assets/ \;
+          ls -la assets
+      - name: create or update the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" assets/* --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" assets/* --generate-notes
+          fi
