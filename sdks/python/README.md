@@ -40,7 +40,7 @@ that file. The file must carry this platform's name, load, and answer the ABI
 this SDK speaks — a mismatch fails the build. `OMNI_REQUIRE_NATIVE=1` makes
 "nothing staged" an error, which is how CI refuses to publish a wheel that
 cannot load. The result is a platform-tagged wheel; see
-`docs/GUIDE.md` section 6.6 for why CI retags it `py3-none-<platform>`.
+`docs/GUIDE.md` section 6.7 for why CI retags it `py3-none-<platform>`.
 
 ## Point the SDK at the library
 
@@ -132,6 +132,41 @@ still extra work), and the win saturates fast — the crossing itself costs ~240
 through ctypes while one wrapped `run` costs ~10 µs, so a batch can only amortise
 the smaller term. `sdks/python/bench.py` prints the numbers for the machine you
 are on.
+
+## Checking for updates
+
+```python
+import omni
+
+result = omni.check_updates()
+result.status        # 'available' | 'up-to-date' | 'abi-mismatch'
+                     # | 'invalid' | 'bad-argument' | 'error'
+result.current       # '0.1.0'
+result.latest        # '0.2.0'
+result.available     # True when the manifest offers a newer build
+result.abi, result.notes, result.asset, result.url, result.error
+```
+
+It fetches one JSON manifest (HTTPS, `OMNI_UPDATE_URL` overrides the default
+GitHub Releases URL, `file://` works for testing), hands the bytes to the
+engine's `omni_check_update`, and returns a frozen `UpdateCheck`. It never
+downloads a binary and never replaces anything — use `omni update` from the CLI
+for that. A network failure is `status='error'` with the reason in `.error`, not
+an exception; `raise_on_error=True` changes that.
+
+The same check can run in the background at construction:
+
+```python
+engine = omni.Engine(background_check=True)   # or OMNI_UPDATE_CHECK=1
+handle = engine.background_update             # BackgroundUpdateCheck
+handle.done                                   # False until the request ends
+handle.wait(0.0)                              # None while it runs
+engine.background_update.result               # UpdateCheck once it is done
+```
+
+The thread is a daemon, it never delays the constructor, and it never raises
+into the program: the answer is there only if you look. `omni.start_background_check()`
+returns the same handle without an engine.
 
 ## Calling back into Python
 

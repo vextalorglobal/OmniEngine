@@ -7,11 +7,12 @@
 # PATH, and a missing tool is reported as SKIP rather than a failure, so this
 # script is usable on a machine that has not got the whole toolchain yet.
 #
-# The last rows are Phase 2 and Phase 3: they run one string program, one type
-# error, and the ABI level through every host that is present and compare the
-# answers with each other, then do the same for host callbacks -- a function the
-# host owns and a script calls. That comparison is the only way to catch a
-# bridge that is internally consistent and externally wrong.
+# Later sections take one answer through every host that is present and compare
+# what came back: strings and errors, a function the host owns, one crossing for
+# many programs, the DevPack surfaces, and finally the update path -- a release
+# check, a refused checksum, and a binary that replaces itself. That comparison
+# is the only way to catch a bridge that is internally consistent and
+# externally wrong.
 #
 # Exits non-zero if anything that could run, failed.
 
@@ -879,6 +880,211 @@ elif [[ -n "$timer_hosts" ]]; then
   pass "one 200 KB execution timed, non-zero and in microseconds:$timer_hosts"
 else
   skip "exec timer" "python and node not available"
+fi
+
+# ---------------------------------------------------- Phase 6: staying current
+# A release check reads one manifest; an update replaces one file. Both are
+# exercised against file:// fixtures so the rows say nothing about the network
+# and everything about the bytes: what the exit code was, and whether the
+# target is still byte-identical when verification refused.
+
+update_exe=""
+case "$OSTYPE" in
+  msys*|cygwin*|win32*) update_exe=".exe" ;;
+esac
+OMNI_BIN="$ROOT/target/debug/omni$update_exe"
+OMNIUP_BIN="$ROOT/target/debug/omniup$update_exe"
+UPDATE_DIR="$OUT/update"
+mkdir -p "$UPDATE_DIR"
+
+sha_of() {
+  if have sha256sum; then sha256sum "$1" | cut -d' ' -f1
+  else shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
+# Git Bash rewrites an argument that looks like an absolute path, and
+# `file:///D:/...` looks like one to it: without this the engine receives
+# `/d/...` and the fetch fails for a reason that has nothing to do with the
+# updater. The exclusion is per-command, so nothing else in this script changes.
+update_cmd() {
+  MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "$@"
+}
+
+host_platform() {
+  local machine
+  machine=$(uname -m 2>/dev/null || echo unknown)
+  case "$OSTYPE" in
+    msys*|cygwin*|win32*) echo win32-x64 ;;
+    darwin*)
+      case "$machine" in arm64|aarch64) echo darwin-arm64 ;; *) echo darwin-x64 ;; esac ;;
+    *)
+      case "$machine" in aarch64|arm64) echo linux-arm64 ;; *) echo linux-x64 ;; esac ;;
+  esac
+}
+
+as_url() {
+  local path="$1"
+  case "$OSTYPE" in
+    msys*|cygwin*|win32*)
+      # $PWD in Git Bash is a POSIX path (/d/...), which is not a URL the ABI can
+      # open; cygpath -m gives the Windows spelling (D:/...) to paste after the
+      # scheme.
+      if have cygpath; then path=$(cygpath -m "$path"); fi
+      path=$(printf '%s' "$path" | sed 's|\\|/|g')
+      case "$path" in
+        [A-Za-z]:/*) printf 'file:///%s' "$path" ;;
+        *) printf 'file:///%s' "${path#/}" ;;
+      esac
+      ;;
+    *) printf 'file://%s' "$path" ;;
+  esac
+}
+
+# The CLI is a native program: a --target it is asked to replace must be spelled
+# the way Windows spells it, not the way Git Bash does.
+native_path() {
+  case "$OSTYPE" in
+    msys*|cygwin*|win32*) if have cygpath; then cygpath -m "$1"; else printf '%s' "$1"; fi ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+write_manifest() { # file, version, abi, asset URL, sha256
+  cat >"$1" <<JSON
+{
+  "version": "$2",
+  "abi": $3,
+  "notes": "verify-all",
+  "assets": {
+    "$PLATFORM": { "url": "$4", "sha256": "$5" }
+  }
+}
+JSON
+}
+
+printf 'omni --version names what it speaks... '
+if have cargo; then
+  if cargo build -q -p omni-cli --bins >"$OUT/cli-bins.log" 2>&1; then
+    abi_level=$(sed -n 's/^#define OMNI_ABI_VERSION \([0-9][0-9]*\).*/\1/p' crates/omni-ffi/include/omni.h | head -1)
+    version=$(awk '/^\[workspace\.package\]/{f=1;next} /^\[/{f=0} f && /^version *=/{gsub(/[" ]/,""); split($0,p,"="); print p[2]; exit}' Cargo.toml)
+    ver=$(update_cmd "$OMNI_BIN" --version 2>&1)
+    if [[ "$ver" == *"omni $version"* && "$ver" == *"ABI $abi_level"* ]]; then
+      pass "omni --version -> $ver"
+    else
+      fail "omni --version printed: $ver"
+    fi
+  else
+    fail "cargo build -p omni-cli --bins"
+    tail -5 "$OUT/cli-bins.log"
+  fi
+else
+  skip "omni --version" "cargo not on PATH"
+fi
+
+if have cargo && [[ -x "$OMNI_BIN" && -x "$OMNIUP_BIN" && -n "${version:-}" && -n "${abi_level:-}" ]]; then
+  PLATFORM=$(host_platform)
+  payload="$UPDATE_DIR/payload$update_exe"
+  cp -f "$OMNI_BIN" "$payload"
+  # A trailing byte changes the checksum without changing the image, so a row
+  # can tell "the update wrote these bytes" from "nothing happened".
+  printf 'verify
+' >>"$payload"
+  payload_sha=$(sha_of "$payload")
+  payload_url=$(as_url "$payload")
+  write_manifest "$UPDATE_DIR/same.json" "$version" "$abi_level" "$payload_url" "$payload_sha"
+  write_manifest "$UPDATE_DIR/newer.json" "99.0.0" "$abi_level" "$payload_url" "$payload_sha"
+  write_manifest "$UPDATE_DIR/other-abi.json" "99.0.0" "$((abi_level + 1))" "$payload_url" "$payload_sha"
+  write_manifest "$UPDATE_DIR/bad-sha.json" "99.0.0" "$abi_level" "$payload_url" "$(printf '0%.0s' $(seq 64))"
+
+  printf 'a build that matches the release... '
+  out=$(update_cmd "$OMNI_BIN" check-update --manifest "$(as_url "$UPDATE_DIR/same.json")" 2>&1)
+  code=$?
+  if [[ $code -eq 0 && "$out" == *"up to date"* ]]; then
+    pass "omni check-update -> 0, $out"
+  else
+    fail "omni check-update on an equal version exited $code: $out"
+  fi
+
+  printf 'a newer release is offered... '
+  out=$(update_cmd "$OMNI_BIN" check-update --manifest "$(as_url "$UPDATE_DIR/newer.json")" 2>&1)
+  code=$?
+  if [[ $code -eq 10 && "$out" == *"99.0.0"* ]]; then
+    pass "omni check-update -> 10, $out"
+  else
+    fail "omni check-update on a newer version exited $code: $out"
+  fi
+
+  printf 'another ABI is refused, not offered... '
+  out=$(update_cmd "$OMNI_BIN" check-update --manifest "$(as_url "$UPDATE_DIR/other-abi.json")" 2>&1)
+  code=$?
+  if [[ $code -eq 11 && "$out" == *"ABI"* ]]; then
+    pass "omni check-update -> 11, $out"
+  else
+    fail "omni check-update on another ABI exited $code: $out"
+  fi
+
+  printf 'a wrong checksum leaves the target alone... '
+  target="$UPDATE_DIR/target$update_exe"
+  # The target is a different program from the payload, so the checksum row
+  # can prove nothing was written rather than compare a file with itself.
+  cp -f "$OMNIUP_BIN" "$target"
+  before=$(sha_of "$target")
+  out=$(update_cmd "$OMNIUP_BIN" update --manifest "$(as_url "$UPDATE_DIR/bad-sha.json")" --target "$(native_path "$target")" --yes 2>&1)
+  code=$?
+  after=$(sha_of "$target")
+  if [[ $code -eq 3 && "$before" == "$after" ]]; then
+    pass "omniup update -> 3, target unchanged"
+  else
+    fail "omniup update with a wrong checksum exited $code and target changed: $before -> $after ($out)"
+  fi
+
+  printf 'a dry run downloads nothing... '
+  write_manifest "$UPDATE_DIR/dry.json" "99.0.0" "$abi_level" "$(as_url "$UPDATE_DIR/never-downloaded")" "$payload_sha"
+  out=$(update_cmd "$OMNIUP_BIN" update --manifest "$(as_url "$UPDATE_DIR/dry.json")" --target "$(native_path "$target")" --dry-run --yes 2>&1)
+  code=$?
+  if [[ $code -eq 10 && ! -f "$UPDATE_DIR/never-downloaded" ]]; then
+    pass "omniup update --dry-run -> 10, nothing fetched"
+  else
+    fail "omniup update --dry-run exited $code: $out"
+  fi
+
+  printf 'a verified update replaces the bytes... '
+  out=$(update_cmd "$OMNIUP_BIN" update --manifest "$(as_url "$UPDATE_DIR/newer.json")" --target "$(native_path "$target")" --yes 2>&1)
+  code=$?
+  if [[ $code -eq 0 && "$(sha_of "$target")" == "$payload_sha" ]]; then
+    pass "omniup update -> 0, target now the release bytes"
+  else
+    fail "omniup update exited $code: $out"
+  fi
+  if [[ -x "$target" ]]; then
+    replaced=$(update_cmd "$target" --version 2>&1)
+    if [[ "$replaced" == *"omni $version"* ]]; then
+      pass "the replaced binary still runs: $replaced"
+    else
+      fail "the replaced binary printed: $replaced"
+    fi
+  fi
+
+  printf 'a running binary updates itself... '
+  self_dir="$UPDATE_DIR/self"
+  mkdir -p "$self_dir"
+  cp -f "$OMNI_BIN" "$self_dir/omni$update_exe"
+  out=$(update_cmd "$self_dir/omni$update_exe" update --manifest "$(as_url "$UPDATE_DIR/newer.json")" --yes 2>&1)
+  code=$?
+  if [[ $code -eq 0 && "$(sha_of "$self_dir/omni$update_exe")" == "$payload_sha" ]]; then
+    if [[ "$update_exe" == ".exe" && -f "$self_dir/omni$update_exe.bak" ]]; then
+      pass "omni update -> 0, the running image is kept at omni.exe.bak"
+    elif [[ "$update_exe" == "" ]]; then
+      pass "omni update -> 0, the old image was released"
+    else
+      fail "omni update -> 0 but the Windows backup is missing"
+    fi
+  else
+    fail "self-update exited $code: $out"
+  fi
+else
+  skip "release check and update" "cargo or the built CLI binaries are unavailable"
 fi
 
 # ---------------------------------------------------------------- report

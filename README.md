@@ -70,12 +70,13 @@ cargo run -p omni-cli -- eval '"omni" + " " + "engine"'  # -> omni engine
 | --- | --- |
 | `crates/omni-core` | NaN-boxed 8-byte scalars, length-delimited strings, a lexer, and a fused parse-and-evaluate engine. Zero dependencies. |
 | `crates/omni-ffi` | The C ABI: `omni.dll` / `libomni.so`, `include/omni.h`, and contract tests written as an external caller. |
-| `crates/omni-cli` | `omni run <file>`, `omni eval <expr>`. Hand-rolled args, no clap. |
+| `crates/omni-cli` | `omni run <file>`, `omni eval <expr>`, `omni check-update`, `omni update`, and the standalone `omniup`. Hand-rolled args, no clap. |
 | `crates/omni-wasm` | Scaffolded wasm surface, mirroring the C ABI shape. Not built by default. |
 | `sdks/python` | `omni` package on `ctypes` only — no pip dependencies at all. |
 | `sdks/nodejs` | `omniengine` package on `koffi`. |
 | `examples/` | `.omni` programs and `c/embed.c`. |
 | `scripts/package.py` | One native archive per platform: library, import library, header, example, docs. |
+| `scripts/cli-binaries.py` | Stages `omni` and `omniup` per platform with checksums; `scripts/make-manifest.py` turns those into `omni-update.json`. |
 | `.github/workflows/release.yml` | Tag-driven build of five platforms, platform wheels, npm tarball, PyPI and GitHub Release. |
 | `docs/GUIDE.md` | The initialization and execution guide, with measured numbers. |
 | `docs/RELEASING.md` | The release runbook: versions, secrets, artefacts, rollback. |
@@ -86,7 +87,7 @@ cargo run -p omni-cli -- eval '"omni" + " " + "engine"'  # -> omni engine
 
 ```bash
 # Rust
-cargo test --workspace                                  # 238 tests
+cargo test --workspace                                  # 269 tests
 cargo run -p omni-cli -- eval '"omni" + " " + "engine"'  # -> omni engine
 cargo run --release -p omni-core --example bench         # the engine, measured
 
@@ -107,7 +108,7 @@ cd sdks/nodejs && npm install koffi && node -e \
 Or run everything at once:
 
 ```bash
-./scripts/verify-all.sh   # the same bytes from every host, ABI level, memory, batch
+./scripts/verify-all.sh   # the same bytes from every host, ABI, memory, batch, updates
 ./scripts/bench.sh        # ns/exec, crossing cost, batch speed-up -- measured
 python scripts/check-versions.py   # one version, one ABI across every surface
 python scripts/package.py          # a clean native archive for this platform
@@ -116,8 +117,10 @@ python scripts/package.py          # a clean native archive for this platform
 It checks that the same bytes come out of the same program on every host, that
 all four surfaces agree on the ABI level, that string results do not grow memory
 over 2,000 executions, that a host function called from a script answers
-identically in Python and Node, and that a batch crossing answers, fails, counts,
-and refuses identically in both. It also checks the DevPack surface across hosts:
+identically in Python and Node, that a batch crossing answers, fails, counts,
+and refuses identically in both, and that the updater refuses a wrong checksum,
+does not fetch during a dry run, and replaces a binary only with verified bytes.
+It also checks the DevPack surface across hosts:
 the math and string builtins, a second-line error rendered as
 `[Line 2, Col 13]`, `eval_str` / `eval` returning native values, and a non-zero
 `last_exec_micros`. Tools that are missing are reported as `SKIP`, not as a pass.
@@ -203,6 +206,43 @@ can only amortise the smaller term. On this machine, batches earned 1.2–1.4× 
 item at their best N in Python and Node, and in Rust the win is unconditional but
 in allocations: 0.00 per execution, 0.004 per *item* inside a 256-batch. Run
 `./scripts/bench.sh` for the machine you are on.
+
+## Staying current
+
+`omni update` reads one manifest, picks the asset for this platform, verifies its
+SHA-256, and replaces the binary only if the bytes match:
+
+```bash
+omni --version                    # omni 0.1.0 (language v1, ABI 4)
+omni check-update                 # 0 current, 10 newer, 11 different ABI
+omni update --dry-run             # 10: an update would apply; nothing fetched
+omni update --yes                 # download, verify, install
+omniup update --target ./omni -y  # update a binary that is not this process
+```
+
+Plain `http://` is refused unless `OMNI_ALLOW_INSECURE=1` is set, because an
+unauthenticated manifest is an unauthenticated binary. Replacement is
+rename-based: a failure part-way restores the old file, and a running Windows
+image is kept beside the new one as `omni.exe.bak`. Both SDKs can report the
+same answer without installing anything:
+
+```python
+import omni
+omni.check_updates().available
+```
+
+```js
+const { checkUpdates } = require('omniengine');
+(await checkUpdates()).available;
+```
+
+The check is opt-in and notify-only — neither SDK replaces the engine under a
+running process. Set `OMNI_UPDATE_CHECK=1` (or `Engine(background_check=True)` /
+`new Engine({ updateCheck: true })`) for a check that never blocks startup,
+never throws, and never prints. The engine itself only parses the manifest
+(`omni_check_update`); fetching stays in the CLI and the SDKs, so the core keeps
+zero dependencies. See
+[docs/GUIDE.md](docs/GUIDE.md#65-staying-current-the-updater).
 
 ## How it stays fast and small
 

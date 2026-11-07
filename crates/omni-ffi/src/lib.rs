@@ -581,6 +581,80 @@ pub extern "C" fn omni_version() -> *const c_char {
         .cast::<c_char>()
 }
 
+/// The manifest describes this build or an older one.
+pub const OMNI_UPDATE_UP_TO_DATE: i32 = 0;
+/// The manifest describes a newer build on the same ABI.
+pub const OMNI_UPDATE_AVAILABLE: i32 = 1;
+/// The manifest describes a build on a different ABI, so it is not an upgrade
+/// this library can take.
+pub const OMNI_UPDATE_ABI_MISMATCH: i32 = 2;
+/// The bytes are not a manifest this ABI accepts.
+pub const OMNI_UPDATE_INVALID: i32 = 3;
+/// A null manifest with a nonzero length, or bytes that are not UTF-8.
+pub const OMNI_UPDATE_BAD_ARG: i32 = -1;
+
+/// Compare a release manifest with the running library.
+///
+/// The caller fetches the manifest; this function only reads it. That split is
+/// deliberate: the engine has no network stack and no business growing one, and
+/// a host that already performs HTTPS should not be made to route it through an
+/// interpreter.
+///
+/// `manifest` is `len` bytes of UTF-8 and need not be NUL-terminated. When the
+/// document parses, the version it names is copied into `out_version` as a
+/// NUL-terminated string, truncated to `out_cap - 1` bytes, and the return value
+/// is [`OMNI_UPDATE_UP_TO_DATE`], [`OMNI_UPDATE_AVAILABLE`] or
+/// [`OMNI_UPDATE_ABI_MISMATCH`]. A null `out_version` or a `out_cap` of zero is
+/// accepted: the status is still the answer.
+///
+/// Returns [`OMNI_UPDATE_INVALID`] when the bytes are not a release manifest,
+/// [`OMNI_UPDATE_BAD_ARG`] for a malformed argument, and [`OMNI_UPDATE_INVALID`]
+/// if a panic escapes the parser.
+///
+/// # Safety
+///
+/// `manifest` must be readable for `len` bytes, or be null with a zero length.
+/// `out_version` must be writable for `out_cap` bytes, or be null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn omni_check_update(
+    manifest: *const c_char,
+    len: usize,
+    out_version: *mut c_char,
+    out_cap: usize,
+) -> i32 {
+    if len > omni_core::update::MAX_MANIFEST_LEN || (manifest.is_null() && len != 0) {
+        return OMNI_UPDATE_BAD_ARG;
+    }
+    let text = if len == 0 {
+        ""
+    } else {
+        // Safety: the null check above ran and the caller guarantees `manifest`
+        // is readable for `len` bytes.
+        let bytes = unsafe { slice::from_raw_parts(manifest.cast::<u8>(), len) };
+        match std::str::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(_) => return OMNI_UPDATE_BAD_ARG,
+        }
+    };
+    catch_unwind(AssertUnwindSafe(|| {
+        let Ok(parsed) = omni_core::update::parse_manifest(text) else {
+            return OMNI_UPDATE_INVALID;
+        };
+        if !out_version.is_null() && out_cap > 0 {
+            let bytes = parsed.version.as_bytes();
+            let n = bytes.len().min(out_cap - 1);
+            // Safety: `out_version` is writable for `out_cap` bytes and n < out_cap,
+            // so the copy and the terminator at out_version[n] both stay inside it.
+            unsafe {
+                ptr::copy_nonoverlapping(bytes.as_ptr(), out_version.cast::<u8>(), n);
+                *out_version.add(n) = 0;
+            }
+        }
+        omni_core::update::check_update(env!("CARGO_PKG_VERSION"), OMNI_ABI_VERSION, &parsed).code()
+    }))
+    .unwrap_or(OMNI_UPDATE_INVALID)
+}
+
 /// Allocate an engine. Returns null if allocation itself panicked.
 #[unsafe(no_mangle)]
 pub extern "C" fn omni_engine_new() -> *mut OmniEngine {
@@ -1748,5 +1822,104 @@ mod tests {
         assert_eq!(n, 0, "an address the engine does not own copies nothing");
         assert_eq!(buf, [0u8; 16], "and writes nothing on the way out");
         unsafe { omni_engine_free(engine) };
+    }
+
+    fn check_manifest(manifest: &str) -> (i32, String) {
+        let mut buf = [0i8; 64];
+        let code = unsafe {
+            omni_check_update(
+                manifest.as_ptr().cast::<c_char>(),
+                manifest.len(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        let text = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        (code, text)
+    }
+
+    #[test]
+    fn the_update_export_compares_against_this_build() {
+        let current = env!("CARGO_PKG_VERSION");
+        let same = format!(r#"{{"version":"{current}","abi":{OMNI_ABI_VERSION}}}"#);
+        assert_eq!(
+            check_manifest(&same),
+            (OMNI_UPDATE_UP_TO_DATE, current.to_string())
+        );
+
+        let newer = format!(r#"{{"version":"99.0.0","abi":{OMNI_ABI_VERSION}}}"#);
+        assert_eq!(
+            check_manifest(&newer),
+            (OMNI_UPDATE_AVAILABLE, "99.0.0".into())
+        );
+
+        // Another wire format is refused before the numbers are compared.
+        let foreign = format!(r#"{{"version":"99.0.0","abi":{}}}"#, OMNI_ABI_VERSION + 1);
+        assert_eq!(check_manifest(&foreign).0, OMNI_UPDATE_ABI_MISMATCH);
+
+        // Older and malformed manifests are distinguishable answers, not errors.
+        let older = format!(r#"{{"version":"0.0.1","abi":{OMNI_ABI_VERSION}}}"#);
+        assert_eq!(check_manifest(&older).0, OMNI_UPDATE_UP_TO_DATE);
+        assert_eq!(check_manifest("{").0, OMNI_UPDATE_INVALID);
+        assert_eq!(check_manifest("").0, OMNI_UPDATE_INVALID);
+    }
+
+    #[test]
+    fn the_update_export_truncates_and_rejects_bad_arguments() {
+        let manifest = format!(r#"{{"version":"99.0.0","abi":{OMNI_ABI_VERSION}}}"#);
+        let mut buf = [0i8; 3];
+        let code = unsafe {
+            omni_check_update(
+                manifest.as_ptr().cast::<c_char>(),
+                manifest.len(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(code, OMNI_UPDATE_AVAILABLE);
+        // Two bytes and a terminator: a short buffer is a truncated answer, not
+        // a memory error.
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_bytes(),
+            b"99"
+        );
+
+        // A null destination still answers the question.
+        let code = unsafe {
+            omni_check_update(
+                manifest.as_ptr().cast::<c_char>(),
+                manifest.len(),
+                ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(code, OMNI_UPDATE_AVAILABLE);
+
+        // A null manifest with a length, non-UTF-8 bytes, and an over-long
+        // document are argument errors rather than reads.
+        assert_eq!(
+            unsafe { omni_check_update(ptr::null(), 4, ptr::null_mut(), 0) },
+            OMNI_UPDATE_BAD_ARG
+        );
+        let bad = [0xFFu8, 0xFE];
+        assert_eq!(
+            unsafe {
+                omni_check_update(bad.as_ptr().cast::<c_char>(), bad.len(), ptr::null_mut(), 0)
+            },
+            OMNI_UPDATE_BAD_ARG
+        );
+        assert_eq!(
+            unsafe {
+                omni_check_update(
+                    manifest.as_ptr().cast::<c_char>(),
+                    omni_core::update::MAX_MANIFEST_LEN + 1,
+                    ptr::null_mut(),
+                    0,
+                )
+            },
+            OMNI_UPDATE_BAD_ARG
+        );
     }
 }

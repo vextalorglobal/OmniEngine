@@ -67,6 +67,13 @@ __all__ = [
     "OMNI_ABI_VERSION",
     "OMNI_HOST_OK",
     "OMNI_HOST_ERR",
+    "OMNI_UPDATE_UP_TO_DATE",
+    "OMNI_UPDATE_AVAILABLE",
+    "OMNI_UPDATE_ABI_MISMATCH",
+    "OMNI_UPDATE_INVALID",
+    "OMNI_UPDATE_BAD_ARG",
+    "UPDATE_STATUS",
+    "MAX_MANIFEST_LEN",
     "HOST_FN",
     "OmniPayload",
     "OmniValue",
@@ -77,6 +84,7 @@ __all__ = [
     "OmniError",
     "OmniLibraryError",
     "load_library",
+    "check_update",
 ]
 
 # ---------------------------------------------------------------------------
@@ -118,6 +126,28 @@ TAGS = {
 #: A host function's own return values: 0 for success, 1 for "out is a message".
 OMNI_HOST_OK = 0
 OMNI_HOST_ERR = 1
+
+#: What ``omni_check_update`` answers. These are an additive export inside ABI 4:
+#: the structs and every other signature are unchanged, so a library built
+#: before this export still loads -- only the update check is unavailable.
+OMNI_UPDATE_UP_TO_DATE = 0
+OMNI_UPDATE_AVAILABLE = 1
+OMNI_UPDATE_ABI_MISMATCH = 2
+OMNI_UPDATE_INVALID = 3
+OMNI_UPDATE_BAD_ARG = -1
+
+UPDATE_STATUS = {
+    OMNI_UPDATE_UP_TO_DATE: "up-to-date",
+    OMNI_UPDATE_AVAILABLE: "available",
+    OMNI_UPDATE_ABI_MISMATCH: "abi-mismatch",
+    OMNI_UPDATE_INVALID: "invalid",
+    OMNI_UPDATE_BAD_ARG: "bad-argument",
+}
+
+#: Largest manifest ``omni_check_update`` will read. Mirrors
+#: ``omni_core::update::MAX_MANIFEST_LEN``; the engine refuses a longer document
+#: with ``OMNI_UPDATE_BAD_ARG`` rather than parsing it.
+MAX_MANIFEST_LEN = 1 << 20
 
 #: Wire format of the value struct this module reads. Checked against the
 #: library at load; see the module docstring's rule 3.
@@ -531,7 +561,62 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
 
     lib.omni_debug_panic.argtypes = [c_void_p]
     lib.omni_debug_panic.restype = c_uint32
+
+    # Additive in ABI 4, so it is declared only when the loaded library has it.
+    # A library built before the update check existed still serves every other
+    # call; check_update() below turns the missing symbol into one clear error
+    # at the moment someone asks for an update, not at import time.
+    if hasattr(lib, "omni_check_update"):
+        lib.omni_check_update.argtypes = [
+            c_char_p,
+            c_size_t,
+            POINTER(ctypes.c_char),
+            c_size_t,
+        ]
+        lib.omni_check_update.restype = c_int32
     return lib
+
+
+def check_update(manifest: str | bytes, *, version_cap: int = 64) -> tuple[int, str]:
+    """Compare a release manifest with the loaded engine.
+
+    A pure comparison: no network, no download, no writes. The caller fetches
+    the manifest; this asks the engine that owns the version and ABI numbers
+    whether the manifest names a newer build.
+
+    Args:
+        manifest: the JSON document bytes (or ``str``).
+        version_cap: bytes reserved for the version the manifest names.
+
+    Returns:
+        ``(status, version)``. ``status`` is one of the ``OMNI_UPDATE_*``
+        constants: ``0`` up to date, ``1`` available, ``2`` ABI mismatch,
+        ``3`` unreadable manifest, ``-1`` bad argument. ``version`` is the
+        manifest's version once it parsed, and ``""`` otherwise.
+
+    Raises:
+        OmniLibraryError: the loaded library predates ``omni_check_update``.
+    """
+    return _check_update_on(load_library(), manifest, version_cap=version_cap)
+
+
+def _check_update_on(
+    lib: ctypes.CDLL, manifest: str | bytes, *, version_cap: int = 64
+) -> tuple[int, str]:
+    """[`check_update`] against a library the caller already loaded."""
+    function = getattr(lib, "omni_check_update", None)
+    if function is None:
+        raise OmniLibraryError(
+            "the loaded OmniEngine library predates the update check "
+            "(omni_check_update). Rebuild it with:\n    cargo build -p omni-ffi"
+        )
+    data = manifest.encode("utf-8") if isinstance(manifest, str) else bytes(manifest)
+    if len(data) > MAX_MANIFEST_LEN:
+        return OMNI_UPDATE_BAD_ARG, ""
+    capacity = max(version_cap, 0)
+    buf = create_string_buffer(max(capacity, 1))
+    status = function(data, len(data), buf, capacity)
+    return status, buf.value.decode("utf-8", "replace")
 
 
 # ---------------------------------------------------------------------------

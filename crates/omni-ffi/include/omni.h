@@ -318,6 +318,46 @@ OMNI_API uint32_t OMNI_CALL omni_abi_version(void);
 /* Version string, static and NUL-terminated. Never free it. */
 OMNI_API const char *OMNI_CALL omni_version(void);
 
+/* ---- update check ---------------------------------------------------- *
+ *
+ * The caller fetches a release manifest; omni_check_update() reads it and
+ * answers whether it names a newer engine. Keeping the fetch outside this ABI
+ * is why the engine still has no network stack and no TLS dependency: a host
+ * that already speaks HTTPS hands the document over as bytes.
+ *
+ * The document is JSON with three required parts and one optional one:
+ *
+ *   { "version": "0.2.0", "abi": 4, "notes": "https://…",   // notes optional
+ *     "assets": { "win32-x64": { "url": "https://…", "sha256": "<64 hex>" } } }
+ *
+ * A manifest entry is chosen by platform key: win32-x64, linux-x64,
+ * linux-arm64, darwin-x64, darwin-arm64. Entries for other keys are ignored.
+ * The checksum is not verified here -- verifying bytes is the downloader's job,
+ * and this function never sees the binary. */
+#define OMNI_UPDATE_UP_TO_DATE   0  /* this build or older, same ABI        */
+#define OMNI_UPDATE_AVAILABLE    1  /* a newer build on this ABI            */
+#define OMNI_UPDATE_ABI_MISMATCH 2  /* a build on another wire format       */
+#define OMNI_UPDATE_INVALID      3  /* not a release manifest               */
+#define OMNI_UPDATE_BAD_ARG     -1  /* null with a length, or non-UTF-8     */
+
+/* Compare a manifest with the running library.
+ *
+ * `manifest` is `len` bytes of UTF-8 and need not be NUL-terminated. On success
+ * the version it names is copied into `out_version` as a NUL-terminated string
+ * (truncated to out_cap - 1) and the return value is one of the three statuses
+ * above. `out_version` may be NULL and `out_cap` may be 0 when only the verdict
+ * is wanted. Returns OMNI_UPDATE_BAD_ARG for a null manifest with a nonzero
+ * length, non-UTF-8 bytes, or a document over 1 MiB, and OMNI_UPDATE_INVALID
+ * when the bytes do not parse as a manifest.
+ *
+ * This export is additive within ABI version 4: it introduces no struct and
+ * changes no existing signature, so a host that only calls the older functions
+ * remains correct. */
+OMNI_API int32_t OMNI_CALL omni_check_update(const char *manifest,
+                                             size_t len,
+                                             char *out_version,
+                                             size_t out_cap);
+
 /* Create an engine. Returns NULL if allocation itself failed. */
 OMNI_API OmniEngine *OMNI_CALL omni_engine_new(void);
 

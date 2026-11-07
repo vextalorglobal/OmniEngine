@@ -47,6 +47,16 @@
  * result readable until the next call -- see `tryRunMany` for the version that
  * reports failures as data.
  *
+ * Ask whether a newer engine is published -- a check, never a download:
+ *
+ *     const check = await require('omniengine').checkUpdates();
+ *     if (check.available) console.log(check.latest, 'is out');
+ *
+ * The comparison runs inside the loaded library (`omni_check_update`), so the
+ * version and ABI it uses are the ones the engine actually speaks. A failed
+ * check is data (`status: 'error'`), not an exception, because an update notice
+ * must never break the program that asked for it.
+ *
  * Arguments arrive as numbers, booleans, strings, or null, and the return value
  * travels back the same way. An exception in your function is not a crash: it
  * becomes an `OmniError` whose kind is `'host'`, carrying your message to the
@@ -64,12 +74,36 @@
 const bindingsModule = require('./lib/bindings');
 const { loadBindings, OmniError, OmniLibraryError, STATUS, TAG, statusName, tagName } = bindingsModule;
 const { libraryFileName, resolveLibrary } = require('./lib/discover');
+const fs = require('node:fs/promises');
+const { fileURLToPath } = require('node:url');
 
 /** Version of this SDK, kept equal to the workspace version of OmniEngine. */
 const VERSION = '0.1.0';
 
 /** Default size for the buffer that error text is copied into. */
 const ERROR_BUFFER_SIZE = 4096;
+
+/** Where a release check looks when the caller names nothing else. */
+const DEFAULT_UPDATE_URL =
+  'https://github.com/fahim5536/omniengine/releases/latest/download/omni-update.json';
+
+/** Names another manifest source: a URL or a `file://` path. */
+const UPDATE_URL_ENV = 'OMNI_UPDATE_URL';
+
+/** Set to `1` to permit plain HTTP manifest URLs. */
+const ALLOW_INSECURE_ENV = 'OMNI_ALLOW_INSECURE';
+
+/** Set to `1` to make every Engine start a background check. */
+const UPDATE_CHECK_ENV = 'OMNI_UPDATE_CHECK';
+
+/** Operating system and architecture, as a release manifest names them. */
+const PLATFORM_KEYS = Object.freeze({
+  'win32-x64': 'win32-x64',
+  'linux-x64': 'linux-x64',
+  'linux-arm64': 'linux-arm64',
+  'darwin-x64': 'darwin-x64',
+  'darwin-arm64': 'darwin-arm64',
+});
 
 /**
  * @typedef {object} Result
@@ -99,7 +133,9 @@ class Engine {
   /**
    * Create an engine.
    *
-   * @param {{ libraryPath?: string }} [options] point at an explicit artifact
+   * @param {{ libraryPath?: string, updateCheck?: boolean }} [options] point at
+   *   an explicit artifact; `updateCheck: true` starts a release check in the
+   *   background (also enabled by `OMNI_UPDATE_CHECK=1`)
    * @throws {OmniLibraryError} if the library is missing, is not this ABI level,
    *   or koffi is not installed
    */
@@ -133,6 +169,13 @@ class Engine {
     // while this Map holds it, and `koffi.unregister` releases it. A callback
     // that is not registered has no handle, so the engine never calls dead code.
     this._hostFns = new Map();
+
+    // A background check is opt-in and starts only after the engine exists, so
+    // a host that never asks pays nothing. The promise resolves to an
+    // UpdateCheck and never rejects: an unreachable server must not surface as
+    // an unhandled rejection in the host's process.
+    const wanted = options.updateCheck === undefined ? envWantsCheck() : Boolean(options.updateCheck);
+    this.updateCheck = wanted ? checkUpdates({ libraryPath: options.libraryPath }) : null;
   }
 
   /** Absolute path of the library this engine is talking to. */
@@ -816,8 +859,234 @@ function anyItemFailed(statuses, count) {
   return false;
 }
 
+/** This host's release key, or `null` when no build is published for it. */
+function platformKey() {
+  return PLATFORM_KEYS[`${process.platform}-${process.arch}`] || null;
+}
+
+function allowInsecure() {
+  return ['1', 'true', 'yes'].includes(String(process.env[ALLOW_INSECURE_ENV] || '').toLowerCase());
+}
+
+/**
+ * Read a manifest over HTTPS, or from `file://` for a local mirror.
+ *
+ * Plain HTTP is refused unless `OMNI_ALLOW_INSECURE` is set: a check that can be
+ * redirected to an unauthenticated channel lets the network choose which release
+ * you are offered.
+ *
+ * @param {string} url
+ * @param {number} timeoutMs
+ * @returns {Promise<Buffer>}
+ */
+async function defaultFetch(url, timeoutMs) {
+  if (url.startsWith('file://')) {
+    const path = fileURLToPath(url);
+    const data = await fs.readFile(path);
+    return data.length > bindingsModule.MAX_MANIFEST_LEN + 1
+      ? data.subarray(0, bindingsModule.MAX_MANIFEST_LEN + 1)
+      : data;
+  }
+  if (!url.startsWith('https://') && !url.startsWith('http://')) {
+    throw new Error(`unsupported update URL ${JSON.stringify(url)}; expected https:// or file://`);
+  }
+  if (url.startsWith('http://') && !allowInsecure()) {
+    throw new Error(
+      `refusing plain HTTP for ${JSON.stringify(url)}; use https, or set ${ALLOW_INSECURE_ENV}=1 to allow it`
+    );
+  }
+  if (typeof fetch !== 'function') {
+    throw new Error('this Node has no global fetch; use Node 18 or later, or pass a fetch function');
+  }
+
+  // A cap, not a guess: the body is read at most MAX_MANIFEST_LEN + 1 bytes so a
+  // server that keeps sending cannot exhaust host memory before the engine
+  // refuses the document for being too large.
+  const cap = bindingsModule.MAX_MANIFEST_LEN + 1;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: { 'user-agent': `omni-node/${VERSION}` },
+    });
+    if (!response.ok) throw new Error(`the update server answered HTTP ${response.status}`);
+    const chunks = [];
+    let total = 0;
+    if (response.body && typeof response.body.getReader === 'function') {
+      const reader = response.body.getReader();
+      try {
+        while (total < cap) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const take = value.subarray(0, Math.min(value.length, cap - total));
+          chunks.push(Buffer.from(take));
+          total += take.length;
+          if (take.length < value.length) break;
+        }
+      } finally {
+        await reader.cancel().catch(() => {});
+      }
+    } else {
+      chunks.push(Buffer.from(await response.arrayBuffer()).subarray(0, cap));
+      total = chunks[0].length;
+    }
+    return Buffer.concat(chunks, total);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Ask the loaded library to compare this build with one manifest. */
+function compareWithEngine(b, document) {
+  if (typeof b.checkUpdate !== 'function') {
+    throw new OmniLibraryError(
+      `${b.path} does not export omni_check_update, so it predates the update check. Rebuild it:\n` +
+        '    cargo build -p omni-ffi'
+    );
+  }
+  const bytes = Buffer.isBuffer(document) ? document : Buffer.from(String(document), 'utf8');
+  const out = Buffer.alloc(64);
+  const status = Number(b.checkUpdate(bytes, bytes.length, out, out.length));
+  const end = out.indexOf(0);
+  const latest = (end === -1 ? out : out.subarray(0, end)).toString('utf8');
+  return { status, latest };
+}
+
+/**
+ * What one release check found.
+ *
+ * `status` is `'up-to-date'`, `'available'`, `'abi-mismatch'`, `'invalid'` (the
+ * manifest is not one this engine reads), `'bad-argument'` (too large), or
+ * `'error'` (the check itself failed -- no network, a library too old to
+ * compare, a URL refused). `asset` is present only when this platform has a
+ * download listed.
+ */
+class UpdateCheck {
+  constructor(fields) {
+    this.status = fields.status;
+    this.current = fields.current;
+    this.latest = fields.latest || '';
+    this.abi = fields.abi === undefined ? null : fields.abi;
+    this.notes = fields.notes === undefined ? null : fields.notes;
+    this.asset = fields.asset === undefined ? null : fields.asset;
+    this.url = fields.url === undefined ? null : fields.url;
+    this.error = fields.error === undefined ? null : fields.error;
+    Object.freeze(this);
+  }
+
+  /** A newer build is published for this ABI and platform. */
+  get available() {
+    return this.status === 'available';
+  }
+
+  /** The check ran and the manifest was readable. */
+  get ok() {
+    return ['up-to-date', 'available', 'abi-mismatch'].includes(this.status);
+  }
+
+  toString() {
+    if (this.status === 'error') return `update check failed: ${this.error}`;
+    if (this.status === 'available') return `omni ${this.latest} is available; this is ${this.current}`;
+    if (this.status === 'abi-mismatch') {
+      return `release ${this.latest} speaks ABI ${this.abi}; this build speaks ABI ${bindingsModule.ABI_VERSION}`;
+    }
+    if (this.status === 'up-to-date') return `omni ${this.current} is up to date`;
+    return `update status: ${this.status}`;
+  }
+}
+
+/**
+ * Ask whether a newer OmniEngine is published. Never downloads anything.
+ *
+ * The comparison runs in the engine itself, so the version and ABI it checks
+ * are the ones the loaded library actually speaks.
+ *
+ * @param {object} [options]
+ * @param {string|Buffer} [options.manifest] the document itself; no network call
+ * @param {string} [options.url] a manifest location; falls back to
+ *   `$OMNI_UPDATE_URL`, then the GitHub release
+ * @param {number} [options.timeoutMs] how long the request may take
+ * @param {(url: string, timeoutMs: number) => any} [options.fetch] a replacement reader
+ * @param {boolean} [options.raiseOnError] reject instead of returning `'error'`
+ * @param {string} [options.libraryPath] point at an explicit engine artifact
+ * @returns {Promise<UpdateCheck>}
+ */
+async function checkUpdates(options = {}) {
+  let source = options.url || process.env[UPDATE_URL_ENV] || DEFAULT_UPDATE_URL;
+  try {
+    let data;
+    if (options.manifest === undefined || options.manifest === null) {
+      const reader = options.fetch || defaultFetch;
+      data = await reader(source, options.timeoutMs === undefined ? 5000 : options.timeoutMs);
+    } else {
+      data = options.manifest;
+      source = null;
+    }
+    const text = Buffer.isBuffer(data) ? data.toString('utf8') : String(data);
+    const b = loadBindings(options.libraryPath);
+    const verdict = compareWithEngine(b, text);
+
+    let notes = null;
+    let abi = null;
+    let asset = null;
+    let document = null;
+    try {
+      document = JSON.parse(text);
+    } catch {
+      document = null;
+    }
+    if (document && typeof document === 'object' && !Array.isArray(document)) {
+      if (typeof document.notes === 'string') notes = document.notes;
+      if (Number.isInteger(document.abi)) abi = document.abi;
+      const key = platformKey();
+      const assets = document.assets;
+      if (
+        key &&
+        assets &&
+        typeof assets === 'object' &&
+        assets[key] &&
+        typeof assets[key].url === 'string' &&
+        typeof assets[key].sha256 === 'string'
+      ) {
+        asset = { url: assets[key].url, sha256: assets[key].sha256 };
+      }
+    }
+
+    return new UpdateCheck({
+      status: bindingsModule.UPDATE_STATUS_NAMES[verdict.status] || `status-${verdict.status}`,
+      current: VERSION,
+      latest: verdict.latest,
+      abi,
+      notes,
+      asset,
+      url: source,
+    });
+  } catch (err) {
+    if (options.raiseOnError) throw err;
+    return new UpdateCheck({
+      status: 'error',
+      current: VERSION,
+      url: source,
+      error: `${err.name || 'Error'}: ${err.message || err}`,
+    });
+  }
+}
+
+/** Whether an Engine should start a check without being asked to. */
+function envWantsCheck() {
+  return ['1', 'true', 'yes'].includes(String(process.env[UPDATE_CHECK_ENV] || '').toLowerCase());
+}
+
 module.exports = {
   Engine,
+  UpdateCheck,
+  checkUpdates,
+  platformKey,
+  DEFAULT_UPDATE_URL,
+  UPDATE_URL_ENV,
+  ALLOW_INSECURE_ENV,
+  UPDATE_CHECK_ENV,
   OmniError,
   OmniLibraryError,
   STATUS,
@@ -845,6 +1114,9 @@ module.exports = {
   },
   get MAX_BATCH() {
     return bindingsModule.MAX_BATCH;
+  },
+  get MAX_MANIFEST_LEN() {
+    return bindingsModule.MAX_MANIFEST_LEN;
   },
   get HOST_OK() {
     return bindingsModule.HOST_OK;

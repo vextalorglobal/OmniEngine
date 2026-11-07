@@ -27,8 +27,23 @@ mutable reference. `omni_exec_many` / `run_many` / `runMany` carries up to 4,096
 programs in one crossing; a failing item reports its own status and text without
 stopping the rest.
 
-**Quality.** 21 of 21 cross-host verification rows pass on this machine: 225 Rust
-tests, 107 Python, 93 Node, plus the C embedding example. `cargo fmt --check` and
+**A standard toolkit.** Eleven builtins need no host registration — `abs`,
+`min`, `max`, `clamp`, `floor`, `ceil`, `round`, `len`, `trim`, `upper`,
+`lower`. A runtime error names its position as `[Line 2, Col 13]` with a byte
+column that reads identically in every host, `last_exec_micros` carries the most
+recent execution time through bytes that were already padding, and `eval_str` /
+`eval` hand back native platform values instead of a wrapper.
+
+**Staying current.** `omni update` reads a release manifest over HTTPS, verifies
+the SHA-256 it names, and replaces the binary by rename, restoring the old file
+if any step fails. `omniup` updates an `omni` that is not the running process.
+Both SDKs can report the same answer (`omni.check_updates()`,
+`checkUpdates()`) without downloading anything, and the comparison itself lives
+in the engine's `omni_check_update` export so every surface agrees on what
+"newer" means. Plain HTTP is refused by default.
+
+**Quality.** 33 of 33 cross-host verification rows pass on this machine: 269 Rust
+tests, 120 Python, 114 Node, plus the C embedding example. `cargo fmt --check` and
 `cargo clippy -- -D warnings` are clean.
 
 **Packaging.** A platform wheel carries the engine in `omni/_native/`; the npm

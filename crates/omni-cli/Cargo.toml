@@ -6,10 +6,21 @@ edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 repository.workspace = true
+# Two binaries ship together; `cargo run -p omni-cli --` must keep meaning the
+# engine, not fail because it cannot choose between them.
+default-run = "omni"
+
+[lib]
+name = "omni_cli"
+path = "src/lib.rs"
 
 [[bin]]
 name = "omni"
 path = "src/main.rs"
+
+[[bin]]
+name = "omniup"
+path = "src/bin/omniup.rs"
 
 [dependencies]
 omni-core.workspace = true

@@ -148,6 +148,37 @@ error messages is a binding that can hide one.
 Prefer data to exceptions? `tryRun` returns
 `{ status, statusName, result, message }` and never throws.
 
+## Checking for updates
+
+```js
+const { checkUpdates } = require('omniengine');
+
+const result = await checkUpdates();
+result.status;      // 'available' | 'up-to-date' | 'abi-mismatch' | 'invalid' | 'error'
+result.current;     // '0.1.0'
+result.latest;      // '0.2.0'
+result.available;   // true when latest > current
+result.abi; result.notes; result.asset; result.url;
+```
+
+The manifest is fetched over HTTPS (Node 18+ `fetch`; `OMNI_UPDATE_URL`
+overrides the default GitHub Releases URL, and `file://` is supported for
+testing), parsed for its notes and platform asset, and compared by the engine's
+own `omni_check_update`, so the SDK and the CLI cannot disagree about what
+"newer" means. It downloads nothing and replaces nothing — `omni update` does
+that. The promise never rejects: a failure is `status: 'error'` with the reason
+in `.error`, unless you pass `{ raiseOnError: true }`.
+
+To check at construction, opt in:
+
+```js
+const engine = new Engine({ updateCheck: true }); // or OMNI_UPDATE_CHECK=1
+await engine.updateCheck;                         // UpdateCheck, or null if off
+```
+
+The request starts in the background, startup is never blocked, and a failure
+stays inside the promise.
+
 ## Calling back into JavaScript
 
 A script can call a JS function. Bind it by name, with the arity the script will
@@ -274,7 +305,7 @@ rule above. Measure it with `engine.stats()` before optimising around it.
 ```bash
 cd sdks/nodejs
 npm install koffi
-npm test                                   # 101 tests, node:test
+npm test                                   # 114 tests, node:test
 node bench.js                              # measured numbers for this machine
 ```
 

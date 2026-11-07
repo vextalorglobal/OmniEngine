@@ -28,16 +28,17 @@ or Phase 3.
 | Phase 2 — core engine | done | 164 `omni-core` tests |
 | Phase 3 — C ABI + header | done | 60 `omni-ffi` tests, PE export table, `examples/c/embed.c` |
 | Phase 4 — extension and Linguist | done (tier 1) | `.gitattributes`, `examples/*.omni` |
-| Phase 5 — SDKs and DX | done | 120 Python + 101 Node tests, CLI, wasm scaffold |
+| Phase 5 — SDKs and DX | done | 120 Python + 114 Node tests, CLI, wasm scaffold |
 | Strings, egress memory, ABI v2 | done | 4 new exports, `omni_str_copy` + `omni_define_string` + `omni_debug_stats` + `omni_abi_version` tested from all four hosts |
 | Host callbacks, re-entrancy, ABI v3 | done | `omni_register_host_fn` + `omni_unregister_host_fn` + `omni_host_fn_count`, a `RefCell` borrow guard on every entry point, and call syntax in the parser |
 | Batch execution, benchmarks, ABI v4 | done | `omni_exec_many` + `omni_batch_error`, checkpointed arena reclamation, three zero-dependency benchmark harnesses and `scripts/bench.sh` (§4.8, §4.9) |
-| Packaging, distribution, release | done | platform wheels with the engine inside, an npm tarball with five engines, `scripts/package.py`, `scripts/check-versions.py`, `.github/workflows/release.yml` (§6.6, `docs/RELEASING.md`) |
+| Packaging, distribution, release | done | platform wheels with the engine inside, an npm tarball with five engines, `scripts/package.py`, `scripts/check-versions.py`, `.github/workflows/release.yml` (§6.7, `docs/RELEASING.md`) |
 | DevPack: builtins, positions, timer, sugar | done | 11 builtins, `[Line N, Col M]` errors, `last_exec_micros` in ABI-4 padding, `eval_str` / `eval` (§3.5, §4.4, §6.1–6.2) |
-| Same answer from four hosts | done | `scripts/verify-all.sh` — 25 rows, all passing |
+| Auto-updater and CLI manager | done | `omni_check_update` in the C ABI, `omni update` / `omni check-update` / `omniup`, `omni.check_updates()` and `checkUpdates()`, `scripts/cli-binaries.py` + `scripts/make-manifest.py` (§6.4–6.5) |
+| Same answer from four hosts | done | `scripts/verify-all.sh` — 33 rows, all passing |
 
 ```
-cargo test --workspace          # 238 tests
+cargo test --workspace          # 269 tests
 ./scripts/verify-all.sh         # Rust, C, Python, Node: 42, "hello, world", ABI 4
 ./scripts/bench.sh              # three hosts, one crossing each, measured
 python scripts/check-versions.py  # one version, one ABI across every surface
@@ -989,7 +990,7 @@ statistics on purpose — they are the engine.
 Both SDKs are thin, both are stdlib-only or nearly so. A **release package
 carries the engine**, built from the same tag in the same CI run; a **checkout
 install** uses the library you built locally. Section 6.3 lists where each one
-looks, and section 6.6 describes the packaging itself.
+looks, and section 6.7 describes the packaging itself.
 
 ### 6.1 Python
 
@@ -1217,12 +1218,24 @@ not by refusing to ship one.
 cargo run -p omni-cli -- run examples/hello.omni      # 42
 cargo run -p omni-cli -- run examples/strings.omni    # hello, world 😀
 cargo run -p omni-cli -- eval "2 + 3 * 4"             # 14
+cargo run -p omni-cli -- --version                    # omni 0.1.0 (language v1, ABI 4)
+cargo run -p omni-cli -- check-update                 # 0, or 10 when newer exists
+cargo run -p omni-cli -- update --dry-run             # 10, downloads nothing
 ```
 
-Exit codes are 0 success, 1 program error, 2 usage or I/O error, so a shell
-script can tell "your expression is wrong" from "you invoked me wrong". Argument
-parsing is hand-rolled; `clap` would add a dozen crates and a few hundred MB of
-build cache for three subcommands.
+Exit codes separate the six things a script needs to tell apart:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | success, or already up to date |
+| 1 | the program parsed but failed to run |
+| 2 | usage error, unreadable file, or a failed check |
+| 3 | the update failed verification or could not be installed |
+| 10 | a newer release exists (`check-update`, or `update --dry-run`) |
+| 11 | the release speaks a different ABI |
+
+Argument parsing is hand-rolled; `clap` would add a dozen crates and a few
+hundred MB of build cache for six subcommands.
 
 A string result prints as its text, through `Engine::render` rather than
 `Value`'s own `Display` — which deliberately prints `<string>` for a box it
@@ -1231,7 +1244,115 @@ that owns the bytes may do. The CLI is exactly where a program's string result
 should be readable, so it asks the owner. That distinction is a test
 (`a_string_result_prints_its_content`), not a comment.
 
-### 6.5 The wasm scaffold
+`--version` answers without loading a program or touching the network: it reads
+the compiled-in `CARGO_PKG_VERSION`, says `language v1`, and reports the ABI the
+binary was built against. A script that gates on the engine's version pays for
+one process spawn, nothing else.
+
+### 6.5 Staying current: the updater
+
+The check and the transport are separate on purpose. The engine parses and
+compares; it never opens a socket. `omni_check_update` takes a manifest **the
+caller already fetched** — bytes and a length — and returns a status:
+
+```c
+int omni_check_update(const void *manifest, size_t len,
+                      char *out_version, size_t out_cap);
+```
+
+| Return | Meaning |
+| --- | --- |
+| 0 | this build is up to date |
+| 1 | a newer version is offered |
+| 2 | the release speaks a different ABI |
+| 3 | the manifest is not valid |
+| -1 | bad argument (null pointer, oversized input, invalid UTF-8) |
+
+It also writes the manifest's version, NUL-terminated, into the caller's buffer,
+so a host can print "0.2.0 is available" without parsing JSON twice. Input is
+capped at 1 MiB, the manifest must be a flat object with a version, and any
+`assets` entries are validated, not interpreted. That makes one small export
+usable by the CLI and both SDKs from the same bytes, and it keeps the engine
+zero-dependency — no TLS, no HTTP, no JSON library. The wasm scaffold does not
+expose it yet; it will mirror the same status codes when it gains a surface.
+
+The manifest is one document per release:
+
+```json
+{
+  "version": "0.2.0",
+  "abi": 4,
+  "notes": "what changed",
+  "assets": {
+    "win32-x64":    { "url": "https://…/omni-win32-x64.exe",   "sha256": "…64 hex…" },
+    "linux-x64":    { "url": "https://…/omni-linux-x64",       "sha256": "…" },
+    "linux-arm64":  { "url": "https://…/omni-linux-arm64",     "sha256": "…" },
+    "darwin-x64":   { "url": "https://…/omni-darwin-x64",      "sha256": "…" },
+    "darwin-arm64": { "url": "https://…/omni-darwin-arm64",    "sha256": "…" }
+  }
+}
+```
+
+**`omni update`** fetches it (default
+`https://github.com/fahim5536/omniengine/releases/latest/download/omni-update.json`,
+overridable with `--manifest` or `OMNI_UPDATE_URL`; `file://` is accepted for
+local testing), picks the asset for this platform, downloads it, and checks the
+SHA-256 before anything touches the disk. Plain `http://` is refused unless
+`OMNI_ALLOW_INSECURE=1` is set, because an unauthenticated manifest is an
+unauthenticated binary. Fetching uses `curl` with `--proto`/`--proto-redir`
+restrictions and a 60-second cap, falling back to `wget` only when curl is
+absent.
+
+Replacement is atomic and reversible:
+
+1. the verified bytes go to `.<name>.new` beside the target;
+2. the target is renamed to `<name>.bak`;
+3. the new file is renamed into place;
+4. if step 3 fails, the backup is renamed back and the error is reported.
+
+On Windows a running image cannot be deleted but can be renamed, so a binary
+updating itself leaves `omni.exe.bak` and says so. The backup is the undo:
+`mv omni.exe.bak omni.exe` restores the old build. Without `-y` / `--yes` it
+asks before replacing, and a closed stdin — a cron job or a CI step — reads as
+"no", not as consent. `--dry-run` stops after the check with exit code 10.
+
+**`omniup`** is the same updater as a separate binary. The point is to update an
+`omni` that is *not* the process doing the updating, which is what a package
+manager or a self-updating install needs:
+
+```bash
+omniup check                                  # 0 up to date, 10 newer, 11 other ABI
+omniup update --target ./omni -y              # replace a specific file
+omniup update --manifest file:///D:/dist/omni-update.json --dry-run
+```
+
+**In the SDKs**, the check is opt-in and notify-only:
+
+```python
+import omni
+result = omni.check_updates()                 # status, current, latest, abi, notes, asset
+result.available                              # True when latest > current
+```
+
+```js
+const { checkUpdates } = require('omniengine');
+const result = await checkUpdates();          // { status, current, latest, abi, notes, asset }
+```
+
+Neither downloads or installs anything — an SDK that silently replaced the
+library under a running interpreter would be a footgun, and the ABI check
+already refuses an incompatible engine at load time. A background check is
+available but off by default: `Engine(background_check=True)` in Python,
+`new Engine({ updateCheck: true })` in Node, or `OMNI_UPDATE_CHECK=1` in either.
+It runs on a daemon thread / an unawaited promise, never delays startup, never
+throws, and never prints — the result is only there if the host looks.
+
+A library built before this export existed is still usable: Python guards the
+declaration with `hasattr`, Node with a `try` around `lib.func`, and a missing
+symbol becomes one actionable error ("rebuild it: cargo build -p omni-ffi")
+rather than a crash.
+
+### 6.6 The wasm scaffold
 
 `crates/omni-wasm` is a workspace member but not a default member, so
 `cargo build` never needs `wasm32-unknown-unknown`, which is not installed here.
@@ -1248,15 +1369,33 @@ cargo build --target wasm32-unknown-unknown -p omni-wasm        # needs the targ
 `wasm-bindgen` is deliberately absent from `Cargo.toml`. Declaring a dependency
 that cannot compile on this machine would put an unusable entry in `Cargo.lock`.
 
-### 6.6 Packaging: what a release contains
+### 6.7 Packaging: what a release contains
 
-Three artifacts, and each one carries the engine it needs:
+Four artifacts, and each one carries the engine it needs:
 
 | Artifact | Shape | Built by |
 | --- | --- | --- |
 | Python wheel | one per platform, `omni/_native/<lib>` inside | `setup.py` + `build`, retagged |
 | npm tarball | one for all platforms, `native/<platform>-<arch>/<lib>` ×5 | `npm pack`, `prepack` guard |
 | C archive | one per target, `lib/`, `include/`, `examples/c/`, README, LICENSE | `scripts/package.py` |
+| CLI binaries | one `omni` and one `omniup` per platform, plus `omni-update.json` | `scripts/cli-binaries.py`, `scripts/make-manifest.py` |
+
+The two command-line binaries are staged with a `.sha256` sidecar under
+`dist/binaries/`, named `omni-<platform>[.exe]` and `omniup-<platform>[.exe]`.
+`scripts/make-manifest.py` then reads the version from `Cargo.toml` and the ABI
+from `omni.h`, recomputes each adjacent digest, and writes the single
+`omni-update.json` that `omni update` fetches:
+
+```bash
+python scripts/cli-binaries.py --platform win32-x64
+python scripts/make-manifest.py --tag v0.1.0 --notes "what changed"
+```
+
+`--tag` must name the workspace version; on a manual run `--base <url>` builds
+asset URLs instead. A missing platform is an error unless `--allow-partial` is
+given, so a release cannot quietly ship a manifest that offers Windows an update
+and leaves macOS behind. The digests in the manifest are the digests recomputed
+here — a stale sidecar fails the manifest build, not the user's update.
 
 **The wheel.** `pyproject.toml` is metadata and nothing else; `setup.py` exists
 to put a Rust artifact inside a Python package, which setuptools cannot do by
@@ -1372,7 +1511,7 @@ One command, and it is the acceptance test for the whole brief:
 ./scripts/verify-all.sh
 ```
 
-Measured output on 2026-11-07, with the DevPack increment in it:
+Measured output on 2026-11-07, with the DevPack and updater increments in it:
 
 ```
 == OmniEngine cross-host verification ==
@@ -1380,7 +1519,7 @@ Measured output on 2026-11-07, with the DevPack increment in it:
 
 Rust tests... Shared library... omni-cli... C embedding... Python SDK... Node SDK... A string is the same bytes in every host... One type error, the same text everywhere... Every surface agrees on the ABI level... String results do not grow memory... A host function answers the same bytes in every host... A host failure is data, and says so identically... Re-entering the engine from a callback is refused, not crashed... The registry says the same thing from both sides... A batch answers the same items in every host... A failing item names itself identically in every host... A batch counts items, not crossings, and reserves nothing extra... A batch inside a host callback is refused, not crashed... The DevPack builtins answer the same in every host... A second-line error names line and byte column in every host... eval_str and eval hand back native values... The last execution timer crosses as microseconds...
 == Results ==
-  PASS  cargo test --workspace (238 tests)
+  PASS  cargo test --workspace (269 tests)
   PASS  omni.dll (5.5M)
   PASS  omni run examples/hello.omni -> 42
   PASS  omni run examples/strings.omni -> hello, world 😀
@@ -1388,7 +1527,7 @@ Rust tests... Shared library... omni-cli... C embedding... Python SDK... Node SD
   PASS  python ctypes -> 42.0
   PASS  python SDK tests (120 tests)
   PASS  node koffi -> 42
-  PASS  node SDK tests (ℹ tests 101 ℹ pass 101 ℹ fail 0 )
+  PASS  node SDK tests (ℹ tests 114 ℹ pass 114 ℹ fail 0 )
   PASS  concat + \u{...} identical in: cli python node
   PASS  the mixed-type message survives the boundary in: cli python node c
   PASS  ABI 4 declared and read identically: header=4 C=4 python=4/lib=4 node=4/lib=4
@@ -1405,6 +1544,15 @@ Rust tests... Shared library... omni-cli... C embedding... Python SDK... Node SD
   PASS  line 2, column 13, and the operator's message in: cli python node
   PASS  int/number, str/string, bool/boolean with no wrapper in: python node
   PASS  one 200 KB execution timed, non-zero and in microseconds: python(914us) node(1054us)
+  PASS  omni --version -> omni 0.1.0 (language v1, ABI 4)
+  PASS  omni check-update -> 0, omni 0.1.0 is up to date (ABI 4)
+  PASS  omni check-update -> 10, omni 99.0.0 is available; this build is 0.1.0
+  PASS  omni check-update -> 11, release 99.0.0 speaks ABI 5; this build speaks ABI 4
+  PASS  omniup update -> 3, target unchanged
+  PASS  omniup update --dry-run -> 10, nothing fetched
+  PASS  omniup update -> 0, target now the release bytes
+  PASS  the replaced binary still runs: omni 0.1.0 (language v1, ABI 4)
+  PASS  omni update -> 0, the running image is kept at omni.exe.bak
 
 All checks that could run, passed.
 ```
@@ -1413,10 +1561,10 @@ All checks that could run, passed.
 artifacts are checked separately, because they are what a consumer gets and
 nothing in the suite above touches them: a wheel installed into a clean venv
 outside the repository, an extracted npm tarball, and a C archive compiled
-against its own header. Those runs are recorded in section 6.6, with the sizes
+against its own header. Those runs are recorded in section 6.7, with the sizes
 they produced.
 
-The last sixteen rows are the ones that could not exist in one host. The string
+The last twenty-four rows are the ones that could not exist in one host. The string
 comparison is byte-exact — an escape decoded differently in Rust and Node passes
 both test suites and is still a broken bridge — and the ABI row reads the number
 off the header, the loaded library as C sees it, and the library as each SDK sees
@@ -1438,10 +1586,20 @@ message in all three; `eval_str` and `eval` hand each host a native value rather
 than a wrapper; and a 200 KB program's measured execution time crosses as a
 non-zero microsecond count in both SDKs.
 
+The eight update rows are different in kind: they run the real binaries against
+a manifest written to a temporary directory. `check-update` is asked three times
+— a matching version must exit 0, a newer one 10, a different ABI 11 — and the
+installer is attacked four ways. A wrong checksum must leave the target's bytes
+untouched; a dry run must fetch nothing and still exit 10; a good manifest must
+replace the file with the exact payload, which is then executed to prove it
+runs; and a self-update must succeed while keeping the running image beside it
+as `omni.exe.bak` on Windows, where a running executable can be renamed but not
+deleted. On Unix the same row asserts no backup is left.
+
 The script degrades to `SKIP` rather than lying. `cargo`, `gcc`, `python` and
 `node` each have their own guard, Node without `koffi` is skipped with
 `npm install koffi` in the reason, and each cross-host row skips itself when fewer
-than two hosts answered. Nothing was skipped on this machine — all twenty-five
+than two hosts answered. Nothing was skipped on this machine — all thirty-three
 rows ran. The Rust row runs the suite once into a log and reads its exit status;
 an earlier version piped cargo into `grep` under `pipefail`, which let a failing
 suite inherit a successful-looking pipeline and briefly hid a stale CLI test. `omni-wasm` has no row here because `wasm32-unknown-unknown` is not
@@ -1453,16 +1611,17 @@ Against the brief's five phases:
 
 | Phase | Asked for | Verified by |
 | --- | --- | --- |
-| 1 | Workspace on D:, fast compiles, managed `target/` | `cargo test --workspace` 238 tests; `target/` measured at 351 MB |
+| 1 | Workspace on D:, fast compiles, managed `target/` | `cargo test --workspace` 269 tests; `target/` measured at 351 MB |
 | 2 | Ultra-fast memory-safe core, no GC | NaN-boxed 8-byte `Value` asserted for size; arena reset is O(chunks); egress rewind keeps reservations flat over 100,000 executions; no collector exists to pause |
 | 3 | C ABI callable from Python and JavaScript | same `42` and the same `hello, world 😀` from Rust, C, Python, Node; 16 exports confirmed with `objdump -p`; `omni.h` compiles warning-free under `-Wall -Wextra` |
 | 4 | A custom extension GitHub recognises | `.gitattributes` tier 1; the tier-2 limit is stated in section 5.3 rather than glossed over |
-| 5 | `pip`/`npm` SDKs that do not move the language stats | 120 + 101 SDK tests; `linguist-vendored` on `sdks/**`; release packages carry a CI-built engine, checkouts carry none |
+| 5 | `pip`/`npm` SDKs that do not move the language stats | 120 + 114 SDK tests; `linguist-vendored` on `sdks/**`; release packages carry a CI-built engine, checkouts carry none |
 
-Test totals: **164** in `omni-core`, **60** in `omni-ffi` (19 unit, 13 in
+Test totals: **173** in `omni-core`, **62** in `omni-ffi` (21 unit, 13 in
 `tests/batch.rs`, 20 in `tests/ffi_contract.rs`, and 8 in
-`tests/host_callbacks.rs`, which drive the ABI exactly as a host does), **7** in
-`omni-cli`, **7** in `omni-wasm`, **120** Python, **101** Node. The batch and
+`tests/host_callbacks.rs`, which drive the ABI exactly as a host does), **27** in
+`omni-cli` (12 library tests for the updater and the writer, 10 for `omni`, 5
+for `omniup`), **7** in `omni-wasm`, **120** Python, **114** Node. The batch and
 callback suites are contract tests against the header, not unit tests of the
 implementation they sit next to.
 
@@ -1632,7 +1791,7 @@ section 3.7 lists — control flow, collections, and user-defined functions.
 Release-side, three things are deliberately unfinished rather than unknown:
 
 - **0.1.0 is packaged, not published.** The workflow builds every artifact and
-  the local runs in section 6.6 passed, but PyPI and npm have not been touched.
+  the local runs in section 6.7 passed, but PyPI and npm have not been touched.
   Publishing is a tag and two credentials (`docs/RELEASING.md`).
 - **Linux wheels are `manylinux_2_39`.** They are built on Ubuntu 24.04 because
   that is the runner with the newest glibc, which makes them work on 24.04 and

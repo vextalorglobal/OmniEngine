@@ -9,7 +9,7 @@ it. The short version:
 
 ```bash
 python scripts/check-versions.py          # one version, one ABI
-./scripts/verify-all.sh                   # 238 Rust, 120 Python, 101 Node checks
+./scripts/verify-all.sh                   # 269 Rust, 120 Python, 114 Node checks
 ./scripts/bench.sh                        # measured numbers, not regressions
 git tag v0.1.0 && git push origin v0.1.0  # the only release action
 ```
@@ -21,6 +21,8 @@ git tag v0.1.0 && git push origin v0.1.0  # the only release action
 | `omniengine-0.1.0-<target>.zip` / `.tar.gz` + `.sha256` | win x64 (MSVC), linux x64/arm64 (glibc 2.39), macos x64/arm64 | `scripts/package.py` |
 | `omniengine-0.1.0-py3-none-<platform>.whl` | `win_amd64`, `manylinux_2_39_{x86_64,aarch64}`, `macosx_{10_12_x86_64,11_0_arm64}` | `sdks/python/setup.py` in CI |
 | `omniengine-0.1.0.tgz` | one tarball, five `native/` directories | `npm pack` after staging |
+| `omni-<platform>[.exe]`, `omniup-<platform>[.exe]` + `.sha256` | the same five platforms | `scripts/cli-binaries.py` |
+| `omni-update.json` | one manifest naming every platform's URL and digest | `scripts/make-manifest.py` |
 | GitHub Release | all of the above | `gh release create` |
 
 The native archive contains the shared library, its import library where the
@@ -31,6 +33,13 @@ A wheel contains `omni/_native/<lib>`; an npm tarball contains
 `native/<platform>-<arch>/<lib>`. Both are built from the tagged commit in the
 same workflow run, so the wrapper and the engine cannot be from different
 versions.
+
+The two command-line binaries are the update channel. `omni-update.json` is what
+`omni update` fetches from
+`https://github.com/fahim5536/omniengine/releases/latest/download/omni-update.json`;
+it names a URL and a SHA-256 for each platform, and the installer refuses bytes
+that do not match. Because it lives at the `/latest/` path, publishing a release
+is what starts offering it — there is no server to deploy.
 
 ## 2. Decisions, including the one that changed
 
@@ -87,7 +96,7 @@ python -m twine check dist/*.whl          # after building the wheel
 
 `check-versions.py` reads the workspace version from `Cargo.toml`, `[project]`
 from `pyproject.toml`, `version` from `package.json`, and the ABI from the C
-header plus both SDK constants. Any disagreement exits non-zero. The same checks
+header, both SDK constants, and the CLI updater's own copy. Any disagreement exits non-zero. The same checks
 run in `sdks/nodejs/scripts/prepack.js`, so `npm publish` cannot proceed on a
 disagreeing tree even if the workflow is bypassed.
 
@@ -127,15 +136,19 @@ git push origin v0.1.0
 The tag push runs the workflow. Jobs, in order:
 
 1. **guard** — versions and ABI agree, tag matches the manifests.
-2. **verify** — fmt, clippy, 225 Rust tests, both SDK suites.
+2. **verify** — fmt, clippy, 269 Rust tests, both SDK suites.
 3. **native** — five platforms, in parallel; each archive is smoke-tested with
-   `omni run examples/hello.omni` before upload.
-4. **python-wheels** — one wheel per platform, engine staged from that
+   `omni run examples/hello.omni` before upload, and the same job stages that
+   platform's `omni` and `omniup` with their checksums.
+4. **update-manifest** — waits for all five binaries, recomputes every digest,
+   and writes `omni-update.json` for the tagged version.
+5. **python-wheels** — one wheel per platform, engine staged from that
    platform's build, retagged `py3-none-<platform>`.
-5. **npm-package** — all five libraries staged under `native/`, `prepack.js`
+6. **npm-package** — all five libraries staged under `native/`, `prepack.js`
    enforces completeness, `npm pack`, then `npm publish --provenance`.
-6. **pypi** — Trusted Publishing uploads the wheels.
-7. **github-release** — archives, wheels, tarball and checksums attached.
+7. **pypi** — Trusted Publishing uploads the wheels.
+8. **github-release** — archives, wheels, tarball, both CLI binaries per
+   platform, the update manifest, and checksums attached.
 
 Re-running a failed tag build is safe: the GitHub Release step updates an
 existing release with `--clobber`, while PyPI and npm reject a version that
@@ -165,6 +178,19 @@ python -c "import omni, os; print(os.path.dirname(omni.__file__))"
 ls node_modules/omniengine/native/*/
 ```
 
+Then the update channel, from the same outside directory:
+
+```bash
+omni --version            # omni 0.1.0 (language v1, ABI 4)
+omni check-update; echo $?  # 0 -- the release you just published is current
+omni update --dry-run; echo $?  # 10 only when a *later* release exists
+```
+
+`check-update` returning 10 immediately after a release means the manifest names
+a version the binaries do not; 2 means the manifest was not reachable or does not
+parse. Both are release bugs and are fixed by republishing, not by editing a
+client.
+
 The npm install prints `omniengine: bundled engine verified (<platform>, ABI 4)`
 when postinstall succeeds. `OMNI_SKIP_POSTINSTALL=1` skips it;
 `OMNI_STRICT_POSTINSTALL=1` turns a missing artifact into a failed install.
@@ -182,6 +208,12 @@ exercises the header, the import library, and the DLL together.
   the honest default.
 - **GitHub**: mark the release as a pre-release or delete it. Tags are immutable
   here: fixing a bad release means a new patch version, never a force-push.
+- **The update feed**: `/latest/download/omni-update.json` follows whichever
+  release is marked latest. A bad manifest is corrected by publishing the next
+  patch version; a manifest that should not be served at all can be removed from
+  the release, which makes clients exit 2 (check failed) instead of installing
+  anything. Clients verify the digest before replacing a byte, so a truncated or
+  corrupted download is a refusal, not a broken install.
 
 ## 9. Known limits of this release
 
@@ -198,6 +230,9 @@ exercises the header, the import library, and the DLL together.
   machine. Splitting into per-platform optional packages would make installs
   smaller; it also makes five packages to version and publish. One tarball is
   the simpler honest trade-off at 0.1.0.
+- Update authenticity rests on TLS to GitHub plus the digest inside the
+  manifest: the SHA-256 catches corruption and a swapped asset, not a
+  compromised release host, and the manifest is not separately signed.
 - The workflow itself has been syntax-checked and every step it calls has been
   run locally on Windows, but a GitHub-hosted run has not been performed from
   this machine (no remote is configured here). The first tag push is the first

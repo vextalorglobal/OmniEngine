@@ -109,6 +109,31 @@ const MAX_BATCH = 4096;
 const HOST_OK = 0;
 const HOST_ERR = 1;
 
+/**
+ * `omni_check_update`'s answers, an additive export inside ABI 4.
+ *
+ * The structs and every other signature are unchanged, so a library built before
+ * this export still loads; only the release check is unavailable.
+ */
+const UPDATE = Object.freeze({
+  UP_TO_DATE: 0,
+  AVAILABLE: 1,
+  ABI_MISMATCH: 2,
+  INVALID: 3,
+  BAD_ARG: -1,
+});
+
+const UPDATE_STATUS_NAMES = Object.freeze({
+  0: 'up-to-date',
+  1: 'available',
+  2: 'abi-mismatch',
+  3: 'invalid',
+  '-1': 'bad-argument',
+});
+
+/** Largest manifest `omni_check_update` will read, mirroring the core limit. */
+const MAX_MANIFEST_LEN = 1 << 20;
+
 function statusName(status) {
   return STATUS_NAMES[status] || `status-${status}`;
 }
@@ -250,6 +275,20 @@ function declare(koffi, lib, resolvedPath) {
     );
   }
 
+  // Additive in ABI 4, so it is declared only when the library exports it. A
+  // library built before the update check still serves every other call, and
+  // checkUpdates() turns the missing symbol into one clear error at the moment
+  // someone asks for a release, not at load time. koffi throws when a function
+  // is declared rather than when it is called, which is why this is a try.
+  let checkUpdate = null;
+  try {
+    checkUpdate = lib.func(
+      'int32_t omni_check_update(const void *manifest, size_t len, char *out_version, size_t out_cap)'
+    );
+  } catch {
+    checkUpdate = null;
+  }
+
   const bindings = {
     koffi,
     lib,
@@ -271,6 +310,10 @@ function declare(koffi, lib, resolvedPath) {
     MAX_BATCH,
     HOST_OK,
     HOST_ERR,
+    UPDATE,
+    UPDATE_STATUS_NAMES,
+    MAX_MANIFEST_LEN,
+    checkUpdate,
     abiVersion,
     version: lib.func('const char *omni_version()'),
     engineNew: lib.func('void *omni_engine_new()'),
@@ -348,4 +391,7 @@ module.exports = {
   MAX_BATCH,
   HOST_OK,
   HOST_ERR,
+  UPDATE,
+  UPDATE_STATUS_NAMES,
+  MAX_MANIFEST_LEN,
 };

@@ -51,7 +51,14 @@ calls yourself.
 from __future__ import annotations
 
 import ctypes
-from collections.abc import Sequence
+import json
+import os
+import platform as _platform
+import sys
+import threading
+import urllib.parse
+import urllib.request
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from ._ffi import (
@@ -59,14 +66,20 @@ from ._ffi import (
     MAX_BATCH,
     MAX_CALL_DEPTH,
     MAX_IDENTIFIER_LEN,
+    MAX_MANIFEST_LEN,
     MAX_SOURCE_LEN,
     MAX_STRING_LEN,
     OMNI_ABI_VERSION,
     OMNI_ERR_REENTRANT,
     OMNI_ERR_RUNTIME,
     OMNI_OK,
+    OMNI_UPDATE_ABI_MISMATCH,
+    OMNI_UPDATE_AVAILABLE,
+    OMNI_UPDATE_INVALID,
+    OMNI_UPDATE_UP_TO_DATE,
     STATUS,
     TAGS,
+    UPDATE_STATUS,
     HostFunction,
     OmniError,
     OmniLibraryError,
@@ -75,11 +88,18 @@ from ._ffi import (
     Stats,
     library_file_name,
 )
+from ._ffi import check_update as _ffi_check_update
 
 __all__ = [
     "Engine",
     "Result",
     "Stats",
+    "UpdateCheck",
+    "BackgroundUpdateCheck",
+    "check_updates",
+    "start_background_check",
+    "platform_key",
+    "DEFAULT_UPDATE_URL",
     "OmniError",
     "OmniLibraryError",
     "HostFunction",
@@ -98,6 +118,259 @@ __all__ = [
 
 #: Version of this SDK, kept equal to the workspace version of OmniEngine.
 __version__ = "0.1.0"
+
+#: Where a release check looks when the caller names nothing else.
+DEFAULT_UPDATE_URL = (
+    "https://github.com/fahim5536/omniengine/releases/latest/download/omni-update.json"
+)
+
+#: Names another manifest source: a URL or a ``file://`` path.
+UPDATE_URL_ENV = "OMNI_UPDATE_URL"
+
+#: Set to ``1`` to permit plain HTTP manifest URLs.
+ALLOW_INSECURE_ENV = "OMNI_ALLOW_INSECURE"
+
+#: Set to ``1`` to make every :class:`Engine` start a background check.
+UPDATE_CHECK_ENV = "OMNI_UPDATE_CHECK"
+
+#: Operating system and architecture, as a release manifest names them.
+_PLATFORM_KEYS = {
+    ("win32", "x64"): "win32-x64",
+    ("linux", "x64"): "linux-x64",
+    ("linux", "arm64"): "linux-arm64",
+    ("darwin", "x64"): "darwin-x64",
+    ("darwin", "arm64"): "darwin-arm64",
+}
+
+_MACHINES = {
+    "x86_64": "x64",
+    "amd64": "x64",
+    "aarch64": "arm64",
+    "arm64": "arm64",
+}
+
+
+def platform_key() -> str | None:
+    """This host's release key, or ``None`` when no build is published for it.
+
+    The names match the manifest, the CLI and the directories both SDKs bundle,
+    so one release can describe every platform with the same words.
+    """
+    machine = _MACHINES.get(_platform.machine().lower())
+    if machine is None:
+        return None
+    return _PLATFORM_KEYS.get((sys.platform, machine))
+
+
+def _allow_insecure() -> bool:
+    return os.environ.get(ALLOW_INSECURE_ENV, "").lower() in ("1", "true", "yes")
+
+
+def _default_fetch(url: str, timeout: float) -> bytes:
+    """Read a manifest over HTTPS, or from ``file://`` for a local mirror.
+
+    Plain HTTP is refused unless :data:`ALLOW_INSECURE_ENV` is set: a check that
+    can be redirected to an unauthenticated channel lets the network choose
+    which release you are offered.
+    """
+    if url.startswith("file://"):
+        path = urllib.parse.unquote(url[len("file://") :])
+        if os.name == "nt" and path.startswith("/") and len(path) > 2 and path[2] == ":":
+            path = path[1:]  # file:///D:/x -> D:/x
+        with open(path, "rb") as handle:
+            return handle.read(MAX_MANIFEST_LEN + 1)
+    if not url.startswith(("https://", "http://")):
+        raise ValueError(f"unsupported update URL {url!r}; expected https:// or file://")
+    if url.startswith("http://") and not _allow_insecure():
+        raise ValueError(
+            f"refusing plain HTTP for {url!r}; use https, or set "
+            f"{ALLOW_INSECURE_ENV}=1 to allow it"
+        )
+    request = urllib.request.Request(
+        url, headers={"User-Agent": f"omni-python/{__version__}"}
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read(MAX_MANIFEST_LEN + 1)
+
+
+@dataclass(frozen=True)
+class UpdateCheck:
+    """What one release check found.
+
+    ``status`` is ``"up-to-date"``, ``"available"``, ``"abi-mismatch"``,
+    ``"invalid"`` (the manifest is not one this engine reads), ``"bad-argument"``
+    (too large), or ``"error"`` (the check itself failed -- no network, no
+    library old enough to compare, a URL refused). The other fields are filled
+    as far as the manifest got: ``latest`` and ``abi`` are empty when it did not
+    parse, and ``asset`` is present only when this platform has a download.
+    """
+
+    status: str
+    current: str
+    latest: str = ""
+    abi: int | None = None
+    notes: str | None = None
+    asset: dict[str, str] | None = None
+    url: str | None = None
+    error: str | None = None
+
+    @property
+    def available(self) -> bool:
+        """A newer build is published for this ABI and platform."""
+        return self.status == "available"
+
+    @property
+    def ok(self) -> bool:
+        """The check ran and the manifest was readable."""
+        return self.status in ("up-to-date", "available", "abi-mismatch")
+
+    def __str__(self) -> str:
+        if self.status == "error":
+            return f"update check failed: {self.error}"
+        if self.status == "available":
+            return f"omni {self.latest} is available; this is {self.current}"
+        if self.status == "abi-mismatch":
+            return (
+                f"release {self.latest} speaks ABI {self.abi}; "
+                f"this build speaks ABI {OMNI_ABI_VERSION}"
+            )
+        if self.status == "up-to-date":
+            return f"omni {self.current} is up to date"
+        return f"update status: {self.status}"
+
+
+def check_updates(
+    *,
+    manifest: str | bytes | None = None,
+    url: str | None = None,
+    timeout: float = 5.0,
+    fetch: Callable[[str, float], str | bytes] | None = None,
+    raise_on_error: bool = False,
+) -> UpdateCheck:
+    """Ask whether a newer OmniEngine is published. Never downloads anything.
+
+    The comparison runs in the engine itself (``omni_check_update``), so the
+    version and ABI it checks are the ones the loaded library actually speaks --
+    not numbers this package copied from a release note.
+
+    Args:
+        manifest: the manifest document itself. When given, no network call is
+            made; this is the form tests use.
+        url: a manifest location to fetch instead of the default. Falls back to
+            ``$OMNI_UPDATE_URL``, then :data:`DEFAULT_UPDATE_URL`.
+        timeout: seconds the request may take.
+        fetch: a replacement reader with the same ``(url, timeout) -> bytes``
+            shape, for a host with its own HTTP stack.
+        raise_on_error: re-raise transport and discovery failures instead of
+            returning an ``"error"`` result.
+
+    Returns:
+        An :class:`UpdateCheck`. By default a failure to check is data, not an
+        exception: an update notice must not break the program that asked.
+    """
+    source = url or os.environ.get(UPDATE_URL_ENV) or DEFAULT_UPDATE_URL
+    try:
+        if manifest is None:
+            reader = fetch or _default_fetch
+            data = reader(source, timeout)
+        else:
+            data = manifest
+            source = None
+        if isinstance(data, (bytes, bytearray)):
+            text = bytes(data).decode("utf-8")
+        else:
+            text = str(data)
+        status, latest = _ffi_check_update(text)
+    except Exception as exc:  # noqa: BLE001 - see raise_on_error
+        if raise_on_error:
+            raise
+        return UpdateCheck(
+            status="error",
+            current=__version__,
+            url=source,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+    notes: str | None = None
+    abi: int | None = None
+    asset: dict[str, str] | None = None
+    try:
+        document = json.loads(text)
+    except ValueError:
+        document = None
+    if isinstance(document, dict):
+        if isinstance(document.get("notes"), str):
+            notes = document["notes"]
+        declared = document.get("abi")
+        if isinstance(declared, int) and not isinstance(declared, bool):
+            abi = declared
+        assets = document.get("assets")
+        key = platform_key()
+        if key and isinstance(assets, dict) and isinstance(assets.get(key), dict):
+            entry = assets[key]
+            if isinstance(entry.get("url"), str) and isinstance(entry.get("sha256"), str):
+                asset = {"url": entry["url"], "sha256": entry["sha256"]}
+
+    return UpdateCheck(
+        status=UPDATE_STATUS.get(status, f"status-{status}"),
+        current=__version__,
+        latest=latest,
+        abi=abi,
+        notes=notes,
+        asset=asset,
+        url=source,
+    )
+
+
+class BackgroundUpdateCheck:
+    """A :func:`check_updates` running on a daemon thread.
+
+    Non-blocking by construction: construction and :meth:`start` return before
+    the request happens, and :attr:`result` stays ``None`` until it finishes.
+    Asking for :meth:`wait` is the only thing that ever waits.
+    """
+
+    __slots__ = ("_thread", "result")
+
+    def __init__(self, **options: object) -> None:
+        self.result: UpdateCheck | None = None
+        self._thread = threading.Thread(
+            target=self._run,
+            kwargs=options,
+            name="omni-update-check",
+            daemon=True,
+        )
+
+    def _run(self, **options: object) -> None:
+        self.result = check_updates(**options)  # type: ignore[arg-type]
+
+    def start(self) -> "BackgroundUpdateCheck":
+        self._thread.start()
+        return self
+
+    @property
+    def done(self) -> bool:
+        """Whether the check finished (successfully or not)."""
+        return self.result is not None
+
+    def wait(self, timeout: float | None = None) -> UpdateCheck | None:
+        """Join the thread and return its result, or ``None`` if it is still
+        running after ``timeout`` seconds."""
+        self._thread.join(timeout)
+        return self.result
+
+    def __repr__(self) -> str:
+        state = self.result.status if self.result else "pending"
+        return f"<omni.BackgroundUpdateCheck {state}>"
+
+
+def start_background_check(**options: object) -> BackgroundUpdateCheck:
+    """Start :func:`check_updates` on a daemon thread and return its handle.
+
+    The thread never downloads and never blocks shutdown; ``engine.
+    background_update`` holds the handle when an Engine started one.
+    """
+    return BackgroundUpdateCheck(**options).start()
 
 
 def status_name(status: int) -> str:
@@ -167,14 +440,22 @@ class Engine:
     rewinds its egress block at the start of the next evaluation.
     """
 
-    __slots__ = ("_raw", "_last_status")
+    __slots__ = ("_raw", "_last_status", "_update_check")
 
-    def __init__(self, library: ctypes.CDLL | None = None) -> None:
+    def __init__(
+        self,
+        library: ctypes.CDLL | None = None,
+        *,
+        background_check: bool | None = None,
+    ) -> None:
         """Create an engine.
 
         Args:
             library: an already-loaded, already-declared library handle, for a
                 caller that wants to control discovery itself. Normally omitted.
+            background_check: start a non-blocking release check on this
+                engine. ``None`` follows ``$OMNI_UPDATE_CHECK``; the check never
+                downloads anything and never raises into the program.
 
         Raises:
             OmniLibraryError: no shared library was found -- build it -- or the
@@ -182,6 +463,23 @@ class Engine:
         """
         self._raw: RawEngine | None = RawEngine(library)
         self._last_status = OMNI_OK
+        if background_check is None:
+            background_check = os.environ.get(UPDATE_CHECK_ENV, "").lower() in (
+                "1",
+                "true",
+                "yes",
+            )
+        self._update_check = start_background_check() if background_check else None
+
+    @property
+    def background_update(self) -> BackgroundUpdateCheck | None:
+        """The release check this engine started, or ``None``.
+
+        Asking is free until :meth:`BackgroundUpdateCheck.wait`, so a host can
+        print a notice if ``.done and .result and .result.available`` and do
+        nothing otherwise.
+        """
+        return self._update_check
 
     @property
     def version(self) -> str:

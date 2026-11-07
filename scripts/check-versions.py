@@ -6,7 +6,7 @@ Reads the four places a release can disagree with itself:
     Cargo.toml                 workspace version
     sdks/python/pyproject.toml Python version
     sdks/nodejs/package.json   npm version
-    omni.h / _ffi.py / bindings.js   ABI level
+    omni.h / _ffi.py / bindings.js / CLI updater   ABI level
 
     python scripts/check-versions.py
     python scripts/check-versions.py --tag v0.1.0
@@ -71,6 +71,13 @@ def abi_levels() -> dict[str, str]:
         "Node": capture(
             r"^const ABI_VERSION\s*=\s*(\d+);",
             ROOT / "sdks" / "nodejs" / "lib" / "bindings.js",
+            "ABI_VERSION",
+        ),
+        # The updater compares a release against this number before it downloads
+        # a byte, so a CLI built for another ABI would refuse every release.
+        "CLI": capture(
+            r"^pub const ABI_VERSION: u32 = (\d+);",
+            ROOT / "crates" / "omni-cli" / "src" / "updater" / "mod.rs",
             "ABI_VERSION",
         ),
     }

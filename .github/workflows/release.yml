@@ -4,11 +4,12 @@ name: release
 #
 #   guard         one version and one ABI across Cargo, PyPI and npm metadata
 #   verify        fmt, clippy, 225 Rust tests, both SDK suites
-#   native        the engine for Windows x64, Linux x64/arm64, macOS x64/arm64
-#   python-wheels one py3-none-<platform> wheel per platform, engine inside
-#   npm-package   one tarball carrying all five platform binaries
-#   pypi          wheels via Trusted Publishing (no API token)
-#   release       GitHub Release with archives, wheels and the npm tarball
+#   native          the engine for Windows x64, Linux x64/arm64, macOS x64/arm64
+#   update-manifest omni-update.json naming and hashing each platform's `omni`
+#   python-wheels   one py3-none-<platform> wheel per platform, engine inside
+#   npm-package     one tarball carrying all five platform binaries
+#   pypi            wheels via Trusted Publishing (no API token)
+#   release         GitHub Release with archives, binaries, manifest, wheels, tarball
 #
 # Publishing needs two things configured once, outside this file:
 #   - PyPI Trusted Publisher for this repository, environment name `pypi`
@@ -115,12 +116,32 @@ jobs:
           python-version: "3.12"
       - name: build and archive
         run: python scripts/package.py --target ${{ matrix.target }} --format ${{ matrix.archive }}
+      - name: stage the omni and omniup executables
+        run: python scripts/cli-binaries.py --target ${{ matrix.target }} --platform ${{ matrix.platform }}
       - name: the archive's engine runs
         run: cargo run --release -p omni-cli --target ${{ matrix.target }} -- run examples/hello.omni
+      - name: the staged CLI runs from where it was copied
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          suffix=""
+          if [[ "$PLATFORM" == win32-x64 ]]; then suffix=".exe"; fi
+          "./dist/binaries/omni-${PLATFORM}${suffix}" --version
+          "./dist/binaries/omni-${PLATFORM}${suffix}" run examples/hello.omni
+          "./dist/binaries/omniup-${PLATFORM}${suffix}" --version
       - uses: actions/upload-artifact@v4
         with:
           name: archive-${{ matrix.platform }}
-          path: dist/*
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.platform }}
+          path: dist/binaries/*
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
@@ -130,6 +151,43 @@ jobs:
             target/${{ matrix.target }}/release/*.dll.lib
             target/${{ matrix.target }}/release/*.so
             target/${{ matrix.target }}/release/*.dylib
+          if-no-files-found: error
+
+  # The document `omni check-update`, `omniup` and both SDKs read. It names the
+  # raw `omni` executable per platform and hashes the bytes it advertises, so a
+  # checker needs one request to learn whether an upgrade exists and one more to
+  # fetch exactly those bytes.
+  update-manifest:
+    needs: native
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cli-*
+          path: dist/binaries
+          merge-multiple: true
+      - name: describe the release
+        shell: bash
+        env:
+          PLATFORM_BASE: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            python scripts/make-manifest.py --tag "${GITHUB_REF_NAME}" \
+              --notes "OmniEngine ${GITHUB_REF_NAME}"
+          else
+            # A manual run has no release to point at yet; the artifact is a
+            # preview whose URLs resolve once a tag publishes the same files.
+            python scripts/make-manifest.py --base "${PLATFORM_BASE}/releases/latest/download/"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: update-manifest
+          path: dist/omni-update.json
           if-no-files-found: error
 
   # Linux wheels are tagged manylinux_2_39 because they are built on Ubuntu
@@ -267,7 +325,7 @@ jobs:
           packages-dir: dist
 
   github-release:
-    needs: [native, python-wheels, npm-package]
+    needs: [native, update-manifest, python-wheels, npm-package]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -281,8 +339,11 @@ jobs:
         shell: bash
         run: |
           mkdir -p assets
+          # The raw executables and the manifest are what `omniup` and both SDKs
+          # fetch; the archives and packages are for humans and other toolchains.
           find artifacts -type f \( -name '*.zip' -o -name '*.tar.gz' \
-            -o -name '*.whl' -o -name '*.tgz' -o -name '*.sha256' \) \
+            -o -name '*.whl' -o -name '*.tgz' -o -name '*.sha256' \
+            -o -name 'omni-*' -o -name 'omniup-*' -o -name 'omni-update.json' \) \
             -exec cp {} assets/ \;
           ls -la assets
       - name: create or update the release

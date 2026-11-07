@@ -21,6 +21,7 @@ pub mod arena;
 pub mod engine;
 pub mod lexer;
 pub mod object;
+pub mod update;
 pub mod value;
 
 /// Test-only: wraps `System` and tallies live bytes per thread, so a test can
