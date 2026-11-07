@@ -47,7 +47,7 @@ class VerticalSlice(unittest.TestCase):
         # The SDK refused to hand back a library whose layout this file cannot
         # read, so by the time an Engine exists the level is known.
         self.assertEqual(engine.abi_version, _ffi.OMNI_ABI_VERSION)
-        self.assertEqual(engine.abi_version, 3)
+        self.assertEqual(engine.abi_version, 4)
 
     def test_arithmetic_precedence_and_parentheses(self) -> None:
         engine = omni.Engine()
@@ -706,6 +706,141 @@ class Errors(unittest.TestCase):
         self.assertEqual(self.engine.last_error, "")
 
 
+class Batch(unittest.TestCase):
+    """One crossing, N programs: the shape of :meth:`Engine.run_many`.
+
+    What a loop of ``run`` cannot give you is N string results alive at the same
+    time, and what it costs you is N crossings. Both halves get tested here, plus
+    the boundary rules: a batch is independent executions, not one long program,
+    and a failing item is data rather than a stopped loop.
+    """
+
+    def setUp(self) -> None:
+        self.engine = omni.Engine()
+        self.addCleanup(self.engine.close)
+
+    def test_run_many_returns_one_result_per_source_in_order(self) -> None:
+        results = self.engine.run_many(["6 * 7", '"hello, " + "batch"', "1 == 1", ""])
+        self.assertEqual([r.tag for r in results], ["number", "string", "bool", "undef"])
+        self.assertEqual(results[0].value, 42.0)
+        self.assertEqual(results[1].value, "hello, batch")
+        self.assertEqual(results[2].value, True)
+        self.assertIsNone(results[3].value)
+
+    def test_every_string_of_a_batch_is_copied_out(self) -> None:
+        # Three live results, read in the order the ABI wrote them and again in
+        # reverse: if the SDK let the engine rewind between items, the earlier
+        # texts would be whatever the last evaluation happened to leave there.
+        programs = ['"a" + "1"', '"b" + "2"', '"c" + "3"']
+        results = self.engine.run_many(programs)
+        self.assertEqual([r.text for r in results], [b"a1", b"b2", b"c3"])
+        for source, expected in reversed(list(zip(programs, results))):
+            self.assertEqual(self.engine.run(source).text, expected.text)
+
+    def test_a_failing_item_raises_naming_its_index(self) -> None:
+        with self.assertRaises(omni.OmniError) as caught:
+            self.engine.run_many(["1 + 1", "1 / 0", "2 + 2"])
+        self.assertIn("item 1 of 3", str(caught.exception))
+        self.assertIn("division by zero", str(caught.exception))
+        self.assertEqual(self.engine.last_status, _ffi.OMNI_ERR_RUNTIME)
+
+    def test_try_run_many_keeps_running_after_a_failure(self) -> None:
+        items = self.engine.try_run_many(["1 +", "2 + 3", "1 / 0", "20 / 4"])
+        self.assertEqual([status for status, _r, _m in items], [1, 0, 2, 0])
+        self.assertIsNone(items[0][1])
+        self.assertEqual(items[1][1].value, 5.0)
+        self.assertEqual(items[3][1].value, 5.0, "the item after a failure ran")
+        self.assertIn("unexpected end of input", items[0][2])
+        self.assertIn("division by zero", items[2][2])
+
+    def test_an_item_cannot_read_the_previous_items_binding(self) -> None:
+        items = self.engine.try_run_many(["let secret = 1; secret", "secret"])
+        self.assertEqual(items[0][1].value, 1.0)
+        self.assertEqual(items[1][0], _ffi.OMNI_ERR_RUNTIME)
+        self.assertIn("secret", items[1][2], "the message is item 1's, not the last one's")
+
+    def test_a_host_function_is_callable_from_a_batch_item(self) -> None:
+        self.engine.register_function("square", lambda x: x * x, arity=1)
+        self.engine.register_function("tag", lambda x: f"squared: {x * x:g}", arity=1)
+        results = self.engine.run_many(["square(6)", "square(7) + 1", 'tag(3) + "!"'])
+        self.assertEqual([results[0].value, results[1].value], [36.0, 50.0])
+        self.assertEqual(results[2].value, "squared: 9!")
+
+    def test_an_empty_batch_is_an_empty_list_that_costs_no_execution(self) -> None:
+        held = self.engine.run('"still current"')
+        before = self.engine.stats()
+        self.assertEqual(self.engine.try_run_many([]), [])
+        self.assertEqual(self.engine.run_many([]), [])
+        after = self.engine.stats()
+        self.assertEqual(after.execs, before.execs, "a no-op crossed nothing")
+        self.assertEqual(held.text, b"still current")
+
+    def test_execs_counts_items_not_crossings(self) -> None:
+        before = self.engine.stats().execs
+        self.engine.run_many(["1", "2", "3", "4", "5"])
+        self.assertEqual(self.engine.stats().execs, before + 5)
+
+    def test_a_batch_larger_than_the_abi_allows_is_refused_locally(self) -> None:
+        sources = ["1"] * (_ffi.MAX_BATCH + 1)
+        with self.assertRaises(omni.OmniError) as caught:
+            self.engine.run_many(sources)
+        self.assertIn(str(_ffi.MAX_BATCH), str(caught.exception))
+        self.assertEqual(self.engine.stats().execs, 0, "nothing ran")
+
+    def test_an_over_long_source_refuses_the_whole_batch(self) -> None:
+        # Checked per item, before the crossing, so item 0 never runs either.
+        long = "1" + " " * (_ffi.MAX_SOURCE_LEN + 1)
+        with self.assertRaises(omni.OmniError):
+            self.engine.run_many(["1 + 1", long])
+        self.assertEqual(self.engine.stats().execs, 0)
+
+    def test_batch_error_answers_only_the_current_batch(self) -> None:
+        raw = _ffi.RawEngine()
+        self.addCleanup(raw.close)
+        raw.exec_many(["1 + 1", "let = 2"])
+        self.assertEqual(raw.batch_error(0), "")
+        self.assertIn("expected a name", raw.batch_error(1))
+        self.assertEqual(raw.batch_error(2), "", "an index past the batch")
+        # A single evaluation ends the batch's currency: there is no item 1 of a
+        # call that had no items.
+        raw.exec("1")
+        self.assertEqual(raw.batch_error(1), "")
+
+    def test_repeated_batches_reserve_a_flat_amount_of_memory(self) -> None:
+        programs = ['"a" + "b" + "c"'] * 8
+        self.engine.run_many(programs)
+        before = self.engine.stats()
+        for _ in range(2_000):
+            self.assertEqual(len(self.engine.run_many(programs)), 8)
+        after = self.engine.stats()
+        self.assertEqual(after.execs, before.execs + 16_000)
+        self.assertEqual(after.egress_bytes_reserved, before.egress_bytes_reserved)
+        self.assertEqual(after.arena_bytes_reserved, before.arena_bytes_reserved)
+        self.assertEqual(after.egress_high_water, before.egress_high_water)
+
+    def test_a_batch_of_long_strings_stops_growing(self) -> None:
+        # Eight 40 KiB results need more than one arena chunk, which is the case
+        # a single call never reaches and the reason the batch shares one rewind.
+        programs = ['"' + "x" * (40 * 1024) + '"'] * 8
+        self.engine.run_many(programs)
+        before = self.engine.stats()
+        self.assertGreaterEqual(before.egress_bytes_reserved, 8 * 40 * 1024)
+        for _ in range(50):
+            self.engine.run_many(programs)
+        after = self.engine.stats()
+        self.assertEqual(after.egress_bytes_reserved, before.egress_bytes_reserved, "reused")
+
+    def test_the_raw_layer_hands_back_arrays_the_caller_sizes(self) -> None:
+        raw = _ffi.RawEngine()
+        self.addCleanup(raw.close)
+        status, values, statuses = raw.exec_many(["1 + 1", "no_such_function()"])
+        self.assertEqual(status, _ffi.OMNI_ERR_RUNTIME)
+        self.assertEqual(len(values), 2)
+        self.assertEqual(statuses, [0, _ffi.OMNI_ERR_RUNTIME])
+        self.assertEqual(raw.read_string(values[0]), b"")
+        self.assertEqual(values[0].number, 2.0)
+
+
 class SafetyBoundaries(unittest.TestCase):
     """The cases a host is most likely to get wrong, tested on purpose."""
 
@@ -849,7 +984,7 @@ class Discovery(unittest.TestCase):
         with self.assertRaises(omni.OmniLibraryError) as caught:
             _ffi._checked(Fake(), "stale-omni.dll")
         self.assertIn("ABI version 1", str(caught.exception))
-        self.assertIn("ABI version 3", str(caught.exception))
+        self.assertIn(f"ABI version {_ffi.OMNI_ABI_VERSION}", str(caught.exception))
         self.assertIn("cargo build -p omni-ffi", str(caught.exception))
 
     def test_a_library_without_an_abi_version_export_is_refused(self) -> None:

@@ -526,6 +526,180 @@ else
   skip "registry agreement" "python and node not available"
 fi
 
+# ---------------------------------------------------- Phase 4: one crossing, many programs
+#
+# A batch is N independent executions that share one crossing, one arena
+# reclamation and one egress rewind. What a single-host suite can check is that
+# its own wrapper is internally consistent; these rows check what it cannot --
+# that the items, the per-item errors, the counter and the re-entrancy refusal
+# come out identically on both sides of the bridge. The C host's batch contract
+# is asserted by examples/c/embed.c above; every row here also holds because
+# embed.c already passed.
+
+printf 'A batch answers the same items in every host... '
+batch_hosts=''
+batch_wrong=''
+if [[ -n "${PY:-}" ]]; then
+  # Written through stdout.buffer, not print: the answer carries a 4-byte code
+  # point, and a non-UTF-8 Python stdout would fail on it for reasons that have
+  # nothing to do with the engine.
+  got=$(cd sdks/python && $PY -c '
+import sys; sys.path.insert(0, ".")
+import omni
+with omni.Engine() as e:
+    results = e.run_many(["1 + 1", "\"hello, \" + \"world\"", "\"\\u{1F600}\" + \"!\"", "20 / 3"])
+    line = "|".join(str(r.value) for r in results)
+    sys.stdout.buffer.write(line.encode("utf-8"))
+' 2>&1)
+  # Python renders the language's doubles as Python floats: 2.0, not 2.
+  if [[ "$got" == "2.0|hello, world|"*"!|6.666666666666667" ]]; then batch_hosts+=' python'
+  else batch_wrong+=" python='$got'"; fi
+fi
+if have node && [[ -d sdks/nodejs/node_modules/koffi ]]; then
+  got=$(cd sdks/nodejs && node -e '
+const { Engine } = require("./index.js");
+const e = new Engine();
+const results = e.runMany(["1 + 1", "\"hello, \" + \"world\"", "\"\\u{1F600}\" + \"!\"", "20 / 3"]);
+console.log(results.map((r) => r.value).join("|"));
+e.close();
+' 2>&1)
+  if [[ "$got" == "2|hello, world|"*"!|6.666666666666667" ]]; then batch_hosts+=' node'
+  else batch_wrong+=" node='$got'"; fi
+fi
+if [[ -n "$batch_wrong" ]]; then
+  fail "the batch answers differ:$batch_wrong"
+elif [[ -n "$batch_hosts" ]]; then
+  pass "four items, one crossing, the same values in:$batch_hosts"
+else
+  skip "batch answers" "python and node not available"
+fi
+
+printf 'A failing item names itself identically in every host... '
+bfail_hosts=''
+bfail_wrong=''
+if [[ -n "${PY:-}" ]]; then
+  got=$(cd sdks/python && $PY -c '
+import sys; sys.path.insert(0, ".")
+import omni
+with omni.Engine() as e:
+    items = e.try_run_many(["1 + 1", "\"a\" + 1", "3 * 3", "nothere"])
+    print(" ".join(str(s) for s, _, _ in items))
+    print("|", items[1][2], "|", items[3][2])
+' 2>&1)
+  if [[ "$got" == "0 2 0 2"*"| line 1: cannot add string to number: \"a\" + 1 | line 1: undefined variable 'nothere'"* ]]; then
+    bfail_hosts+=' python'
+  else bfail_wrong+=" python='$got'"; fi
+fi
+if have node && [[ -d sdks/nodejs/node_modules/koffi ]]; then
+  got=$(cd sdks/nodejs && node -e '
+const { Engine } = require("./index.js");
+const e = new Engine();
+const items = e.tryRunMany(["1 + 1", "\"a\" + 1", "3 * 3", "nothere"]);
+console.log(items.map((i) => i.status).join(" "));
+console.log("|", items[1].message, "|", items[3].message);
+e.close();
+' 2>&1)
+  if [[ "$got" == "0 2 0 2"*"| line 1: cannot add string to number: \"a\" + 1 | line 1: undefined variable 'nothere'"* ]]; then
+    bfail_hosts+=' node'
+  else bfail_wrong+=" node='$got'"; fi
+fi
+if [[ -n "$bfail_wrong" ]]; then
+  fail "the per-item failure differs:$bfail_wrong"
+elif [[ -n "$bfail_hosts" ]]; then
+  pass "statuses 0 2 0 2 and the engine text for items 1 and 3, identically in:$bfail_hosts"
+else
+  skip "batch failure text" "python and node not available"
+fi
+
+printf 'A batch counts items, not crossings, and reserves nothing extra... '
+bcnt_hosts=''
+bcnt_wrong=''
+if [[ -n "${PY:-}" ]]; then
+  got=$(cd sdks/python && $PY -c '
+import sys; sys.path.insert(0, ".")
+import omni
+with omni.Engine() as e:
+    e.run_many(["6 * 7"])               # warm: the first crossing maps the blocks
+    before = e.stats()
+    for _ in range(1000):
+        e.run_many(["6 * 7"] * 8)
+    after = e.stats()
+    print(before.egress_bytes_reserved, after.egress_bytes_reserved, after.execs - before.execs, sep=" ")
+' 2>&1)
+  read -r before after execs <<< "$got"
+  if [[ "$before" == "$after" && "$execs" == "8000" ]]; then bcnt_hosts+=" python($after B)"
+  else bcnt_wrong+=" python='$got'"; fi
+fi
+if have node && [[ -d sdks/nodejs/node_modules/koffi ]]; then
+  got=$(cd sdks/nodejs && node -e '
+const { Engine } = require("./index.js");
+const e = new Engine();
+e.runMany(["6 * 7"]);
+const before = e.stats();
+for (let i = 0; i < 1000; i++) e.runMany(Array(8).fill("6 * 7"));
+const after = e.stats();
+console.log(before.egressBytesReserved, after.egressBytesReserved, after.execs - before.execs);
+e.close();
+' 2>&1)
+  read -r before after execs <<< "$got"
+  if [[ "$before" == "$after" && "$execs" == "8000" ]]; then bcnt_hosts+=" node($after B)"
+  else bcnt_wrong+=" node='$got'"; fi
+fi
+if [[ -n "$bcnt_wrong" ]]; then
+  fail "the batch counter or reservation disagreed:$bcnt_wrong"
+elif [[ -n "$bcnt_hosts" ]]; then
+  pass "8000 items in 1000 crossings, execs +8000, reservation flat:$bcnt_hosts"
+else
+  skip "batch accounting" "python and node not available"
+fi
+
+printf 'A batch inside a host callback is refused, not crashed... '
+bre_hosts=''
+bre_wrong=''
+if [[ -n "${PY:-}" ]]; then
+  # The callback borrows the engine's state; a batch crossing from inside it is
+  # the same re-entrancy as a single exec, refused with the same words.
+  got=$(cd sdks/python && $PY -c '
+import sys; sys.path.insert(0, ".")
+import omni
+e = omni.Engine()
+def peek(_):
+    return e.run_many(["1 + 1"])[0].value
+e.register_function("peek", peek, arity=1)
+try:
+    e.run("peek(1)")
+    text = "the re-entrant batch returned no error"
+except omni.OmniError as err:
+    text = str(err)
+print(text, "|", e.evaluate("6 * 7"))
+' 2>&1)
+  if [[ "$got" == *"$PEEK_WANT"* && "$got" == *"42.0"* ]]; then
+    bre_hosts+=' python'
+  else bre_wrong+=" python='$got'"; fi
+fi
+if have node && [[ -d sdks/nodejs/node_modules/koffi ]]; then
+  got=$(cd sdks/nodejs && node -e '
+const { Engine } = require("./index.js");
+const e = new Engine();
+e.registerFunction("peek", () => e.runMany(["1 + 1"])[0].value, { arity: 1 });
+let text;
+try { e.run("peek(1)"); text = "the re-entrant batch returned no error"; }
+catch (err) { text = String(err); }
+console.log(text, "|", e.evaluate("6 * 7"));
+e.close();
+' 2>&1)
+  if [[ "$got" == *"$PEEK_WANT"* && "$got" == *"42"* ]]; then
+    bre_hosts+=' node'
+  else bre_wrong+=" node='$got'"; fi
+fi
+if [[ -n "$bre_wrong" ]]; then
+  fail "the re-entrant batch was not refused-and-survived in:$bre_wrong"
+elif [[ -n "$bre_hosts" ]]; then
+  pass "a batch from a borrowed handle errors with the shared refusal text in:$bre_hosts"
+else
+  skip "batch re-entrancy guard" "python and node not available"
+fi
+
 # ---------------------------------------------------------------- report
 echo
 echo "== Results =="

@@ -7,8 +7,11 @@ CLI that runs `.omni` files.
 This is a **runnable engine**, not a toy skeleton. `let answer = 40 + 2`
 evaluates to `42`, and `"hello, " + "world"` evaluates to `hello, world`, through
 the same code path from four hosts — Rust, C, Python, and Node — and a script can
-call *back* into whichever host embeds it. Every claim below is covered by a test
-that has been run on this machine.
+call *back* into whichever host embeds it. One crossing can carry several
+programs at once (`run_many` / `runMany` / `omni_exec_many`), and the performance
+numbers in this repository are measured runs, not promises: `scripts/bench.sh`
+prints them for this machine. Every claim below is covered by a test that has
+been run on this machine.
 
 ```
 cargo build -p omni-ffi                          # the shared library
@@ -34,8 +37,9 @@ cargo run -p omni-cli -- run examples/strings.omni  # -> hello, world 😀
 
 ```bash
 # Rust
-cargo test --workspace                                  # 187 tests
+cargo test --workspace                                  # 225 tests
 cargo run -p omni-cli -- eval '"omni" + " " + "engine"'  # -> omni engine
+cargo run --release -p omni-core --example bench         # the engine, measured
 
 # C, against the hand-written header — built beside the library it loads
 gcc -std=c11 -Wall -Wextra -I crates/omni-ffi/include \
@@ -54,14 +58,16 @@ cd sdks/nodejs && npm install koffi && node -e \
 Or run everything at once:
 
 ```bash
-./scripts/verify-all.sh
+./scripts/verify-all.sh   # the same bytes from every host, ABI level, memory, batch
+./scripts/bench.sh        # ns/exec, crossing cost, batch speed-up -- measured
 ```
 
 It checks that the same bytes come out of the same program on every host, that
 all four surfaces agree on the ABI level, that string results do not grow memory
-over 2,000 executions, and that a host function called from a script answers
-identically in Python and Node. Tools that are missing are reported as `SKIP`, not
-as a pass.
+over 2,000 executions, that a host function called from a script answers
+identically in Python and Node, and that a batch crossing answers, fails, counts,
+and refuses identically in both. Tools that are missing are reported as `SKIP`,
+not as a pass.
 
 ## Calling back into the host
 
@@ -86,11 +92,48 @@ its own engine gets `OMNI_ERR_REENTRANT` instead of a second mutable reference.
 See [docs/GUIDE.md](docs/GUIDE.md#47-host-callbacks-the-bridge-running-backwards)
 and `examples/c/embed.c` for the C surface.
 
+## Batching: several programs, one crossing
+
+A loop of `run` pays the FFI crossing and the arena reclamation once per program;
+a batch pays both once for the whole list:
+
+```python
+engine.run_many(["1 + 1", '"two"', "shout('hey')"])
+# [Result(2.0), Result('two'), Result('HEY!')]
+```
+
+```js
+engine.runMany(['1 + 1', '"two"', "shout('hey')"]);
+// [{ tag: 'number', value: 2 }, { tag: 'string', value: 'two' }, ...]
+```
+
+Each item is an independent program — item *N* cannot read item *N−1*'s `let` —
+and a failing item does not stop the rest: `try_run_many` / `tryRunMany` return
+one `(status, result, message)` per item, with the engine's text for exactly that
+item. All N string results stay readable until the next execution, so a batch's
+egress is bounded by its total demand, not one item's.
+
+The measured usage guidance: a batch of one is strictly a loss, and the win
+saturates fast — the crossing itself costs ~240 ns through ctypes and ~36 ns
+through koffi, while one wrapped execution costs several microseconds, so a batch
+can only amortise the smaller term. On this machine, batches earned 1.2–1.4× per
+item at their best N in Python and Node, and in Rust the win is unconditional but
+in allocations: 0.00 per execution, 0.004 per *item* inside a 256-batch. Run
+`./scripts/bench.sh` for the machine you are on.
+
 ## How it stays fast and small
 
 - **No GC, ever.** Scalars are NaN-boxed into 8 bytes; everything the engine
   allocates goes into a bump arena that is bulk-freed at the start of each
-  evaluation. `reset()` is O(chunks), not O(objects).
+  evaluation. `reset()` is O(chunks), not O(objects), and a batch reclaims
+  back to a checkpoint instead of back to the beginning.
+- **A warm engine lexes without allocating.** The token vector is reused across
+  executions — measured, 0.00 allocations per execution in every benchmark
+  scenario, and 0.004 per item inside a 256-batch.
+- **Reservations are flat by construction.** The arena cursor walks chunks it
+  already mapped instead of asking the system for new ones, so 100,000
+  executions reserve exactly what the first one did — checked by the harness,
+  not just by the claim.
 - **Three lifetimes, three blocks.** The exec arena is freed every evaluation.
   Strings handed to a host live in a separate egress block that *rewinds*
   instead of freeing, so a stale pointer reads the newest bytes rather than

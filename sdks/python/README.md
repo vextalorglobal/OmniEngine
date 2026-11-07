@@ -83,6 +83,30 @@ engine.try_run("###")      # returns (1, None, "line 1: unexpected character '#'
 own text, including the line number — that context survives the C boundary on
 purpose.
 
+## Batching: several programs, one crossing
+
+A loop of `run` pays the FFI crossing and the arena reclamation once per
+program; a batch pays both once:
+
+```python
+engine.run_many(["1 + 1", '"two"', "shout('hey')"])
+# [Result(tag='number', value=2.0), Result(tag='string', value='two'),
+#  Result(tag='string', value='HEY!')]
+```
+
+Each item is an independent program — item *N* cannot read item *N−1*'s `let` —
+and every string result is copied out before the list is returned, so nothing in
+it expires. A failing item raises `OmniError` naming its index and its own
+message (`item 1 of 3: line 1: …`); the items after it still ran. For REPL-style
+callers, `try_run_many` returns one `(status, result, message)` per item instead
+of raising — the per-item shape of `try_run`.
+
+Measured usage guidance: a batch of one is strictly a loss (one extra list is
+still extra work), and the win saturates fast — the crossing itself costs ~240 ns
+through ctypes while one wrapped `run` costs ~10 µs, so a batch can only amortise
+the smaller term. `sdks/python/bench.py` prints the numbers for the machine you
+are on.
+
 ## Calling back into Python
 
 A script can call a Python function. Bind it by name, with the arity the script
@@ -140,10 +164,16 @@ instead of crossing as `0`.
 - A Python exception inside a host function becomes `OmniError(kind="host")` with
   the message your script can read, never an unwind through the frames that
   called your callback.
+- A batch of N sources produces N results in order, each one a complete `exec`'s
+  worth of state; a failing item does not stop the batch, and the reserved egress
+  bytes are bounded by one batch's total demand, not one item's. An empty batch
+  is a no-op that expires nothing.
 - Source, names and payloads longer than the ABI's bounds are rejected in
   Python, before a call — and so is a registration whose `fn` is not callable.
   `register_function` raises `OmniError(kind="argument")` there rather than
   storing a trampoline that would fail as a host error several evaluations later.
+- A batch longer than `MAX_BATCH` (4,096) is refused in Python before the
+  crossing, with the SDK's own message.
 
 ## Limits
 
@@ -162,16 +192,19 @@ arrive from a comparison.
 A host function takes at most 16 arguments (`MAX_ARGS`) and a program may nest
 calls 64 deep (`MAX_CALL_DEPTH`); both are checked by the engine and reported as
 errors rather than as stack overflow. A returned string is capped by the same
-`MAX_STRING_LEN` the engine gives a program.
+`MAX_STRING_LEN` the engine gives a program. One batch crossing carries at most
+`MAX_BATCH` (4,096) sources.
 
 `Result.text` is a `bytes`, and a `str` you get back is a Python object that
 costs one copy. If you are moving megabytes per call, that copy is the price of
-the safety rule above; measure it with `engine.stats()` before deciding.
+the safety rule above; measure it with `engine.stats()` — or run
+`sdks/python/bench.py` — before deciding.
 
 ## Tests
 
 ```bash
-python sdks/python/tests/test_ffi.py        # 92 tests, stdlib unittest
+python sdks/python/tests/test_ffi.py        # 106 tests, stdlib unittest
+python sdks/python/bench.py                 # ns/call, gc/call, batch speed-up
 ```
 
 They need `cargo build -p omni-ffi` (the build, not `cargo test`: the tests load

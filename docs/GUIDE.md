@@ -31,18 +31,21 @@ or Phase 3.
 | Phase 5 — SDKs and DX | done | 92 Python + 74 Node tests, CLI, wasm scaffold |
 | Strings, egress memory, ABI v2 | done | 4 new exports, `omni_str_copy` + `omni_define_string` + `omni_debug_stats` + `omni_abi_version` tested from all four hosts |
 | Host callbacks, re-entrancy, ABI v3 | done | `omni_register_host_fn` + `omni_unregister_host_fn` + `omni_host_fn_count`, a `RefCell` borrow guard on every entry point, and call syntax in the parser |
-| Same answer from four hosts | done | `scripts/verify-all.sh` — 17 rows, all passing |
+| Batch execution, benchmarks, ABI v4 | done | `omni_exec_many` + `omni_batch_error`, checkpointed arena reclamation, three zero-dependency benchmark harnesses and `scripts/bench.sh` (§4.8, §4.9) |
+| Same answer from four hosts | done | `scripts/verify-all.sh` — 21 rows, all passing |
 
 ```
-cargo test --workspace        # 187 tests
-./scripts/verify-all.sh       # Rust, C, Python, Node: 42, "hello, world", ABI 3
+cargo test --workspace        # 225 tests
+./scripts/verify-all.sh       # Rust, C, Python, Node: 42, "hello, world", ABI 4
+./scripts/bench.sh            # three hosts, one crossing each, measured
 ```
 
 ---
 
 ## 1. Verified environment
 
-Measured on 2026-11-03.
+Measured on 2026-11-07; toolchain versions are the ones 2026-11-03 recorded and
+have not moved since.
 
 | | |
 | --- | --- |
@@ -51,19 +54,19 @@ Measured on 2026-11-03.
 | gcc | 16.2.0 (MinGW-W64 x86_64-ucrt-posix-seh, WinLibs) |
 | Python | 3.15.0 |
 | Node / npm | 26.12.0 / 11.20.0 |
-| **C:** | 100 GB total, **7.3 GB free (93 % used)** |
-| **D:** | 138 GB total, **75 GB free (47 % used)** |
+| **C:** | 100 GB total, **6.5 GB free (94 % used)** |
+| **D:** | 138 GB total, **46 GB free (68 % used)** |
 | `CARGO_HOME` | 982 MB on disk (`du`), 1,067 MB of file bytes — the registry is nearly all of it, and none of it is from this project |
-| `D:\OmniEngine\target` | 227 MB (216 MB of it under `target/debug`) |
+| `D:\OmniEngine\target` | 266 MB (1.3 MB of it under `target/release`, which holds the benchmark binary) |
 | `target/debug/omni.dll` | 5,577,792 bytes — 5.3 MB, and `du -h` rounds that up to 5.4M |
-| Rust sources | 7,332 lines (`crates/**/*.rs`) |
-| Python, JavaScript, and C sources | 4,785 lines — 2,194 Python, 2,227 JavaScript, 364 C (`sdks/` and `examples/c/`, `node_modules` excluded) |
+| Rust sources | 9,271 lines (`crates/**/*.rs`) |
+| Python, JavaScript, and C sources | 6,342 lines — 2,799 Python, 3,059 JavaScript, 484 C (`sdks/` and `examples/c/`, `node_modules` excluded) |
 
 **The storage premise needed correcting.** The brief said 20 GB allocated, and
-the natural reading was "keep it small on D:". D: has 74 GB free and is not the
-problem. C: — where `CARGO_HOME`, the toolchain, and every default build cache
-live — has 7.6 GB free. That is the constraint that shapes the build policy,
-and it is why section 2.4 exists.
+the natural reading was "keep it small on D:". D: is not the problem. C: — where
+`CARGO_HOME`, the toolchain, and every default build cache live — has 6.5 GB
+free. That is the constraint that shapes the build policy, and it is why
+section 2.4 exists.
 
 ---
 
@@ -156,7 +159,7 @@ strip = "debuginfo"
 ```
 
 `debug = "full"` on Windows makes MSVC Program Databases that run to multiple
-gigabytes for a workspace this size, and they land on the drive with 7.6 GB
+gigabytes for a workspace this size, and they land on the drive with 6.5 GB
 free. `line-tables-only` keeps file and line in backtraces — which is what an
 engine under development actually needs — without the variable and type
 metadata that costs the gigabytes.
@@ -319,8 +322,9 @@ prints `0`), and the lexer's two occurrences are both inside its own test module
 
 The invariant the facade depends on, and that the engine upholds: **every
 collection of `Slot`s must be dropped before the arena is reset.**
-`begin_execution()` resets the arena and clears the bindings vector in the same
-call, so the invariant cannot be broken by a caller.
+`reclaim()` resets the arena and clears the bindings vector in the same call, so
+the invariant cannot be broken by a caller — and `exec_many` does the same
+pairing per item, with `reset_to(mark)` in place of a full reset (4.8).
 
 ### 3.3 The lexer borrows; it does not allocate
 
@@ -546,11 +550,13 @@ to read: while a callback holds them, nothing else can move the engine.
 
 | Function | Returns |
 | --- | --- |
-| `omni_abi_version()` | `3` — read this before anything else |
+| `omni_abi_version()` | `4` — read this before anything else |
 | `omni_version()` | static NUL-terminated string, never freed |
 | `omni_engine_new()` | opaque `OmniEngine*`, null on failure |
 | `omni_engine_free(e)` | nothing; null is a no-op |
 | `omni_exec(e, src, len, out)` | status; writes `OmniValue` |
+| `omni_exec_many(e, srcs, lens, n, out, statuses)` | status of the first failing item; writes `n` values and `n` per-item statuses (4.8) |
+| `omni_batch_error(e, index, buf, cap)` | bytes copied for item `index` of the current batch; `0` once the next execution has expired it |
 | `omni_exec_number(e, src, len, out)` | status; writes a `double`; refuses a non-number tag |
 | `omni_str_copy(e, value, buf, cap)` | bytes copied; `0` for a non-string tag or an address this engine does not own |
 | `omni_define_string(e, name, name_len, bytes, bytes_len)` | status; installs a global the language can read |
@@ -564,7 +570,9 @@ to read: while a callback holds them, nothing else can move the engine.
 Statuses: `0 OK`, `1 ERR_COMPILE`, `2 ERR_RUNTIME`, `3 ERR_PANIC`, `4 ERR_ARG`,
 `5 ERR_HOST`, `6 ERR_REENTRANT`. Tags: `0 NUMBER`, `1 NIL`, `2 BOOL`, `3 UNDEF`,
 `4 STRING`. `ERR_HOST` is what a callback's own failure becomes when the script
-that called it fails; `ERR_REENTRANT` is the guard in 4.2.
+that called it fails; `ERR_REENTRANT` is the guard in 4.2. Since ABI v4,
+`OmniStats.execs` counts batch **items** — executions — not crossings, because a
+counter that counted crossings could not verify the linearity claim in 4.9.
 
 The layout is pinned on both sides so a drifting SDK fails at compile time
 rather than returning wrong numbers at run time:
@@ -732,6 +740,95 @@ is the four `verify-all.sh` rows that only make sense across two languages at on
 identical bytes from a callback, identical failure text, a re-entrant call refused
 with the engine still usable afterwards, and the registry count agreeing.
 
+### 4.8 Batch execution: one crossing, many programs
+
+`omni_exec_many` carries N programs in one crossing, amortising the crossing and
+the arena reclamation over the whole list. The header's rule 11 is the contract
+in one sentence: **a batch is N independent executions sharing one egress
+rewind**, not one long program — item *N* cannot read item *N−1*'s `let`.
+
+The mechanics behind that sentence, each checkable in `omni-ffi/tests/batch.rs`
+and `embed.c`:
+
+- **One reclamation, then N isolated runs.** `reclaim()` runs once, before the
+  first item; between items the arena resets back to a `Mark` taken at batch
+  start and the bindings vector clears. Each item is exactly one `exec`'s worth
+  of state.
+- **All N results are live at once.** The egress block rewinds once, before the
+  first item, so every string result stays readable until the next `omni_exec`
+  or `omni_exec_many` — a host can copy all of them out after the call. The
+  trade, stated not hidden: reserved egress bytes are bounded by one batch's
+  total demand rather than one execution's. 256 string items measured 6,142
+  bytes of high-water against a reservation that never moved.
+- **Two error channels.** A malformed *call* — null arrays, `count > 4096`, a
+  source over 256 MiB, bad UTF-8 — is refused whole: `OMNI_ERR_ARG` and nothing
+  written. A failing *item* is data: every element of `statuses` is written,
+  the return status is the first item's failure, and `omni_batch_error(index)`
+  copies that item's own message — until the next execution, at which point it
+  answers zero bytes rather than a stale one. `OMNI_MAX_BATCH` is 4096.
+- **The guards hold.** A batch attempted from inside a host callback is
+  `OMNI_ERR_REENTRANT` exactly like a single exec, and a host failure inside an
+  item is that item's status, never an unwind.
+
+The SDK surfaces: `engine.run_many([...]) -> list[Result]` (raises naming the
+first failing item) and `engine.try_run_many([...]) -> list[(status, result,
+message)]` in Python; `engine.runMany([...])` / `engine.tryRunMany([...])` in
+Node. Both SDKs refuse an over-long list locally, before the crossing. Usage
+advice that the measurements below earn: a batch of one is strictly a loss —
+one extra list is still extra work — and the win saturates fast; there is no
+reason to build huge lists for the crossing's sake.
+
+### 4.9 Measured performance: the three harnesses
+
+Three zero-dependency harnesses measure what each host can see with its own
+instruments — the counting `GlobalAlloc` in the Rust binary, the `gc` callbacks
+and `tracemalloc` in Python, the `PerformanceObserver` in Node — and
+`scripts/bench.sh` runs whichever are present and prints the comparison. The
+method is shared so the tables mean the same thing: five rounds, fastest
+reported (a scheduler preemption only ever adds time), separate passes for
+timing and counting, and the engine's own `execs` counter checked per timed
+pass, so a round that skipped executions fails loudly.
+
+Canonical run, this machine, 20,000 iterations, `./scripts/bench.sh`
+(2026-11-07; full tables land in `target/bench/`):
+
+```
+host           string ns   empty crossing   best batch/item
+rust              269.5              --              0.99x
+python          10062.0           239.1              1.24x
+node             8489.9            35.8              1.38x
+```
+
+The three tables agree on the headline: **the crossing costs 36–240 ns and the
+wrapper costs microseconds, so a batch's time win at the SDK level is bounded
+(1.2–1.4× per item at best), while its allocation win is unconditional — in
+Rust, 0.00 allocations per execution in every scenario, falling to 0.004 per
+*item* inside a 256-batch.** The empty-crossing row is why: ctypes spends
+239 ns on a call that does nothing, koffi 36 ns, and that is the entire thing a
+batch can amortise. The rest of each call is the host building arguments and
+reading results, which a batch cannot remove — it can only share the per-item
+part of the wrapper, which is where the SDK speed-ups come from.
+
+The linearity claim, checked in all three harnesses at 1,000 / 10,000 /
+100,000 executions of the `string` scenario: per-execution time flat (Rust
+225.9 → 229.8 → 240.3 ns; Node 7.3 → 8.2 → 8.4 µs; Python flat within its
+noise), egress reservation 65,536 bytes throughout, `execs` counted exactly,
+retained bytes zero. Every number in this section is a quoted run, not a
+promise — the harnesses print the library paths and tool versions they ran
+against, and a laptop's noise floor is part of the record (the Python batch
+table's N=256 cell measured 0.96× on this run and 1.34× on another, and says
+so).
+
+Two core changes the baseline earned, and one thing deliberately not done:
+the token vector is now reused across executions (a warm engine lexes without
+asking the allocator for anything), and the arena's cursor walks already-mapped
+chunks instead of mapping fresh ones per cycle — the change without which
+"reservation flat over 100,000 executions" could not be written. Deliberately
+not done: parallelism inside a batch (a sequential batch has no
+synchronisation to get wrong), and bytecode or caching (an expression
+language with no user-defined functions has nothing to reuse a compiled form
+for).
+
 ---
 
 ## 5. Phase 4 — GitHub Linguist and file extensions
@@ -798,13 +895,13 @@ checkout and a Linux checkout do not fight over `Cargo.lock`.
 
 **Language statistics** — `linguist-vendored` removes `sdks/**` from the counts,
 and `linguist-documentation` removes `docs/**`. That is what makes the brief's
-"without altering native project statistics" true *in this repository*: the 4,421
-lines of Python and JavaScript under `sdks/` — 2,194 and 2,227 — do not dilute the
-7,332 lines of Rust. The numbers are raw `wc -l`; Linguist reports fewer for both,
+"without altering native project statistics" true *in this repository*: the 5,858
+lines of Python and JavaScript under `sdks/` — 2,799 and 3,059 — do not dilute the
+9,271 lines of Rust. The numbers are raw `wc -l`; Linguist reports fewer for both,
 because it drops blanks and comments, and the ratio is not the claim — the
 *exclusion* is, so no SDK line reaches the bar at all. `examples/c/embed.c` is
-deliberately *not* vendored: it is part of the engine's own proof, and its 364
-lines against 7,332 would not move the bar anyway.
+deliberately *not* vendored: it is part of the engine's own proof, and its 484
+lines against 9,271 would not move the bar anyway.
 
 ### 5.3 The honest limit, and the two-tier plan
 
@@ -1063,36 +1160,40 @@ One command, and it is the acceptance test for the whole brief:
 ./scripts/verify-all.sh
 ```
 
-Measured output on 2026-11-03, with the callback increment in it:
+Measured output on 2026-11-07, with the batch increment in it:
 
 ```
 == OmniEngine cross-host verification ==
    workspace: /d/OmniEngine
 
-Rust tests... Shared library... omni-cli... C embedding... Python SDK... Node SDK... A string is the same bytes in every host... One type error, the same text everywhere... Every surface agrees on the ABI level... String results do not grow memory... A host function answers the same bytes in every host... A host failure is data, and says so identically... Re-entering the engine from a callback is refused, not crashed... The registry says the same thing from both sides...
+Rust tests... Shared library... omni-cli... C embedding... Python SDK... Node SDK... A string is the same bytes in every host... One type error, the same text everywhere... Every surface agrees on the ABI level... String results do not grow memory... A host function answers the same bytes in every host... A host failure is data, and says so identically... Re-entering the engine from a callback is refused, not crashed... The registry says the same thing from both sides... A batch answers the same items in every host... A failing item names itself identically in every host... A batch counts items, not crossings, and reserves nothing extra... A batch inside a host callback is refused, not crashed...
 == Results ==
-  PASS  cargo test --workspace (187 tests)
+  PASS  cargo test --workspace (225 tests)
   PASS  omni.dll (5.4M)
   PASS  omni run examples/hello.omni -> 42
   PASS  omni run examples/strings.omni -> hello, world 😀
   PASS  examples/c/embed.c -> 42 via omni.h
   PASS  python ctypes -> 42.0
-  PASS  python SDK tests (92 tests)
+  PASS  python SDK tests (106 tests)
   PASS  node koffi -> 42
-  PASS  node SDK tests (ℹ tests 74 ℹ pass 74 ℹ fail 0 )
+  PASS  node SDK tests (ℹ tests 92 ℹ pass 92 ℹ fail 0 )
   PASS  concat + \u{...} identical in: cli python node
   PASS  the mixed-type message survives the boundary in: cli python node c
-  PASS  ABI 3 declared and read identically: header=3 C=3 python=3/lib=3 node=3/lib=3
+  PASS  ABI 4 declared and read identically: header=4 C=4 python=4/lib=4 node=4/lib=4
   PASS  2000 string executions, one rewind each, reservation flat: python(65536 B) node(65536 B)
   PASS  an argument crossed in and a string crossed back out, identically in: python node
   PASS  an exception was caught at the boundary and named in: python node
   PASS  a second borrow of the same handle errors and the engine lives on in: python node
   PASS  three registrations, one removal, then the name is unknown in: python node
+  PASS  four items, one crossing, the same values in: python node
+  PASS  statuses 0 2 0 2 and the engine text for items 1 and 3, identically in: python node
+  PASS  8000 items in 1000 crossings, execs +8000, reservation flat: python(0 B) node(0 B)
+  PASS  a batch from a borrowed handle errors with the shared refusal text in: python node
 
 All checks that could run, passed.
 ```
 
-The last eight rows are the ones that could not exist in one host. The string
+The last twelve rows are the ones that could not exist in one host. The string
 comparison is byte-exact — an escape decoded differently in Rust and Node passes
 both test suites and is still a broken bridge — and the ABI row reads the number
 off the header, the loaded library as C sees it, and the library as each SDK sees
@@ -1102,13 +1203,18 @@ what only a *round trip* can: that a host's answer arrives as the same bytes in
 Python and in Node, that a host's exception surfaces as the same message rather
 than as a crash, that a callback which re-enters its own engine is refused and the
 engine still evaluates `6 * 7` afterwards, and that the registry count and the
-unknown-name error agree on both sides.
+unknown-name error agree on both sides. The four batch rows are the same idea
+for `omni_exec_many`: the same four items come out of one crossing as the same
+values in both hosts, a failing item reports the same statuses and the same
+engine text, the counter proves 8,000 items in 1,000 crossings are 8,000
+executions with a flat reservation, and a batch from inside a callback meets the
+same refusal.
 
 The script degrades to `SKIP` rather than lying. `cargo`, `gcc`, `python` and
 `node` each have their own guard, Node without `koffi` is skipped with
 `npm install koffi` in the reason, and each cross-host row skips itself when fewer
-than two hosts answered. Nothing was skipped on this machine — all seventeen rows
-ran. `omni-wasm` has no row here because `wasm32-unknown-unknown` is not
+than two hosts answered. Nothing was skipped on this machine — all twenty-one
+rows ran. `omni-wasm` has no row here because `wasm32-unknown-unknown` is not
 installed; its 7 tests run under `cargo test --workspace`, where the crate
 compiles for the host target and asserts its status codes against the same
 constants the C header declares.
@@ -1117,16 +1223,18 @@ Against the brief's five phases:
 
 | Phase | Asked for | Verified by |
 | --- | --- | --- |
-| 1 | Workspace on D:, fast compiles, managed `target/` | `cargo test --workspace` 187 tests; `target/` measured at 227 MB |
-| 2 | Ultra-fast memory-safe core, no GC | NaN-boxed 8-byte `Value` asserted for size; arena reset is O(chunks); egress rewind keeps reservations flat over 5,000 executions; no collector exists to pause |
-| 3 | C ABI callable from Python and JavaScript | same `42` and the same `hello, world 😀` from Rust, C, Python, Node; 14 exports confirmed with `objdump -p`; `omni.h` compiles warning-free under `-Wall -Wextra` |
+| 1 | Workspace on D:, fast compiles, managed `target/` | `cargo test --workspace` 225 tests; `target/` measured at 266 MB |
+| 2 | Ultra-fast memory-safe core, no GC | NaN-boxed 8-byte `Value` asserted for size; arena reset is O(chunks); egress rewind keeps reservations flat over 100,000 executions; no collector exists to pause |
+| 3 | C ABI callable from Python and JavaScript | same `42` and the same `hello, world 😀` from Rust, C, Python, Node; 16 exports confirmed with `objdump -p`; `omni.h` compiles warning-free under `-Wall -Wextra` |
 | 4 | A custom extension GitHub recognises | `.gitattributes` tier 1; the tier-2 limit is stated in section 5.3 rather than glossed over |
-| 5 | `pip`/`npm` SDKs that do not move the language stats | 92 + 74 SDK tests; `linguist-vendored` on `sdks/**`; no binary vendored into either package |
+| 5 | `pip`/`npm` SDKs that do not move the language stats | 106 + 92 SDK tests; `linguist-vendored` on `sdks/**`; no binary vendored into either package |
 
-Test totals: **128** in `omni-core`, **45** in `omni-ffi` (18 unit, 20 in
-`tests/ffi_contract.rs`, and 7 in `tests/host_callbacks.rs`, which drive the ABI
-exactly as a host does), **7** in `omni-cli`, **7** in `omni-wasm`, **92** Python,
-**74** Node.
+Test totals: **152** in `omni-core`, **59** in `omni-ffi` (18 unit, 13 in
+`tests/batch.rs`, 20 in `tests/ffi_contract.rs`, and 8 in
+`tests/host_callbacks.rs`, which drive the ABI exactly as a host does), **7** in
+`omni-cli`, **7** in `omni-wasm`, **106** Python, **92** Node. The batch and
+callback suites are contract tests against the header, not unit tests of the
+implementation they sit next to.
 
 Static checks are part of the definition of done:
 
@@ -1145,15 +1253,15 @@ cache and cargo's `deps` contain hardlinks.
 
 | What | Size | Where | Note |
 | --- | --- | --- | --- |
-| Source tree (excluding `target/` and `node_modules`) | 2.5 MB | D: | the whole repository, tracked files only |
-| `target/` total | **228 MB** | D: | 216 MB of it under `target/debug` |
+| Source tree (excluding `target/` and `node_modules`) | 3.0 MB | D: | the whole repository, tracked files only |
+| `target/` total | **266 MB** | D: | 1.3 MB under `target/release`, which is the benchmark binary |
 | `target/debug/omni.dll` | 5.4 MB | D: | the artifact every host loads |
-| `CARGO_HOME` | 982 MB | C: | 897 MB registry + 170 MB `bin` by file size; none of it from this project |
+| `CARGO_HOME` | 969 MB | C: | 897 MB registry + 170 MB `bin` by file size; none of it from this project |
 | `sdks/nodejs/node_modules` | 2.9 MB | D: | koffi prebuild, gitignored |
-| Free on C: | **7.3 GB** (93 % used) | | the binding constraint |
-| Free on D: | 75 GB (47 % used) | | |
+| Free on C: | **6.5 GB** (94 % used) | | the binding constraint |
+| Free on D: | 46 GB (68 % used) | | |
 
-`cargo clean` returns the 228 MB in a second, and it is the only routine way to
+`cargo clean` returns the 266 MB in a second, and it is the only routine way to
 do so. The knobs that keep it that size are in section 2.4: no dependencies, so
 no dependency artifacts; `debug = "line-tables-only"`, so no PDBs.
 
@@ -1270,13 +1378,15 @@ the call site.
 
 ## 10. What comes next
 
-Two increments shipped after the first bridge. Strings made `OmniValue` a union,
+Three increments shipped after the first bridge. Strings made `OmniValue` a union,
 promoted a result's bytes into a block a host can copy from, and made
 `omni_str_copy` refuse addresses it cannot prove. Host callbacks then made the
 boundary bidirectional: a script can call foreign code, the engine borrows its own
 state through `RefCell` so a re-entrant call is an error rather than an alias, and
-every host turns an exception into a message instead of an unwind. What the same
-memory model is still waiting for, in rough order:
+every host turns an exception into a message instead of an unwind. Batch execution
+then made the boundary carry several programs at once, and the three benchmark
+harnesses (4.9) turned every performance claim in this file into a quoted run.
+What the same memory model is still waiting for, in rough order:
 
 1. **Booleans, `nil`, `undefined` as literals.** The tags and singletons already
    exist in `Value`; only the parser is missing. Booleans are values today — you
@@ -1284,20 +1394,27 @@ memory model is still waiting for, in rough order:
 2. **String operations.** `length`, indexing, slicing, comparison order, and a
    way to get a number or a bool *into* a string. The box already stores the
    length, so this is evaluator work, not layout work.
-3. **An AST.** Extracting one from the current one-pass evaluator, so functions
+3. **A zero-copy result path for a host that wants one.** The harnesses in 4.9
+   say the crossing is 36–240 ns and the wrapper is microseconds, and the
+   wrapper's biggest single cost is copying string bytes out. A borrow API —
+   pointer valid until the next execution, on the same rule 1 a host already
+   lives under — is the next performance increment, and the benches are the
+   instrument it will be judged by. A batch already makes all N results live at
+   once, so a borrow and a batch compose.
+4. **An AST.** Extracting one from the current one-pass evaluator, so functions
    and control flow have something to be built from. A call node is the first
    thing an AST would buy back: today `parse_call` evaluates its arguments as it
    reads them, so a host function cannot see the source text of its own call, and
    that is what macros, lazy arguments, and closures would need.
-4. **User-defined functions and control flow.** Host functions settled the call
+5. **User-defined functions and control flow.** Host functions settled the call
    *syntax*, the arity check, and the depth guard, so what remains is language-side
    frames — which is where the arena's `reset`-per-exec model needs re-examining.
-5. **wasm for real.** `wasm-bindgen`, the `wasm32-unknown-unknown` target, and a
+6. **wasm for real.** `wasm-bindgen`, the `wasm32-unknown-unknown` target, and a
    browser example; the shape is already scaffolded and asserted to agree with
    the C statuses. A wasm string will need its own copy rule, since there is no
    shared address space to rewind inside, and a host callback needs a `JsFunction`
    rather than a function pointer.
-6. **Linguist tier 2.** The upstream PR from section 5.3, which would also make
+7. **Linguist tier 2.** The upstream PR from section 5.3, which would also make
    the new `examples/strings.omni` show up under its own language name.
 
 **One cosmetic defect, deliberately left for its own commit.** `display_kind`

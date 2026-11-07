@@ -37,7 +37,7 @@ import ctypes
 import os
 import platform
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from ctypes import (
     POINTER,
     Structure,
@@ -63,6 +63,7 @@ __all__ = [
     "MAX_IDENTIFIER_LEN",
     "MAX_ARGS",
     "MAX_CALL_DEPTH",
+    "MAX_BATCH",
     "OMNI_ABI_VERSION",
     "OMNI_HOST_OK",
     "OMNI_HOST_ERR",
@@ -120,7 +121,7 @@ OMNI_HOST_ERR = 1
 
 #: Wire format of the value struct this module reads. Checked against the
 #: library at load; see the module docstring's rule 3.
-OMNI_ABI_VERSION = 3
+OMNI_ABI_VERSION = 4
 
 #: The ABI rejects any source ``len`` above this, so a huge value is an argument
 #: error rather than an out-of-bounds read.
@@ -144,6 +145,11 @@ MAX_ARGS = 16
 #: host function that never terminates costs a runtime error, not a stack
 #: overflow that would take the Python process down with it.
 MAX_CALL_DEPTH = 64
+
+#: Most programs one ``omni_exec_many`` crossing may carry. Mirrors
+#: ``OMNI_MAX_BATCH``: a boundary bound on how many pointers the engine will read
+#: from a host array, not a limit of the language.
+MAX_BATCH = 4096
 
 
 #: What a host function receives and returns: the arguments the script passed,
@@ -467,6 +473,23 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     lib.omni_exec_number.argtypes = [c_void_p, c_char_p, c_size_t, POINTER(c_double)]
     lib.omni_exec_number.restype = c_uint32
 
+    # Two arrays in, two arrays out. POINTER(c_char_p) is the array of source
+    # addresses; the lengths are a separate array because no source is required
+    # to be NUL-terminated. Both output arrays are caller-owned and sized by the
+    # caller, which is why the count is passed rather than inferred.
+    lib.omni_exec_many.argtypes = [
+        c_void_p,
+        POINTER(c_char_p),
+        POINTER(c_size_t),
+        c_size_t,
+        POINTER(OmniValue),
+        POINTER(c_uint32),
+    ]
+    lib.omni_exec_many.restype = c_uint32
+
+    lib.omni_batch_error.argtypes = [c_void_p, c_size_t, POINTER(ctypes.c_char), c_size_t]
+    lib.omni_batch_error.restype = c_size_t
+
     # buf is POINTER(c_char), not c_char_p: the ABI writes into it, and a
     # one-way c_char_p would let ctypes hand out a read-only pointer to
     # immutable Python bytes.
@@ -631,7 +654,19 @@ class RawEngine:
     interpreter teardown is how these bindings segfault on exit.
     """
 
-    __slots__ = ("_lib", "_handle", "_host_fns")
+    __slots__ = (
+        "_lib",
+        "_handle",
+        "_host_fns",
+        "_batch_ptrs",
+        "_batch_lengths",
+        "_batch_values",
+        "_batch_statuses",
+        "_batch_capacity",
+        "_batch_keep",
+        "_string_buf",
+        "_string_cap",
+    )
 
     def __init__(self, lib: ctypes.CDLL | None = None) -> None:
         self._lib = lib if lib is not None else load_library()
@@ -642,6 +677,23 @@ class RawEngine:
         # Name (as registered bytes) -> binding. This dict is the only owner of
         # the ctypes closures whose addresses the engine holds.
         self._host_fns: dict[bytes, _HostBinding] = {}
+        # The four arrays a batch hands the ABI, sized to the largest batch this
+        # engine has ever been asked for and reused after that. Building them is
+        # four allocations and a C-side fill per call otherwise, which is the
+        # batch's own overhead -- measured, and the reason it is paid once.
+        self._batch_ptrs = None
+        self._batch_lengths = None
+        self._batch_values = None
+        self._batch_statuses = None
+        self._batch_capacity = 0
+        # The encoded sources of the most recent batch, held so that no slot of
+        # `_batch_ptrs` is ever an address whose bytes have already died.
+        self._batch_keep = None
+        # One growable destination for omni_str_copy. The bytes it hands back is
+        # a fresh object, so the buffer itself is reusable -- and a per-result
+        # allocation is the difference between a batch and a loop.
+        self._string_buf = None
+        self._string_cap = 0
 
     @property
     def lib(self) -> ctypes.CDLL:
@@ -668,6 +720,84 @@ class RawEngine:
         status = self._lib.omni_exec_number(self._handle, data, len(data), byref(out))
         return status, out.value
 
+    def exec_many(self, sources: Sequence[str | bytes]) -> tuple[int, list[OmniValue], list[int]]:
+        """Evaluate every source in one crossing; never raises on a script error.
+
+        Returns ``(first_failing_status, values, statuses)``. The two lists have
+        one entry per source, in order, including for items that failed -- a
+        failed item's value is ``OMNI_UNDEF``.
+
+        Every string in ``values`` is readable *now*, because the batch shares
+        one egress rewind. They all expire on the next evaluation of either
+        kind, so a caller that keeps them must copy them out first, which is
+        what :meth:`read_string` is for.
+
+        Raises:
+            OmniError: more than :data:`MAX_BATCH` sources, or one source longer
+                than :data:`MAX_SOURCE_LEN`. Both are checked here, before any
+                pointer is handed over, so the engine never sees a bad array.
+        """
+        encoded = [self._encode(source) for source in sources]
+        count = len(encoded)
+        if count > MAX_BATCH:
+            raise OmniError(
+                OMNI_ERR_ARG,
+                f"a batch carries at most {MAX_BATCH} programs, not {count}",
+            )
+        if count == 0:
+            return OMNI_OK, [], []
+        self._grow_batch(count)
+        ptrs, lengths, values, statuses = (
+            self._batch_ptrs,
+            self._batch_lengths,
+            self._batch_values,
+            self._batch_statuses,
+        )
+        # `encoded` owns the bytes these slots point into, and
+        # `_batch_keep` holds it for the ABI call and until the next one --
+        # ctypes does not keep a reference on your behalf, and a reused array
+        # would otherwise outlive the buffers it was filled with.
+        self._batch_keep = encoded
+        for index, data in enumerate(encoded):
+            ptrs[index] = data
+            lengths[index] = len(data)
+            # Cleared here rather than allocated: an argument error refuses the
+            # whole call without writing a single status, and a stale non-zero
+            # from the previous batch would read back as this batch's failure.
+            statuses[index] = 0
+        status = self._lib.omni_exec_many(self._handle, ptrs, lengths, count, values, statuses)
+        return status, [values[index] for index in range(count)], [statuses[index] for index in range(count)]
+
+    def _grow_batch(self, count: int) -> None:
+        """Make the reused batch arrays hold at least `count` sources.
+
+        Sizes double from 8, so a host that walks its queue in slightly larger
+        steps reallocates logarithmically, and the capacity can never pass
+        :data:`MAX_BATCH` because `exec_many` refuses above it.
+        """
+        if count <= self._batch_capacity:
+            return
+        size = 8
+        while size < count:
+            size *= 2
+        self._batch_ptrs = (c_char_p * size)()
+        self._batch_lengths = (c_size_t * size)()
+        self._batch_values = (OmniValue * size)()
+        self._batch_statuses = (c_uint32 * size)()
+        self._batch_capacity = size
+
+    def batch_error(self, index: int, cap: int = 4096) -> str:
+        """The rendered error of item ``index`` of the most recent batch.
+
+        ``""`` for an item that succeeded, for an index past the batch, and after
+        a single :meth:`exec` -- which ends the batch's currency. The engine's own
+        :meth:`last_error` holds only the *final* item's message, which is why
+        this exists.
+        """
+        buf = ctypes.create_string_buffer(cap)
+        written = self._lib.omni_batch_error(self._handle, index, buf, cap)
+        return buf.raw[:written].decode("utf-8", "replace")
+
     def read_string(self, value: OmniValue) -> bytes:
         """Copy a string result into Python storage, through the ABI.
 
@@ -683,10 +813,15 @@ class RawEngine:
         if size == 0:
             return b""
         # create_string_buffer(n) allocates n + 1 and zeroes it, so there is
-        # always a byte past the request to prove the ABI wrote no further.
-        buf = ctypes.create_string_buffer(size)
-        written = self._lib.omni_str_copy(self._handle, byref(value), buf, size)
-        return buf.raw[:written]
+        # always a byte past the request to prove the ABI wrote no further. The
+        # buffer is this engine's, grown when a result needs more than it holds:
+        # the bytes returned below is a fresh object, so nothing handed to a
+        # caller points into it.
+        if self._string_cap < size:
+            self._string_buf = ctypes.create_string_buffer(size)
+            self._string_cap = size
+        written = self._lib.omni_str_copy(self._handle, byref(value), self._string_buf, size)
+        return ctypes.string_at(ctypes.addressof(self._string_buf), written)
 
     def define_string(self, name: str | bytes, payload: str | bytes) -> int:
         """Bind a host string; returns the status. Never raises on error.

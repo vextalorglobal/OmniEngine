@@ -346,9 +346,9 @@ test('the OmniStats layout matches omni.h', () => {
 test('the ABI level is read from the library, not assumed', () => {
   const engine = new Engine();
   try {
-    assert.equal(engine.abiVersion, 3);
+    assert.equal(engine.abiVersion, 4);
     assert.equal(engine.abiVersion, bindings.ABI_VERSION);
-    assert.equal(omni.ABI_VERSION, 3);
+    assert.equal(omni.ABI_VERSION, 4);
   } finally {
     engine.close();
   }
@@ -364,12 +364,15 @@ test('checkAbi refuses a library that speaks another wire format', () => {
     (err) => {
       assert.equal(err.name, 'OmniLibraryError');
       assert.match(err.message, /ABI version 1/);
-      assert.match(err.message, /ABI version 3/);
+      // The SDK's own level, read from the module rather than typed in: this
+      // is the message a stale artifact answers with, and it has to name the
+      // level the caller is actually missing.
+      assert.match(err.message, new RegExp(`ABI version ${bindings.ABI_VERSION}`));
       assert.match(err.message, /cargo build -p omni-ffi/);
       return true;
     }
   );
-  assert.equal(bindings.checkAbi(3, '/current/omni.dll'), 3);
+  assert.equal(bindings.checkAbi(bindings.ABI_VERSION, '/current/omni.dll'), bindings.ABI_VERSION);
 });
 
 test('status and tag names', () => {

@@ -51,10 +51,12 @@ calls yourself.
 from __future__ import annotations
 
 import ctypes
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from ._ffi import (
     MAX_ARGS,
+    MAX_BATCH,
     MAX_CALL_DEPTH,
     MAX_IDENTIFIER_LEN,
     MAX_SOURCE_LEN,
@@ -88,6 +90,7 @@ __all__ = [
     "MAX_STRING_LEN",
     "MAX_IDENTIFIER_LEN",
     "MAX_ARGS",
+    "MAX_BATCH",
     "MAX_CALL_DEPTH",
     "OMNI_ABI_VERSION",
     "__version__",
@@ -261,6 +264,70 @@ class Engine:
         if status != OMNI_OK:
             return status, None, self._message(raw, status)
         return status, _convert(value, raw.read_string(value)), ""
+
+    def run_many(self, sources: Sequence[str]) -> list[Result]:
+        """Evaluate every source in one crossing and return one Result each.
+
+        The point is the crossing, not the convenience: a loop of :meth:`run`
+        pays the FFI round trip and the engine's per-execution reclamation once
+        per program, and this pays both once for the whole list.
+
+        Each source is an independent program. A ``let`` in one is not visible
+        to the next, exactly as two :meth:`run` calls would behave.
+
+        Every string result is copied out before this returns, so the list is
+        ordinary Python data and nothing in it expires.
+
+        Raises:
+            OmniError: the first item that failed, named by its index. Items
+                after it still ran -- use :meth:`try_run_many` to see them all.
+        """
+        items = self._batch(sources)
+        for index, (status, _result, message) in enumerate(items):
+            if status != OMNI_OK:
+                raise OmniError(status, f"item {index} of {len(items)}: {message}")
+        return [result for _status, result, _message in items]  # type: ignore[return-value]
+
+    def try_run_many(self, sources: Sequence[str]) -> list[tuple[int, Result | None, str]]:
+        """Evaluate a batch without exceptions: one ``(status, result, message)``
+        per source, in order.
+
+        The per-item shape of :meth:`try_run`. A failing item carries its own
+        status and the engine's message for *that* item -- not the message of the
+        last one, which is all ``last_error`` can offer after a batch.
+
+        An empty sequence returns an empty list and expires nothing: polling an
+        empty queue does not invalidate a Result you are still holding.
+
+        Raises:
+            OmniError: the call itself was refused -- too many sources, an
+                over-long source, a closed engine. A program that fails is data
+                here; a call that was built wrong is not.
+        """
+        return self._batch(sources)
+
+    def _batch(self, sources: Sequence[str]) -> list[tuple[int, Result | None, str]]:
+        """One crossing, then every string copied out before anything else runs.
+
+        The copy has to happen here and has to happen for every item: the batch
+        shares one egress rewind, so all N results are live at once right now
+        and all N expire on the next evaluation.
+        """
+        raw = self._require()
+        status, values, statuses = raw.exec_many(sources)
+        self._last_status = status
+        results = [
+            _convert(value, raw.read_string(value)) if code == OMNI_OK else None
+            for value, code in zip(values, statuses)
+        ]
+        if status != OMNI_OK and all(code == OMNI_OK for code in statuses):
+            # No item failed, so the call itself was refused -- a bad argument or
+            # a re-entrant call. There is no per-item shape for that.
+            raise OmniError(status, self._message(raw, status))
+        return [
+            (code, result, raw.batch_error(index) if code != OMNI_OK else "")
+            for index, (code, result) in enumerate(zip(statuses, results))
+        ]
 
     def define_string(self, name: str, value: str) -> None:
         """Bind ``name`` to a string the *host* owns.

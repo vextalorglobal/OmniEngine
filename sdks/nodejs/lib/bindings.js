@@ -84,8 +84,14 @@ const TAG_NAMES = Object.freeze({
  * The bump is a guard rail -- a v2 library does not have `omni_register_host_fn`,
  * so reading a script that calls a host function fails as a runtime error, not
  * as a missing symbol.
+ *
+ * Version 4 changes no layout either. It is `omni_exec_many` and
+ * `omni_batch_error`, which a v3 SDK cannot declare, and the fact that
+ * `OmniStats.execs` now counts batch items as well as single calls -- a v3 host
+ * reading it as "number of omni_exec calls" would draw a wrong conclusion from a
+ * correct number.
  */
-const ABI_VERSION = 3;
+const ABI_VERSION = 4;
 
 /** The ABI rejects any length above these, before reading a single byte. */
 const MAX_SOURCE_LEN = 2 ** 28;
@@ -95,6 +101,9 @@ const MAX_IDENTIFIER_LEN = 32;
 /** How many arguments a host function may take, and how deep calls may nest. */
 const MAX_ARGS = 16;
 const MAX_CALL_DEPTH = 64;
+
+/** Items one `omni_exec_many` call may carry. */
+const MAX_BATCH = 4096;
 
 /** What a host callback returns: success, or failure with a message in `out`. */
 const HOST_OK = 0;
@@ -255,6 +264,7 @@ function declare(koffi, lib, resolvedPath) {
     MAX_IDENTIFIER_LEN,
     MAX_ARGS,
     MAX_CALL_DEPTH,
+    MAX_BATCH,
     HOST_OK,
     HOST_ERR,
     abiVersion,
@@ -263,6 +273,16 @@ function declare(koffi, lib, resolvedPath) {
     engineFree: lib.func('void omni_engine_free(void *engine)'),
     exec: lib.func('uint32_t omni_exec(void *engine, const void *src, size_t len, OmniValue *out)'),
     execNumber: lib.func('uint32_t omni_exec_number(void *engine, const void *src, size_t len, double *out)'),
+    // Batch: four caller-owned arrays, so every parameter is `void *` and this
+    // SDK does the marshalling. Declaring `OmniValue *` or `uint32_t *` would
+    // invite koffi to convert a JavaScript object into a temporary struct and
+    // hand the engine *that* address, which is a write that goes nowhere. As
+    // `void *`, koffi passes the memory we point it at: a BigUint64Array of
+    // source addresses, a BigUint64Array of lengths, a koffi.alloc'd struct
+    // array, and a Uint32Array of statuses. `sources` is therefore an array of
+    // pointers rather than an array of strings -- the ABI reads `count` of each
+    // and validates every source before running any of them.
+    execMany: lib.func('uint32_t omni_exec_many(void *engine, const void *sources, const void *lengths, size_t count, void *out, void *statuses)'),
     // `char *` for the destination: koffi needs to know it is writable, and a
     // Buffer is what the caller owns. The ABI writes no NUL and reads no NUL --
     // `cap` and the return value are the whole contract.
@@ -276,6 +296,10 @@ function declare(koffi, lib, resolvedPath) {
     hostFnCount: lib.func('size_t omni_host_fn_count(const void *engine)'),
     debugStats: lib.func('uint32_t omni_debug_stats(void *engine, OmniStats *out)'),
     lastError: lib.func('size_t omni_last_error(void *engine, void *buf, size_t cap)'),
+    // Same contract as omni_last_error, one index over: after a batch,
+    // last_error only ever holds the final item's message, so a host that wants
+    // the reason item 7 failed asks for it by number.
+    batchError: lib.func('size_t omni_batch_error(const void *engine, size_t index, void *buf, size_t cap)'),
     debugPanic: lib.func('uint32_t omni_debug_panic(void *engine)'),
   };
 
@@ -317,6 +341,7 @@ module.exports = {
   MAX_IDENTIFIER_LEN,
   MAX_ARGS,
   MAX_CALL_DEPTH,
+  MAX_BATCH,
   HOST_OK,
   HOST_ERR,
 };

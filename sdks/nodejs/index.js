@@ -37,6 +37,16 @@
  *     engine.registerFunction('shout', (s) => s.toUpperCase() + '!');
  *     engine.run('shout("hi")').value;          // 'HI!'
  *
+ * Many programs at once, if they are independent, belong in one crossing:
+ *
+ *     const results = engine.runMany(['1 + 1', '"two"', 'square(3)']);
+ *     results[2].value;                          // 9
+ *
+ * `runMany` pays the FFI round trip and the engine's per-execution reclamation
+ * once for the whole list instead of once per program, and it keeps every string
+ * result readable until the next call -- see `tryRunMany` for the version that
+ * reports failures as data.
+ *
  * Arguments arrive as numbers, booleans, strings, or null, and the return value
  * travels back the same way. An exception in your function is not a crash: it
  * becomes an `OmniError` whose kind is `'host'`, carrying your message to the
@@ -106,6 +116,17 @@ class Engine {
     this._numberOut = this._b.koffi.alloc('double', 1);
     this._statsOut = this._b.koffi.alloc(this._b.OmniStats, 1);
     this._errorBuf = Buffer.alloc(ERROR_BUFFER_SIZE);
+    // Batch scratch, grown once to the largest batch this engine has been handed
+    // and reused after that. koffi passes a TypedArray's own memory for a
+    // `void *` parameter, so repeating a batch of the same size costs no
+    // allocation and no copy -- the only work per call is filling the arrays.
+    this._batchCapacity = 0;
+    this._batchAddrs = null;
+    this._batchLengths = null;
+    this._batchStatuses = null;
+    this._batchValues = null;
+    this._batchBase = 0n;
+    this._batchStride = BigInt(this._b.koffi.sizeof(this._b.OmniValue));
     this._lastStatus = STATUS.OK;
     // Registered callbacks and their koffi handles, keyed by name. The handle is
     // the memory koffi allocated for the C-to-JS trampoline; it stays live only
@@ -209,6 +230,158 @@ class Engine {
     }
     const raw = b.koffi.decode(this._valueOut, b.OmniValue);
     return { status, statusName: 'ok', result: toResult(raw, this._copyString(raw)), message: '' };
+  }
+
+  /**
+   * Evaluate every source in one crossing and return one Result per source.
+   *
+   * Each source is an independent program: a `let` in one is not visible to the
+   * next, exactly as two `run` calls would behave. Host globals and registered
+   * functions survive every item, as they survive every call.
+   *
+   * Every string result is copied out before this returns, so nothing in the
+   * list expires.
+   *
+   * @param {Iterable<string|Buffer>} sources at most `MAX_BATCH` of them
+   * @returns {Result[]}
+   * @throws {OmniError} naming the first item that failed. Items after it still
+   *   ran -- use `tryRunMany` to see them all.
+   */
+  runMany(sources) {
+    const items = this._batch(sources);
+    for (let index = 0; index < items.length; index++) {
+      if (items[index].status !== STATUS.OK) {
+        throw new OmniError(items[index].status, `item ${index} of ${items.length}: ${items[index].message}`);
+      }
+    }
+    return items.map((item) => item.result);
+  }
+
+  /**
+   * Evaluate a batch without throwing: one `{ status, statusName, result,
+   * message }` per source, in order.
+   *
+   * The per-item shape of `tryRun`. A failing item carries its own status and
+   * the engine's message for *that* item, read through `omni_batch_error` --
+   * `lastError()` only ever holds the final item's.
+   *
+   * An empty iterable returns an empty list and expires nothing: polling an
+   * empty queue does not invalidate a Result you are still holding.
+   *
+   * @param {Iterable<string|Buffer>} sources
+   * @throws {OmniError} when the call itself was refused -- too many sources, an
+   *   over-long source, a closed engine. A program that fails is data here; a
+   *   call that was built wrong is not.
+   */
+  tryRunMany(sources) {
+    return this._batch(sources);
+  }
+
+  /**
+   * One crossing, then every string copied out before anything else runs.
+   *
+   * The copy has to happen here and has to happen for every item: the batch
+   * shares one egress rewind, so all N results are live at once right now and
+   * all N expire on the next execution of either kind.
+   */
+  _batch(sources) {
+    const b = this._require();
+    const list = sources === null || sources === undefined ? [] : Array.from(sources);
+    if (list.length > bindingsModule.MAX_BATCH) {
+      throw new OmniError(
+        STATUS.ERR_ARG,
+        `${list.length} sources; one crossing carries at most ${bindingsModule.MAX_BATCH}`
+      );
+    }
+    if (list.length === 0) return [];
+
+    // The Buffers hold the bytes the engine reads, so they have to outlive the
+    // call. The arrays below only carry their addresses.
+    const encoded = list.map((source) => encode(source));
+    const count = encoded.length;
+    if (count > this._batchCapacity) this._growBatch(count);
+    for (let i = 0; i < count; i++) {
+      this._batchAddrs[i] = BigInt(b.koffi.address(encoded[i]));
+      this._batchLengths[i] = BigInt(encoded[i].length);
+    }
+    // Zero the statuses this call owns. The ABI guarantees nothing about the
+    // ones it does not write: an argument error refuses the whole batch with
+    // nothing written, and a reused buffer would otherwise report the previous
+    // batch's failures as this one's.
+    this._batchStatuses.fill(0, 0, count);
+
+    const callStatus = Number(
+      b.execMany(this._handle, this._batchAddrs, this._batchLengths, count, this._batchValues, this._batchStatuses)
+    );
+    this._lastStatus = callStatus;
+
+    if (callStatus !== STATUS.OK && !anyItemFailed(this._batchStatuses, count)) {
+      // No item failed, so the call itself was refused -- a bad argument or a
+      // re-entrant call. There is no per-item shape for that, and nothing was
+      // written, so the results stay undecoded rather than stale.
+      throw new OmniError(callStatus, this._error(b, callStatus));
+    }
+
+    // One egress rewind for the whole batch: every string is readable right
+    // now, and every one of them expires on the next execution. Copying them
+    // here is what turns borrowed memory into ordinary JavaScript.
+    const values = b.koffi.decode(this._batchValues, b.koffi.array(b.OmniValue, count));
+    return values.map((raw, index) => {
+      const status = this._batchStatuses[index];
+      const failed = status !== STATUS.OK;
+      return {
+        status,
+        statusName: statusName(status),
+        result: failed ? null : toResult(raw, this._copyStringAt(raw, index)),
+        message: failed ? this._itemError(b, index) : '',
+      };
+    });
+  }
+
+  /**
+   * Allocate the batch arrays for at least `count` sources.
+   *
+   * Sizes double from 8, so a host that grows its batches a little at a time
+   * reallocates logarithmically rather than once per call. `count` never
+   * exceeds `MAX_BATCH`, so neither can the capacity.
+   */
+  _growBatch(count) {
+    const b = this._b;
+    let capacity = 8;
+    while (capacity < count) capacity *= 2;
+    if (this._batchValues) b.koffi.free(this._batchValues);
+    this._batchAddrs = new BigUint64Array(capacity);
+    this._batchLengths = new BigUint64Array(capacity);
+    this._batchStatuses = new Uint32Array(capacity);
+    this._batchValues = b.koffi.alloc(b.OmniValue, capacity);
+    this._batchBase = BigInt(b.koffi.address(this._batchValues));
+    this._batchCapacity = capacity;
+  }
+
+  /**
+   * Copy a batch result out by index.
+   *
+   * `omni_str_copy` wants the address of the value struct, and a batch's structs
+   * are one array: this SDK allocated it, so its base plus `index` strides is
+   * element `index`. The stride comes from koffi's own layout of the struct,
+   * which `declare` has already checked against the ABI.
+   */
+  _copyStringAt(raw, index) {
+    if (raw.tag !== TAG.STRING) return EMPTY;
+    const needed = Number(raw.len);
+    if (needed === 0) return EMPTY;
+    const buf = Buffer.allocUnsafe(needed);
+    const written = Number(
+      this._b.strCopy(this._handle, this._batchBase + BigInt(index) * this._batchStride, buf, needed)
+    );
+    if (written === needed) return buf;
+    return Buffer.from(buf.subarray(0, written));
+  }
+
+  /** The engine's own message for item `index` of the batch just run. */
+  _itemError(b, index) {
+    const written = Number(b.batchError(this._handle, index, this._errorBuf, this._errorBuf.length));
+    return written > 0 ? this._errorBuf.subarray(0, written).toString('utf8') : '';
   }
 
   /**
@@ -398,7 +571,7 @@ class Engine {
     this._hostFns.clear();
     if (this._handle) b.engineFree(this._handle);
     this._handle = null;
-    for (const ptr of [this._valueOut, this._numberOut, this._statsOut]) {
+    for (const ptr of [this._valueOut, this._numberOut, this._statsOut, this._batchValues]) {
       if (ptr) {
         b.koffi.free(ptr);
       }
@@ -406,6 +579,12 @@ class Engine {
     this._valueOut = null;
     this._numberOut = null;
     this._statsOut = null;
+    this._batchAddrs = null;
+    this._batchLengths = null;
+    this._batchStatuses = null;
+    this._batchValues = null;
+    this._batchBase = 0n;
+    this._batchCapacity = 0;
   }
 
   /**
@@ -603,6 +782,19 @@ function encodeBytes(value, limit, label) {
   return bytes;
 }
 
+/**
+ * Did any of the first `count` batch items fail?
+ *
+ * Reads only the range this call owns, because the array behind it is reused
+ * and may still hold an earlier batch's statuses past `count`.
+ */
+function anyItemFailed(statuses, count) {
+  for (let index = 0; index < count; index++) {
+    if (statuses[index] !== STATUS.OK) return true;
+  }
+  return false;
+}
+
 module.exports = {
   Engine,
   OmniError,
@@ -629,6 +821,9 @@ module.exports = {
   },
   get MAX_CALL_DEPTH() {
     return bindingsModule.MAX_CALL_DEPTH;
+  },
+  get MAX_BATCH() {
+    return bindingsModule.MAX_BATCH;
   },
   get HOST_OK() {
     return bindingsModule.HOST_OK;

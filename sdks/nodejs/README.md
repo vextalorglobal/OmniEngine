@@ -161,6 +161,30 @@ The koffi handle and the encoded name are held for as long as the engine knows
 them, which is what `close()` releases. Register once at start-up; a callback
 re-registered per request pays the encode every time.
 
+## Batching: several programs, one crossing
+
+A loop of `run` pays the FFI crossing and the arena reclamation once per
+program; a batch pays both once:
+
+```js
+engine.runMany(['1 + 1', '"two"', "shout('hey')"]);
+// [ { tag: 'number', value: 2 }, { tag: 'string', value: 'two' },
+//   { tag: 'string', value: 'HEY!' } ]
+```
+
+Each item is an independent program — item *N* cannot read item *N−1*'s `let` —
+and every string result is copied out before the array is returned, so nothing
+in it expires. A failing item throws `OmniError` naming its index and its own
+message (`item 1 of 3: line 1: …`); the items after it still ran. For REPL-style
+callers, `tryRunMany` returns one `{ status, statusName, result, message }` per
+item instead of throwing — the per-item shape of `tryRun`.
+
+Measured usage guidance: a batch of one is strictly a loss (one extra array is
+still extra work), and the win saturates fast — the crossing itself costs ~36 ns
+through koffi while one wrapped `run` costs ~8.5 µs, so a batch can only
+amortise the smaller term. `node bench.js` prints the numbers for the machine
+you are on.
+
 ## What is guaranteed
 
 - The engine handle is a **BigInt**. Converting it with `Number()` would
@@ -186,6 +210,12 @@ re-registered per request pays the encode every time.
 - An exception thrown inside a host function becomes status `5` (`host`) with
   your message in the script's error, never an unwind through the Rust frames that
   called your callback.
+- A batch of N sources produces N results in order, each one a complete
+  `exec`'s worth of state; a failing item does not stop the batch, and the
+  reserved egress bytes are bounded by one batch's total demand, not one
+  item's. An empty batch is a no-op that expires nothing.
+- A batch longer than `MAX_BATCH` (4,096) is refused here, before the ABI
+  sees it, with the SDK's own message.
 - `close()` is idempotent, and the scratch memory koffi allocated is freed. Every
   registered trampoline is unregistered first, so a live JS closure is never left
   pointing at a dead engine.
@@ -206,7 +236,8 @@ arrive from a comparison.
 A host function takes at most 16 arguments (`MAX_ARGS`) and a program may nest
 calls 64 deep (`MAX_CALL_DEPTH`); both are checked by the engine and reported as
 errors rather than as a stack overflow. A returned string is capped by the same
-`MAX_STRING_LEN` the engine gives a program.
+`MAX_STRING_LEN` the engine gives a program. One batch crossing carries at most
+`MAX_BATCH` (4,096) sources.
 
 `text` is a fresh `Buffer` per string result, and that copy is the price of the
 rule above. Measure it with `engine.stats()` before optimising around it.
@@ -216,7 +247,8 @@ rule above. Measure it with `engine.stats()` before optimising around it.
 ```bash
 cd sdks/nodejs
 npm install koffi
-npm test                                   # 74 tests, node:test
+npm test                                   # 92 tests, node:test
+node bench.js                              # measured numbers for this machine
 ```
 
 They need `cargo build -p omni-ffi` — the build, not `cargo test`, because the
