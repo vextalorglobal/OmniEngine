@@ -56,6 +56,10 @@ checkout (`examples/c/embed.c`).
 cargo build -p omni-ffi
 cargo run -p omni-cli -- run examples/hello.omni    # -> 42
 cargo run -p omni-cli -- eval '"omni" + " " + "engine"'  # -> omni engine
+
+cargo install --path crates/omni-cli                # `omni` and `omniup` on PATH
+omni --version                                      # omni 0.1.0 (language v1, ABI 4)
+omni run examples/hello.omni                        # -> 42
 ```
 
 > The first `v0.1.0` release is built by

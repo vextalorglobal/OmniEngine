@@ -1214,6 +1214,17 @@ not by refusing to ship one.
 
 ### 6.4 The CLI
 
+The CLI installs globally from the checkout; both binaries land in `~/.cargo/bin`
+(already on `PATH` for anyone using cargo):
+
+```bash
+cargo install --path crates/omni-cli   # omni and omniup
+omni --version                         # omni 0.1.0 (language v1, ABI 4)
+omni run examples/hello.omni           # 42
+```
+
+Running it without installing works too:
+
 ```bash
 cargo run -p omni-cli -- run examples/hello.omni      # 42
 cargo run -p omni-cli -- run examples/strings.omni    # hello, world 😀
@@ -1222,6 +1233,9 @@ cargo run -p omni-cli -- --version                    # omni 0.1.0 (language v1,
 cargo run -p omni-cli -- check-update                 # 0, or 10 when newer exists
 cargo run -p omni-cli -- update --dry-run             # 10, downloads nothing
 ```
+
+`update` and `check-update` also answer to `--update` and `--check-update`, so a
+flag-style invocation from a script works without a subcommand.
 
 Exit codes separate the six things a script needs to tell apart:
 

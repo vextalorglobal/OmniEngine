@@ -17,7 +17,9 @@ USAGE:
     omni run <file.omni>     Run a program from a file
     omni eval <expression>   Evaluate one expression
     omni check-update        Report whether a newer omni exists
+                             (also --check-update)
     omni update              Download, verify, and install a newer omni
+                             (also --update)
     omni --version           Print the engine version
     omni --help              Show this message
 
