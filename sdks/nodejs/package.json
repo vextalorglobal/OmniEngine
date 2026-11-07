@@ -23,13 +23,19 @@
   "bugs": "https://github.com/fahim5536/OmniEngine/issues",
   "main": "index.js",
   "exports": {
-    ".": "./index.js",
+    ".": {
+      "require": "./index.js",
+      "default": "./index.js"
+    },
     "./bindings": "./lib/bindings.js",
-    "./discover": "./lib/discover.js"
+    "./discover": "./lib/discover.js",
+    "./package.json": "./package.json"
   },
   "files": [
     "index.js",
     "lib/",
+    "native/",
+    "scripts/postinstall.js",
     "README.md",
     "LICENSE"
   ],
@@ -38,6 +44,9 @@
   },
   "scripts": {
     "build:engine": "cargo build -p omni-ffi",
+    "postinstall": "node scripts/postinstall.js",
+    "prepack": "node scripts/prepack.js",
+    "pack:check": "node scripts/prepack.js --require-native",
     "test": "node --test tests/",
     "test:verbose": "node --test --test-reporter=spec tests/"
   },
@@ -45,5 +54,9 @@
     "koffi": "^3.3.6"
   },
   "dependencies": {},
-  "devDependencies": {}
+  "devDependencies": {},
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
 }

@@ -14,7 +14,7 @@ license = "MIT"
 license-files = ["LICENSE"]
 keywords = ["omni", "omniengine", "language", "interpreter", "ffi", "embed"]
 classifiers = [
-  "Development Status :: 2 - Pre-Alpha",
+  "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
   "Programming Language :: Rust",
   "Programming Language :: Python :: 3",
@@ -24,15 +24,21 @@ classifiers = [
 
 # Deliberately empty, and load-bearing: the whole point of this SDK is that
 # adding OmniEngine to a project cannot change that project's dependency tree.
+# A wheel does carry a native library, but it is data copied into the package,
+# not a Python dependency.
 dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/fahim5536/OmniEngine"
 Repository = "https://github.com/fahim5536/OmniEngine"
+Documentation = "https://github.com/fahim5536/OmniEngine/blob/main/docs/GUIDE.md"
+Changelog = "https://github.com/fahim5536/OmniEngine/releases"
 
 [tool.setuptools.packages.find]
 include = ["omni*"]
 
-# The engine itself is a native artifact built by cargo. It is not vendored
-# into the wheel here, so `pip install` never needs a Rust toolchain and never
-# silently ships a stale binary. Set OMNI_ENGINE_LIBRARY to point at one.
+# Where a release wheel puts the engine. setup.py's build_py stages the file
+# from a release build of the tagged commit; a checkout install falls back to
+# finding target/ at run time, and OMNI_ENGINE_LIBRARY overrides both.
+[tool.setuptools.package-data]
+omni = ["_native/*"]

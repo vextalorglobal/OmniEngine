@@ -1,0 +1,5 @@
+# The wheel build stages omni.dll / libomni.so / libomni.dylib here. The
+# artifact is never committed: it is built from the tagged commit by CI, or
+# copied in by setup.py when OMNI_NATIVE names one.
+*
+!.gitignore

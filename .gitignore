@@ -16,6 +16,12 @@ dist/
 # Node SDK — SDK deps are not vendored into the engine repo
 node_modules/
 
+# Native artifacts staged for a release package. CI fills these from the
+# tag build; they are never committed, so a tarball cannot carry a stale one.
+sdks/nodejs/native/
+# `npm pack` writes here when run inside the package; CI packs into dist/.
+/sdks/nodejs/*.tgz
+
 # Editors and OS noise
 .vscode/
 .idea/
