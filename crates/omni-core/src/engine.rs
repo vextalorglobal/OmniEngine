@@ -27,11 +27,12 @@
 //! [`crate::object`]; [`Engine::string_of`] is the safe door to it, and it is safe
 //! because taking `&self` means no `exec` can run while the bytes are borrowed.
 
+use std::borrow::Cow;
 use std::fmt;
 
 use crate::Value;
 use crate::arena::{Arena, Slot};
-use crate::lexer::{BinOp, LexError, Token, TokenKind, lex};
+use crate::lexer::{BinOp, LexError, Token, TokenKind, lex_into};
 use crate::object::{self, MAX_STRING_LEN, StrRef};
 
 /// Longest identifier the arena binding cell can hold inline. A bump allocator
@@ -187,6 +188,59 @@ struct Global {
     owned: Option<Box<[u8]>>,
 }
 
+/// A source buffer and the tokens lexed from it, borrowed together.
+///
+/// Not an AST — the parser still evaluates while descending, and there is still
+/// no node type. This pairs the two things every parse step needs so the token
+/// vector can be *owned by the engine* and refilled per execution. A token that
+/// borrowed the source would have made that vector self-referential, which is
+/// the whole reason [`Token`] carries offsets instead.
+struct Tokens<'a> {
+    source: &'a str,
+    tokens: &'a [Token],
+}
+
+impl<'a> Tokens<'a> {
+    /// Resolve one token's text against the source it was lexed from.
+    fn text(&self, token: Token) -> &'a str {
+        token.text(self.source)
+    }
+}
+
+/// The arguments of one call, held on the stack.
+///
+/// `MAX_ARGS + 1` slots so the argument that breaks the limit has somewhere to
+/// land before the overflow is reported — the same shape the allocating version
+/// had, minus one heap allocation per call site. [`MAX_CALL_DEPTH`] bounds how
+/// many of these can be live at once, which is what makes the stack cost a
+/// stated number rather than an open question.
+struct Args {
+    buf: [Value; MAX_ARGS + 1],
+    len: usize,
+}
+
+impl Args {
+    fn new() -> Args {
+        Args {
+            buf: [Value::UNDEF; MAX_ARGS + 1],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, value: Value) {
+        self.buf[self.len] = value;
+        self.len += 1;
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn as_slice(&self) -> &[Value] {
+        &self.buf[..self.len]
+    }
+}
+
 /// What a host callback gives back.
 ///
 /// Primitives only, never a [`Value`]. A `Value` is an address the *engine*
@@ -221,13 +275,40 @@ struct HostFunction {
     call: Box<HostCall>,
 }
 
+/// One result of [`Engine::exec_many`]: what the item produced, or why it did
+/// not.
+///
+/// A struct rather than a `Result` so the batch can be walked as data — the FFI
+/// writes one `OmniValue` and one status per item into caller-owned arrays, and
+/// an `Option<OmniError>` maps onto that without a second pass.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchItem {
+    /// The promoted value, or [`Value::UNDEF`] when the item failed. A string
+    /// here lives in the egress block and is readable until the next execution.
+    pub value: Value,
+    pub error: Option<OmniError>,
+}
+
+impl BatchItem {
+    pub fn is_ok(&self) -> bool {
+        self.error.is_none()
+    }
+
+    pub fn into_result(self) -> Result<Value, OmniError> {
+        match self.error {
+            Some(e) => Err(e),
+            None => Ok(self.value),
+        }
+    }
+}
+
 /// Counters a host reads to prove the memory story from outside Rust.
 ///
 /// Fixed-width and `Copy` because the FFI hands it across the boundary as a
 /// `#[repr(C)]` struct; the field order is the wire order and is pinned there.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Stats {
-    /// `exec` calls started, successful or not.
+    /// Executions started, successful or not: one per `exec`, one per batch item.
     pub execs: u64,
     /// String blocks built, cumulative. The one counter that is *supposed* to grow.
     pub strings_built: u64,
@@ -236,7 +317,8 @@ pub struct Stats {
     pub arena_chunks: u64,
     pub egress_bytes_in_use: u64,
     pub egress_bytes_reserved: u64,
-    /// The largest single execution's egress demand — the bound on a rewinding block.
+    /// The largest egress demand between two rewinds — one execution, or one
+    /// whole batch. This is the bound on a rewinding block.
     pub egress_high_water: u64,
 }
 
@@ -248,6 +330,17 @@ pub struct Stats {
 pub struct Engine {
     arena: Arena,
     egress: Arena,
+    /// The token buffer, refilled by every execution and never freed while the
+    /// engine lives. Its capacity is the high-water mark of the largest program
+    /// this engine has run, which is the same bounded-reuse story the egress
+    /// block tells: a warm engine lexes without touching the system allocator.
+    tokens: Vec<Token>,
+    /// Gathering space for one concatenation, reused like the token buffer.
+    /// `string_of` borrows the engine and `new_string` needs it mutably, so the
+    /// two slices have to be gathered somewhere before the arena is touched;
+    /// this is that somewhere, and keeping it means a warm engine concatenates
+    /// without asking the system allocator for a buffer per `+`.
+    scratch: Vec<u8>,
     /// Arena-resident `let` bindings for the current execution.
     bindings: Vec<Slot<Binding>>,
     /// Persistent host-injected bindings.
@@ -272,6 +365,8 @@ impl Engine {
         Engine {
             arena: Arena::new(),
             egress: Arena::new(),
+            tokens: Vec::new(),
+            scratch: Vec::new(),
             bindings: Vec::new(),
             globals: Vec::new(),
             host_fns: Vec::new(),
@@ -290,7 +385,8 @@ impl Engine {
     /// rather than frees. Everything else this function hands back is eight bytes
     /// with no memory behind it.
     pub fn exec(&mut self, source: &str) -> Result<Value, OmniError> {
-        self.begin_execution();
+        self.reclaim();
+        self.execs += 1;
         let result = self.run(source);
         match result {
             Ok(v) => {
@@ -306,20 +402,78 @@ impl Engine {
         }
     }
 
-    /// Begin a fresh execution.
+    /// Run several programs in one call, sharing one arena reclamation and one
+    /// egress rewind between them.
+    ///
+    /// The point is amortisation, not convenience: a host crossing the FFI once
+    /// per expression pays for the crossing and for the reset every time, and a
+    /// batch pays for both once. Each item still gets the arena back to where the
+    /// batch started, so item *N* cannot see item *N-1*'s `let` bindings — a batch
+    /// is a sequence of independent executions, not one long program.
+    ///
+    /// The egress block rewinds **once, before the first item**. Every string
+    /// result is promoted into it and stays readable until the next `exec` or
+    /// `exec_many`, so all *N* results can be copied out after the call returns.
+    /// That is the trade the batch makes: reserved egress bytes are bounded by
+    /// one batch's total demand rather than by one execution's.
+    ///
+    /// A failing item does not stop the batch. Every element of `sources` gets an
+    /// element in the result, in order, holding either a value or an error.
+    /// `last_value` and `last_error` end up exactly as if the final item had been
+    /// passed to [`Engine::exec`] alone.
+    ///
+    /// An empty slice is a no-op that reclaims nothing, so a host polling an empty
+    /// queue does not expire the results it is still holding.
+    pub fn exec_many(&mut self, sources: &[&str]) -> Vec<BatchItem> {
+        if sources.is_empty() {
+            return Vec::new();
+        }
+        self.reclaim();
+        let mark = self.arena.mark();
+        let mut items = Vec::with_capacity(sources.len());
+        for source in sources {
+            self.arena.reset_to(mark);
+            self.bindings.clear();
+            self.call_depth = 0;
+            self.execs += 1;
+            items.push(match self.run(source) {
+                Ok(v) => {
+                    let v = self.promote(v);
+                    self.last_value = v;
+                    self.last_error = None;
+                    BatchItem {
+                        value: v,
+                        error: None,
+                    }
+                }
+                Err(e) => {
+                    self.last_error = Some(e.clone());
+                    BatchItem {
+                        value: Value::UNDEF,
+                        error: Some(e),
+                    }
+                }
+            });
+        }
+        items
+    }
+
+    /// Give back everything the previous execution claimed.
     ///
     /// Clears the arena and the binding list together: that pairing is the
     /// invariant [`Slot`] relies on, so neither may happen without the other. The
     /// egress block rewinds rather than resets, because pointers into it are the
     /// ones a host is allowed to still be holding.
-    fn begin_execution(&mut self) {
+    ///
+    /// Shared by `exec` and `exec_many` so there is one place that decides what
+    /// survives a crossing and one place that can get it wrong.
+    fn reclaim(&mut self) {
         self.arena.reset();
         self.bindings.clear();
         self.egress.rewind();
         // An error mid-call returns through `?` and skips the decrement, so the
         // count is re-zeroed here rather than trusted to unwind cleanly.
         self.call_depth = 0;
-        self.execs += 1;
     }
 
     /// Copy an arena-resident string result into the egress block.
@@ -548,27 +702,42 @@ impl Engine {
         }
     }
 
+    /// Lex into the engine's own buffer, evaluate, and hand the buffer back.
+    ///
+    /// The take-and-restore is what lets a `Vec` owned by `self` be parsed by
+    /// methods that need `&mut self`: the buffer is a local for the duration of
+    /// the evaluation, so no borrow of `self` overlaps it. It goes back on the
+    /// error path too — a bad program must not cost the next good one a
+    /// reallocation.
     fn run(&mut self, source: &str) -> Result<Value, OmniError> {
-        let tokens = lex(source)?;
+        let mut tokens = std::mem::take(&mut self.tokens);
+        let result = self.run_tokens(source, &mut tokens);
+        self.tokens = tokens;
+        result
+    }
+
+    fn run_tokens(&mut self, source: &str, tokens: &mut Vec<Token>) -> Result<Value, OmniError> {
+        lex_into(source, tokens)?;
+        let t = Tokens { source, tokens };
         let mut index = 0usize;
         let mut last = Value::UNDEF;
         loop {
             // Statement separators are optional and non-significant.
-            while self.peek_kind(&tokens, index) == Some(TokenKind::Semi) {
+            while self.peek_kind(&t, index) == Some(TokenKind::Semi) {
                 self.advance(&mut index);
             }
-            match self.peek_kind(&tokens, index) {
+            match self.peek_kind(&t, index) {
                 None | Some(TokenKind::Eof) => break,
                 Some(TokenKind::Let) => {
                     self.advance(&mut index);
-                    let line = self.peek_line(&tokens, index);
-                    let name = self.expect_ident(&tokens, &mut index)?;
-                    self.expect(&tokens, &mut index, TokenKind::Eq)?;
-                    let value = self.parse_expr(&tokens, &mut index)?;
+                    let line = self.peek_line(&t, index);
+                    let name = self.expect_ident(&t, &mut index)?;
+                    self.expect(&t, &mut index, TokenKind::Eq)?;
+                    let value = self.parse_expr(&t, &mut index)?;
                     self.bind(name, value, line)?;
                     last = value;
                 }
-                _ => last = self.parse_expr(&tokens, &mut index)?,
+                _ => last = self.parse_expr(&t, &mut index)?,
             }
         }
         Ok(last)
@@ -613,7 +782,7 @@ impl Engine {
     /// Comparison sits one level below `+`, so `"a" + "b" == "ab"` parses as
     /// `("a" + "b") == "ab"` and not as the nonsense the old two-level grammar
     /// would have made of it.
-    fn parse_expr(&mut self, t: &[Token<'_>], i: &mut usize) -> Result<Value, OmniError> {
+    fn parse_expr(&mut self, t: &Tokens<'_>, i: &mut usize) -> Result<Value, OmniError> {
         let mut acc = self.parse_additive(t, i)?;
         loop {
             let want_equal = match self.peek_kind(t, *i) {
@@ -629,7 +798,7 @@ impl Engine {
         Ok(acc)
     }
 
-    fn parse_additive(&mut self, t: &[Token<'_>], i: &mut usize) -> Result<Value, OmniError> {
+    fn parse_additive(&mut self, t: &Tokens<'_>, i: &mut usize) -> Result<Value, OmniError> {
         let mut acc = self.parse_term(t, i)?;
         loop {
             let op = match self.peek_kind(t, *i) {
@@ -645,7 +814,7 @@ impl Engine {
         Ok(acc)
     }
 
-    fn parse_term(&mut self, t: &[Token<'_>], i: &mut usize) -> Result<Value, OmniError> {
+    fn parse_term(&mut self, t: &Tokens<'_>, i: &mut usize) -> Result<Value, OmniError> {
         let mut acc = self.parse_factor(t, i)?;
         loop {
             let op = match self.peek_kind(t, *i) {
@@ -662,7 +831,7 @@ impl Engine {
         Ok(acc)
     }
 
-    fn parse_factor(&mut self, t: &[Token<'_>], i: &mut usize) -> Result<Value, OmniError> {
+    fn parse_factor(&mut self, t: &Tokens<'_>, i: &mut usize) -> Result<Value, OmniError> {
         let mut negate = false;
         loop {
             match self.peek_kind(t, *i) {
@@ -694,7 +863,7 @@ impl Engine {
         Ok(value)
     }
 
-    fn parse_primary(&mut self, t: &[Token<'_>], i: &mut usize) -> Result<Value, OmniError> {
+    fn parse_primary(&mut self, t: &Tokens<'_>, i: &mut usize) -> Result<Value, OmniError> {
         let token = self.peek(t, *i).ok_or_else(|| {
             OmniError::new(
                 ErrorKind::Parse,
@@ -705,24 +874,27 @@ impl Engine {
         match token.kind {
             TokenKind::Number => {
                 self.advance(i);
-                token.text.parse::<f64>().map(Value::from_f64).map_err(|_| {
-                    OmniError::new(
-                        ErrorKind::Parse,
-                        token.line,
-                        format!("'{}' is not a valid number", token.text),
-                    )
-                })
+                t.text(token)
+                    .parse::<f64>()
+                    .map(Value::from_f64)
+                    .map_err(|_| {
+                        OmniError::new(
+                            ErrorKind::Parse,
+                            token.line,
+                            format!("'{}' is not a valid number", t.text(token)),
+                        )
+                    })
             }
             TokenKind::Str => {
                 self.advance(i);
                 // Decoding happens here, not in the lexer, so a token stays a
-                // borrowed slice and lexing allocates nothing. The line number
+                // pair of offsets and lexing allocates nothing. The line number
                 // survives the deferral because the token carries it.
-                let bytes = decode_literal(token.text, token.line)?;
+                let bytes = decode_literal(t.text(token), token.line)?;
                 self.new_string(&bytes, token.line, ErrorKind::Runtime)
             }
             TokenKind::Ident => {
-                let name = token.text;
+                let name = t.text(token);
                 self.advance(i);
                 // A name followed by '(' is a call and nothing else; the same name
                 // on its own is still a global or binding lookup. Position is the
@@ -762,7 +934,7 @@ impl Engine {
     /// the recursion spends is the thing being limited.
     fn parse_call(
         &mut self,
-        t: &[Token<'_>],
+        t: &Tokens<'_>,
         i: &mut usize,
         name: &str,
         line: u32,
@@ -790,7 +962,7 @@ impl Engine {
         self.advance(i); // the '(' that made this a call
 
         self.call_depth += 1;
-        let outcome = self.read_args(t, i, name, arity);
+        let outcome = self.read_args(t, i, name);
         self.call_depth -= 1;
         let args = outcome?;
         if args.len() != arity {
@@ -804,7 +976,7 @@ impl Engine {
                 ),
             ));
         }
-        self.invoke_host(index, name, &args, line)
+        self.invoke_host(index, name, args.as_slice(), line)
     }
 
     /// Read `arg, arg, …` up to and including the closing paren.
@@ -812,14 +984,12 @@ impl Engine {
     /// Split out of [`Engine::parse_call`] so the depth counter has exactly one
     /// increment and one decrement between them, with a `Result` in the middle —
     /// the shape that makes an early `?` unable to strand the count.
-    fn read_args(
-        &mut self,
-        t: &[Token<'_>],
-        i: &mut usize,
-        name: &str,
-        arity: usize,
-    ) -> Result<Vec<Value>, OmniError> {
-        let mut args = Vec::with_capacity(arity);
+    ///
+    /// The arity is not a parameter: the buffer is sized by [`MAX_ARGS`] alone,
+    /// so a call costs the same stack whether the host takes one argument or
+    /// sixteen, and nothing is allocated to find out which.
+    fn read_args(&mut self, t: &Tokens<'_>, i: &mut usize, name: &str) -> Result<Args, OmniError> {
+        let mut args = Args::new();
         if self.peek_kind(t, *i) != Some(TokenKind::RParen) {
             loop {
                 // The last argument's expression is where an error most often
@@ -943,11 +1113,27 @@ impl Engine {
     /// `string + string`, newly allocated in the execution arena.
     ///
     /// A copy, not a rope: the cost of `let s = s + "x"` in a loop is quadratic
-    /// and that is a known property rather than a surprise. The bytes are gathered
-    /// into an owned buffer first so the arena borrow and the arena allocation do
-    /// not have to overlap.
+    /// and that is a known property rather than a surprise. The bytes are
+    /// gathered into the engine's scratch buffer first, because `string_of`
+    /// borrows the engine and `new_string` needs it mutably. The buffer goes back
+    /// afterwards with its capacity intact, so the next `+` reuses it instead of
+    /// asking the system allocator for one per concatenation.
     fn concat(&mut self, lhs: Value, rhs: Value, line: u32) -> Result<Value, OmniError> {
-        let joined = {
+        let mut buf = std::mem::take(&mut self.scratch);
+        let result = self.concat_into(lhs, rhs, line, &mut buf);
+        self.scratch = buf;
+        result
+    }
+
+    fn concat_into(
+        &mut self,
+        lhs: Value,
+        rhs: Value,
+        line: u32,
+        buf: &mut Vec<u8>,
+    ) -> Result<Value, OmniError> {
+        // Scoped so both shared borrows end before the arena is claimed.
+        {
             let Some(a) = self.string_of(lhs) else {
                 return Err(unreadable_string(line, lhs));
             };
@@ -965,12 +1151,12 @@ impl Engine {
                     ),
                 ));
             }
-            let mut buf = Vec::with_capacity(total);
+            buf.clear();
+            buf.reserve(total);
             buf.extend_from_slice(a);
             buf.extend_from_slice(b);
-            buf
-        };
-        self.new_string(&joined, line, ErrorKind::Runtime)
+        }
+        self.new_string(buf, line, ErrorKind::Runtime)
     }
 
     fn numeric(&self, lhs: Value, op: BinOp, rhs: Value, line: u32) -> Result<Value, OmniError> {
@@ -1011,30 +1197,30 @@ impl Engine {
 
     // -- token cursor helpers -------------------------------------------------
 
-    fn peek<'t>(&self, t: &[Token<'t>], i: usize) -> Option<Token<'t>> {
-        // Token is Copy, so the cursor hands back a value rather than a borrow
-        // whose slice lifetime is entangled with the source lifetime.
-        t.get(i).copied()
+    fn peek(&self, t: &Tokens<'_>, i: usize) -> Option<Token> {
+        // Token is Copy and carries no lifetime, so the cursor hands back a
+        // value: sixteen bytes the caller may keep past the next peek.
+        t.tokens.get(i).copied()
     }
 
-    fn peek_kind(&self, t: &[Token<'_>], i: usize) -> Option<TokenKind> {
-        t.get(i).map(|tok| tok.kind)
+    fn peek_kind(&self, t: &Tokens<'_>, i: usize) -> Option<TokenKind> {
+        t.tokens.get(i).map(|tok| tok.kind)
     }
 
-    fn peek_line(&self, t: &[Token<'_>], i: usize) -> u32 {
-        t.get(i).map_or(0, |tok| tok.line)
+    fn peek_line(&self, t: &Tokens<'_>, i: usize) -> u32 {
+        t.tokens.get(i).map_or(0, |tok| tok.line)
     }
 
-    fn last_line(&self, t: &[Token<'_>]) -> u32 {
-        t.last().map_or(1, |tok| tok.line)
+    fn last_line(&self, t: &Tokens<'_>) -> u32 {
+        t.tokens.last().map_or(1, |tok| tok.line)
     }
 
     fn advance(&self, i: &mut usize) {
         *i += 1;
     }
 
-    fn expect(&self, t: &[Token<'_>], i: &mut usize, want: TokenKind) -> Result<(), OmniError> {
-        match t.get(*i) {
+    fn expect(&self, t: &Tokens<'_>, i: &mut usize, want: TokenKind) -> Result<(), OmniError> {
+        match t.tokens.get(*i) {
             Some(tok) if tok.kind == want => {
                 self.advance(i);
                 Ok(())
@@ -1048,10 +1234,10 @@ impl Engine {
         }
     }
 
-    fn expect_ident<'s>(&self, t: &[Token<'s>], i: &mut usize) -> Result<&'s str, OmniError> {
-        match t.get(*i) {
+    fn expect_ident<'s>(&self, t: &Tokens<'s>, i: &mut usize) -> Result<&'s str, OmniError> {
+        match t.tokens.get(*i) {
             Some(tok) if tok.kind == TokenKind::Ident => {
-                let text = tok.text;
+                let text = t.text(*tok);
                 self.advance(i);
                 Ok(text)
             }
@@ -1070,7 +1256,7 @@ impl Engine {
 
     fn parse_error_kind(
         &self,
-        t: &[Token<'_>],
+        t: &Tokens<'_>,
         i: usize,
         kind: TokenKind,
         context: &str,
@@ -1132,8 +1318,14 @@ fn unreadable_string(line: u32, value: Value) -> OmniError {
 /// surrogate and anything above `0x10FFFF` as out of range. There is no
 /// surrogate-pair joining, because these strings are UTF-8 and a code-unit escape
 /// would be a second encoding rule nobody asked for — write `"😀"` or `"\u{1F600}"`.
-fn decode_literal(raw: &str, line: u32) -> Result<Vec<u8>, OmniError> {
+fn decode_literal(raw: &str, line: u32) -> Result<Cow<'_, [u8]>, OmniError> {
     let bytes = raw.as_bytes();
+    // Most literals contain no escape at all, and for those the decoded value
+    // *is* the source text. Borrowing it skips both the allocation and the copy
+    // into it; the arena copy in `new_string` is then the only one performed.
+    if !bytes.contains(&b'\\') {
+        return Ok(Cow::Borrowed(bytes));
+    }
     let mut out = Vec::with_capacity(bytes.len());
     let mut pos = 0usize;
     while pos < bytes.len() {
@@ -1180,7 +1372,7 @@ fn decode_literal(raw: &str, line: u32) -> Result<Vec<u8>, OmniError> {
         }
         pos += 2;
     }
-    Ok(out)
+    Ok(Cow::Owned(out))
 }
 
 /// Parse `\u{...}` starting at the byte after `u`.
@@ -1895,6 +2087,246 @@ mod tests {
             after - before
         );
         assert_eq!(e.stats().execs, 100_200);
+    }
+
+    /// The stronger half of the same claim: not merely "nothing left behind"
+    /// but "nothing asked for". A warm engine refills its token buffer, keeps its
+    /// binding vector's capacity, and bumps the arena, so a numeric execution
+    /// must not reach the system allocator at all. `live()` cannot show this —
+    /// a buffer allocated and freed every time nets to zero — so the counter
+    /// here is allocation *requests*.
+    #[test]
+    fn a_warm_numeric_execution_makes_no_heap_allocation() {
+        let mut e = Engine::new();
+        let src = "let answer = 40 + 2; answer * 1";
+        for _ in 0..64 {
+            e.exec(src).unwrap();
+        }
+        let before = crate::counted::calls();
+        for _ in 0..1000 {
+            assert_eq!(e.exec(src).unwrap(), num(42.0));
+        }
+        assert_eq!(
+            crate::counted::calls(),
+            before,
+            "a warm numeric exec still asked the system allocator for memory"
+        );
+    }
+
+    /// A literal with no escape decodes to the source text itself, so building
+    /// it and promoting the result touch only the arena and the egress block.
+    /// The borrow is the whole reason `decode_literal` returns a `Cow`.
+    #[test]
+    fn a_warm_escape_free_literal_makes_no_heap_allocation() {
+        let mut e = Engine::new();
+        for _ in 0..64 {
+            e.exec(r#""hello, world""#).unwrap();
+        }
+        let before = crate::counted::calls();
+        for _ in 0..1000 {
+            e.exec(r#""hello, world""#).unwrap();
+        }
+        assert_eq!(crate::counted::calls(), before);
+    }
+
+    /// Concatenation gathers into the engine's scratch buffer, so once that
+    /// buffer is wide enough for the program's longest `+`, a warm execution
+    /// allocates nothing here either. Three literals and two joins is the shape
+    /// the cross-host verification rows use.
+    #[test]
+    fn a_warm_concatenation_makes_no_heap_allocation() {
+        let mut e = Engine::new();
+        let src = r#""hello, " + "world" + "!""#;
+        for _ in 0..64 {
+            e.exec(src).unwrap();
+        }
+        let before = crate::counted::calls();
+        for _ in 0..1000 {
+            e.exec(src).unwrap();
+        }
+        assert_eq!(crate::counted::calls(), before);
+        assert_eq!(text_of(&mut e, src), "hello, world!");
+    }
+
+    // -- batch execution ------------------------------------------------------
+
+    #[test]
+    fn a_batch_returns_one_item_per_source_in_order() {
+        let mut e = Engine::new();
+        let items = e.exec_many(&["1 + 1", "let x = 6; x * 7", "\"ok\""]);
+        assert_eq!(items.len(), 3);
+        assert!(items.iter().all(BatchItem::is_ok));
+        assert_eq!(items[0].value.as_f64(), Some(2.0));
+        assert_eq!(items[1].value.as_f64(), Some(42.0));
+        assert_eq!(e.render(items[2].value), "ok");
+    }
+
+    /// A batch is a sequence of independent executions, not one long program.
+    /// Without the per-item `reset_to` and binding clear, item 1 would read item
+    /// 0's `x` out of a chunk that has since been handed back.
+    #[test]
+    fn an_item_cannot_see_the_previous_items_bindings() {
+        let mut e = Engine::new();
+        let items = e.exec_many(&["let secret = 1; secret", "secret"]);
+        assert_eq!(items[0].value.as_f64(), Some(1.0));
+        let err = items[1]
+            .error
+            .as_ref()
+            .expect("the binding did not survive");
+        assert_eq!(err.kind, ErrorKind::Runtime);
+        assert!(err.message.contains("secret"), "message was {err}");
+        assert_eq!(items[1].value, Value::UNDEF);
+    }
+
+    #[test]
+    fn a_host_global_still_survives_every_item() {
+        let mut e = Engine::new();
+        e.define("answer", num(42.0));
+        let items = e.exec_many(&["answer", "answer + 1", "answer"]);
+        assert_eq!(
+            items.iter().map(|i| i.value.as_f64()).collect::<Vec<_>>(),
+            vec![Some(42.0), Some(43.0), Some(42.0)]
+        );
+    }
+
+    /// The reason the egress block rewinds once per batch rather than once per
+    /// item: a host that gets three string results back has to be able to read
+    /// all three. Rewinding per item would leave the first two stale.
+    #[test]
+    fn every_string_result_of_a_batch_stays_readable_after_it_returns() {
+        let mut e = Engine::new();
+        let items = e.exec_many(&[r#""a" + "1""#, r#""b" + "2""#, r#""c" + "3""#]);
+        let text: Vec<String> = items.iter().map(|i| e.render(i.value)).collect();
+        assert_eq!(text, vec!["a1", "b2", "c3"]);
+        for item in &items {
+            let addr = item.value.as_ptr().unwrap() as usize;
+            assert!(e.egress().owns(addr), "promoted into the rewinding block");
+            assert!(StrRef::checked(item.value, e.arena()).is_none());
+        }
+        assert!(
+            e.egress().bytes_in_use() > 0,
+            "three results are live at once, not one"
+        );
+    }
+
+    #[test]
+    fn a_failing_item_does_not_stop_the_batch() {
+        let mut e = Engine::new();
+        let items = e.exec_many(&["1 +", "2 + 3", "?", "\"still runs\""]);
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0].error.as_ref().unwrap().kind, ErrorKind::Parse);
+        assert_eq!(items[1].value.as_f64(), Some(5.0));
+        assert_eq!(items[2].error.as_ref().unwrap().kind, ErrorKind::Lex);
+        assert!(items[3].is_ok());
+        assert_eq!(e.render(items[3].value), "still runs");
+    }
+
+    /// A host failure propagates through `?` and skips the depth decrement, so
+    /// the count is re-zeroed per item. A hundred failures must not leave the
+    /// next good call one step from the ceiling.
+    #[test]
+    fn call_depth_does_not_leak_from_a_failing_item_into_the_next() {
+        let mut e = Engine::new();
+        e.register_host_fn("boom", 0, |_engine, _args| {
+            HostOutcome::Failure(b"no".to_vec())
+        })
+        .unwrap();
+        add_square(&mut e);
+        let mut sources: Vec<&str> = (0..MAX_CALL_DEPTH * 2).map(|_| "boom()").collect();
+        sources.push("square(6)");
+        let items = e.exec_many(&sources);
+        assert!(
+            items[..items.len() - 1]
+                .iter()
+                .all(|i| { i.error.as_ref().map(|e| e.kind) == Some(ErrorKind::Host) })
+        );
+        let last = items.last().unwrap();
+        assert!(last.is_ok(), "depth leaked: {:?}", last.error);
+        assert_eq!(last.value.as_f64(), Some(36.0));
+    }
+
+    #[test]
+    fn an_empty_batch_is_a_no_op_that_expires_nothing() {
+        let mut e = Engine::new();
+        let held = e.exec("\"keep me\"").unwrap();
+        let execs = e.stats().execs;
+        assert!(e.exec_many(&[]).is_empty());
+        assert_eq!(e.stats().execs, execs, "no execution was started");
+        assert_eq!(
+            e.string_of(held).map(|b| b.to_vec()),
+            Some(b"keep me".to_vec()),
+            "an empty queue must not rewind the block a host is still reading"
+        );
+    }
+
+    #[test]
+    fn a_batch_counts_one_execution_per_item() {
+        let mut e = Engine::new();
+        e.exec("1").unwrap();
+        assert_eq!(e.exec_many(&["2", "3", "?"]).len(), 3);
+        assert_eq!(
+            e.stats().execs,
+            4,
+            "one exec plus three items, failures included"
+        );
+    }
+
+    #[test]
+    fn a_batch_leaves_the_last_item_state_behind() {
+        let mut e = Engine::new();
+        e.exec_many(&["7", "?"]);
+        assert_eq!(e.last_value().as_f64(), Some(7.0));
+        assert_eq!(e.last_error().unwrap().kind, ErrorKind::Lex);
+        e.exec_many(&["?", "9"]);
+        assert_eq!(e.last_value().as_f64(), Some(9.0));
+        assert!(e.last_error().is_none(), "a later success clears the error");
+    }
+
+    /// The amortisation claim, made checkable. The result vector is the batch's
+    /// one unavoidable heap request — the FFI writes into caller-owned arrays
+    /// instead and pays even that zero. Everything else is warm reuse.
+    #[test]
+    fn a_warm_batch_allocates_only_the_vector_it_hands_back() {
+        let mut e = Engine::new();
+        let sources = ["let answer = 40 + 2; answer", r#""hello, " + "world""#];
+        for _ in 0..64 {
+            e.exec_many(&sources);
+        }
+        let before = crate::counted::calls();
+        for _ in 0..1000 {
+            let items = e.exec_many(&sources);
+            assert_eq!(items.len(), 2);
+        }
+        assert_eq!(
+            crate::counted::calls() - before,
+            1000,
+            "one allocation per batch, and it is the result vector"
+        );
+    }
+
+    /// Bounded reuse at batch scale: the same batch run ten thousand times must
+    /// reserve the same bytes, because the egress block rewinds once and reuses
+    /// what the first batch mapped.
+    #[test]
+    fn repeated_batches_reserve_a_flat_amount_of_memory() {
+        let mut e = Engine::new();
+        let sources = ["let x = 1; x", r#""a" + "b" + "c""#, "square(3)"];
+        add_square(&mut e);
+        e.exec_many(&sources);
+        let reserved = e.stats().egress_bytes_reserved;
+        let high_water = e.stats().egress_high_water;
+        let live_before = crate::counted::live();
+        for round in 0..10_000 {
+            let items = e.exec_many(&sources);
+            assert!(items.iter().all(BatchItem::is_ok), "round {round}");
+            assert_eq!(
+                e.stats().egress_bytes_reserved,
+                reserved,
+                "round {round}: the block grew instead of being reused"
+            );
+        }
+        assert_eq!(e.stats().egress_high_water, high_water);
+        assert_eq!(crate::counted::live(), live_before, "the loop leaked");
     }
 
     fn text_of(e: &mut Engine, src: &str) -> String {

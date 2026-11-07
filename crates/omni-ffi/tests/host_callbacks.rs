@@ -1,6 +1,7 @@
-//! Phase 3: host callbacks through the C ABI.
+//! Phase 3: host callbacks through the C ABI, and the batch entry point's share
+//! of the same guard.
 //!
-//! These tests are what the header's caller rules 8, 9, and 10 mean in code.
+//! These tests are what the header's caller rules 8, 9, 10, and 11 mean in code.
 //! They exercise the boundary as an external C host would: raw pointers, a
 //! function registered by address, no Rust-side ownership.
 
@@ -12,6 +13,9 @@ use omni::*;
 
 static LAST_ARGC: AtomicU32 = AtomicU32::new(u32::MAX);
 static LAST_STATUS: AtomicU32 = AtomicU32::new(0);
+/// What `omni_batch_error` returned from inside a callback. A `usize` widened to
+/// u32 is enough: the answer under test is 0.
+static BATCH_ERROR_LEN: AtomicU32 = AtomicU32::new(u32::MAX);
 
 /// Read one string argument the way the header says to read it: a borrowed view
 /// of `len` bytes, copied immediately, with `omni_str_copy` forbidden.
@@ -99,6 +103,55 @@ unsafe extern "C" fn try_reentrant(
             tag: OMNI_NUMBER,
             len: 0,
             payload: OmniPayload { number: 0.0 },
+        };
+    }
+    OMNI_HOST_OK
+}
+
+/// The batch entry point tried from inside a callback, plus the per-item error
+/// reader. Both must refuse: the batch on record mid-execution is the *previous*
+/// one, and answering from it would describe a call this callback is not inside.
+unsafe extern "C" fn try_batch_from_callback(
+    user_data: *mut c_void,
+    _args: *const OmniValue,
+    _argc: u32,
+    out: *mut OmniValue,
+) -> i32 {
+    let engine = user_data as *mut OmniEngine;
+    let source = "1 + 1";
+    let sources = [source.as_ptr().cast::<std::ffi::c_char>()];
+    let lengths = [source.len()];
+    let mut value = OmniValue::default();
+    let mut status = u32::MAX;
+    let code = unsafe {
+        omni_exec_many(
+            engine,
+            sources.as_ptr(),
+            lengths.as_ptr(),
+            1,
+            &mut value,
+            &mut status,
+        )
+    };
+    LAST_STATUS.store(code, Ordering::SeqCst);
+    // A refused batch must not have touched either output array.
+    assert_eq!(status, u32::MAX, "a refused batch wrote a status");
+    assert_eq!(value.tag, OMNI_UNDEF, "a refused batch wrote a value");
+    let mut buf = [0u8; 64];
+    let n = unsafe {
+        omni_batch_error(
+            engine,
+            0,
+            buf.as_mut_ptr().cast::<std::ffi::c_char>(),
+            buf.len(),
+        )
+    };
+    BATCH_ERROR_LEN.store(n as u32, Ordering::SeqCst);
+    unsafe {
+        *out = OmniValue {
+            tag: OMNI_NUMBER,
+            len: 0,
+            payload: OmniPayload { number: 7.0 },
         };
     }
     OMNI_HOST_OK
@@ -293,6 +346,110 @@ fn reentry_from_a_callback_is_a_status_not_aliasing() {
             "omni_exec from inside a callback returns REENTRANT"
         );
         assert_eq!(LAST_ARGC.load(Ordering::SeqCst), 0);
+
+        omni_unregister_host_fn(engine, name.as_ptr() as *const std::ffi::c_char, name.len());
+        omni_engine_free(engine);
+    }
+}
+
+/// The same guard, reached from a batch item rather than a single call. This is
+/// the case Phase 4 adds: `exec_many` holds the mutable borrow for the whole
+/// batch, so an item's callback must not be able to start a second one.
+#[test]
+fn a_batch_entry_point_is_refused_from_inside_a_callback() {
+    let engine = omni_engine_new();
+    let name = b"try_batch_from_callback";
+    unsafe {
+        assert_eq!(
+            omni_register_host_fn(
+                engine,
+                name.as_ptr() as *const std::ffi::c_char,
+                name.len(),
+                0,
+                Some(try_batch_from_callback),
+                engine as *mut c_void,
+            ),
+            OMNI_OK
+        );
+
+        // A previous batch with a failing item, so there IS a message on record
+        // for index 0 of an earlier batch -- the wrong one to hand a callback.
+        let bad = "1 +";
+        let sources = [bad.as_ptr().cast::<std::ffi::c_char>()];
+        let lengths = [bad.len()];
+        let mut value = OmniValue::default();
+        let mut status = 0;
+        assert_eq!(
+            omni_exec_many(
+                engine,
+                sources.as_ptr(),
+                lengths.as_ptr(),
+                1,
+                &mut value,
+                &mut status
+            ),
+            OMNI_ERR_COMPILE
+        );
+
+        let source = "try_batch_from_callback()";
+        let mut out = [OmniValue::default(); 2];
+        let mut statuses = [u32::MAX; 2];
+        LAST_STATUS.store(0, Ordering::SeqCst);
+        BATCH_ERROR_LEN.store(u32::MAX, Ordering::SeqCst);
+        // Two items, so the guard is proven to hold for the second one too: a
+        // per-item borrow that was released early would let item 1 re-enter.
+        let items = [source, source];
+        let item_ptrs: Vec<*const std::ffi::c_char> =
+            items.iter().map(|s| s.as_ptr().cast()).collect();
+        let item_lens = [source.len(), source.len()];
+        assert_eq!(
+            omni_exec_many(
+                engine,
+                item_ptrs.as_ptr(),
+                item_lens.as_ptr(),
+                2,
+                out.as_mut_ptr(),
+                statuses.as_mut_ptr()
+            ),
+            OMNI_OK
+        );
+        assert_eq!(statuses, [OMNI_OK, OMNI_OK]);
+        assert_eq!(out[0].number(), Some(7.0));
+        assert_eq!(out[1].number(), Some(7.0));
+        assert_eq!(
+            LAST_STATUS.load(Ordering::SeqCst),
+            OMNI_ERR_REENTRANT,
+            "omni_exec_many from inside a callback returns REENTRANT"
+        );
+        assert_eq!(
+            BATCH_ERROR_LEN.load(Ordering::SeqCst),
+            0,
+            "omni_batch_error answers 0 rather than the previous batch's message"
+        );
+
+        // The batch that just ran is now the one on record, and it succeeded, so
+        // index 0 has no message either way -- ask about a failing batch instead.
+        assert_eq!(
+            omni_exec_many(
+                engine,
+                sources.as_ptr(),
+                lengths.as_ptr(),
+                1,
+                &mut value,
+                &mut status
+            ),
+            OMNI_ERR_COMPILE
+        );
+        let mut buf = [0u8; 64];
+        assert!(
+            omni_batch_error(
+                engine,
+                0,
+                buf.as_mut_ptr().cast::<std::ffi::c_char>(),
+                buf.len()
+            ) > 0,
+            "the reader still works from the ordinary path"
+        );
 
         omni_unregister_host_fn(engine, name.as_ptr() as *const std::ffi::c_char, name.len());
         omni_engine_free(engine);

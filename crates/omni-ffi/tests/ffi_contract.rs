@@ -281,8 +281,8 @@ fn copy_out(engine: *const OmniEngine, value: &OmniValue) -> Vec<u8> {
 }
 
 #[test]
-fn the_abi_reports_three_and_the_header_agrees() {
-    assert_eq!(omni_abi_version(), 3);
+fn the_abi_reports_four_and_the_header_agrees() {
+    assert_eq!(omni_abi_version(), 4);
     assert_eq!(omni_abi_version(), OMNI_ABI_VERSION);
 }
 

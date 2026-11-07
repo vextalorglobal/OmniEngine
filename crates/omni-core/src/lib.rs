@@ -32,12 +32,12 @@ pub mod counted;
 #[global_allocator]
 static COUNTED: counted::Counting = counted::Counting;
 
-pub use arena::Arena;
+pub use arena::{Arena, Mark};
 pub use engine::{
-    Engine, ErrorKind, HostCall, HostError, HostOutcome, MAX_ARGS, MAX_CALL_DEPTH,
+    BatchItem, Engine, ErrorKind, HostCall, HostError, HostOutcome, MAX_ARGS, MAX_CALL_DEPTH,
     MAX_IDENTIFIER_LEN, OmniError, Stats,
 };
-pub use lexer::{BinOp, LexError, Token, TokenKind, lex};
+pub use lexer::{BinOp, LexError, MAX_SOURCE_LEN, Token, TokenKind, lex, lex_into};
 pub use object::{MAX_STRING_LEN, StrRef};
 pub use value::Value;
 

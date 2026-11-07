@@ -1,11 +1,27 @@
-//! The lexer: `&str` in, borrowed token slices out.
+//! The lexer: `&str` in, offset tokens out.
 //!
-//! Token text is a `&'a str` slice of the caller's source buffer rather than an
-//! owned `String`, so lexing a program allocates for the token vector and for
-//! nothing else. That is a deliberate consequence of the memory model: the
-//! source outlives the tokens produced from it inside a single `Engine::exec`.
+//! A token records *where* its text is in the caller's buffer rather than
+//! holding a slice of it. Two things follow, and both are load-bearing.
+//!
+//! Lexing allocates for the token vector and nothing else — no `String` per
+//! identifier, no copy per literal. And because a token no longer borrows the
+//! source, the vector has no lifetime: [`crate::Engine`] keeps one and refills
+//! it on every execution, so a warm engine lexes without asking the system
+//! allocator for anything.
+//!
+//! [`Token::text`] resolves an offset against the source it came from. The
+//! source outlives the tokens inside a single evaluation, which is the same
+//! rule the borrowed-slice version relied on, now stated once instead of being
+//! carried in every signature.
 
 use std::fmt;
+
+/// Longest program the lexer accepts, and the reason a token's offsets are
+/// `u32` rather than `usize`: 256 MiB of source is far past any program a host
+/// sends, and it keeps a token at sixteen bytes instead of thirty-two. The C
+/// ABI states the same number, so a host is refused at the boundary before the
+/// core is asked.
+pub const MAX_SOURCE_LEN: usize = 1 << 28;
 
 /// Binary operators, already folded into one variant so the parser can test
 /// precedence without matching four separate token kinds.
@@ -37,11 +53,12 @@ pub enum TokenKind {
     Number,
     /// A string literal's *contents*, quotes removed, escapes not yet decoded.
     ///
-    /// Two decisions live in that one variant. Keeping the raw slice means lexing
-    /// still allocates nothing but the token vector, which is the whole reason the
-    /// lexer is allocation-free. And deferring decoding means a bad escape is
-    /// reported where the value and the line number are both at hand — evaluation
-    /// — rather than in a second pass over text that has already been accepted.
+    /// Two decisions live in that one variant. Keeping the raw offsets means
+    /// lexing still allocates nothing but the token vector, which is the whole
+    /// reason the lexer is allocation-free. And deferring decoding means a bad
+    /// escape is reported where the value and the line number are both at hand —
+    /// evaluation — rather than in a second pass over text that has already been
+    /// accepted.
     Str,
     BinOp(BinOp),
     Eq,
@@ -62,13 +79,35 @@ pub enum TokenKind {
     Eof,
 }
 
+/// One token: what it is, where its text is, and which line it came from.
+///
+/// Sixteen bytes, `Copy`, and no lifetime. The offsets are `u32` because
+/// [`MAX_SOURCE_LEN`] bounds the source they index, which is what lets a whole
+/// token stream be reused across executions instead of reallocated per program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Token<'a> {
+pub struct Token {
     pub kind: TokenKind,
-    /// Borrows the source buffer.
-    pub text: &'a str,
+    /// Byte offset of the text in the source buffer.
+    pub start: u32,
+    /// Length of that text in bytes. Zero only for `Eof`, which has no text;
+    /// punctuation carries its real spelling, so [`Token::text`] is never a lie.
+    pub len: u32,
     /// 1-based line number for diagnostics.
     pub line: u32,
+}
+
+impl Token {
+    /// This token's text, borrowed from the source it was lexed from.
+    ///
+    /// An offset paired with a different source yields `""` rather than a
+    /// panic: the lexer guarantees char boundaries for the source it walked
+    /// (`"` and `\` are ASCII, and UTF-8 never hides one inside a multi-byte
+    /// character), but this is a public type and a caller may pair it wrongly.
+    pub fn text<'a>(&self, source: &'a str) -> &'a str {
+        let start = self.start as usize;
+        let end = start + self.len as usize;
+        source.get(start..end).unwrap_or("")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,14 +138,61 @@ impl fmt::Display for LexError {
 
 impl std::error::Error for LexError {}
 
-/// Tokenize a whole program.
+/// Record one token. The casts cannot truncate: [`lex_into`] refused a source
+/// longer than [`MAX_SOURCE_LEN`], which is far inside `u32`.
+fn emit(tokens: &mut Vec<Token>, kind: TokenKind, start: usize, len: usize, line: u32) {
+    tokens.push(Token {
+        kind,
+        start: start as u32,
+        len: len as u32,
+        line,
+    });
+}
+
+/// Tokenize a whole program into a fresh vector.
+///
+/// The convenience form, for a caller that lexes once. [`lex_into`] is the one
+/// the engine uses, because it refills a buffer the engine already owns.
+pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
+    let mut tokens = Vec::new();
+    lex_into(source, &mut tokens)?;
+    Ok(tokens)
+}
+
+/// Tokenize into a buffer the caller keeps, clearing it first.
 ///
 /// Always appends [`TokenKind::Eof`], so the parser never has to special-case
 /// the end of input. Newlines are insignificant in the Phase 1 grammar and are
 /// skipped, with line numbers tracked for diagnostics.
-pub fn lex(source: &str) -> Result<Vec<Token<'_>>, LexError> {
+///
+/// The vector's capacity survives the clear, which is the entire point: after
+/// the first program of a given size, lexing costs no allocation at all.
+///
+/// The buffer is left empty on failure as well as on entry. An out-parameter
+/// that kept the tokens scanned before a bad byte would let a caller who
+/// ignored the `Result` parse half a program, so the contract is all-or-nothing.
+pub fn lex_into(source: &str, tokens: &mut Vec<Token>) -> Result<(), LexError> {
+    tokens.clear();
+    if source.len() > MAX_SOURCE_LEN {
+        return Err(LexError::new(
+            1,
+            1,
+            format!(
+                "source is {} bytes; the lexer accepts at most {MAX_SOURCE_LEN}",
+                source.len()
+            ),
+        ));
+    }
+    let result = scan(source, tokens);
+    if result.is_err() {
+        tokens.clear();
+    }
+    result
+}
+
+/// Walk the source, appending tokens until it ends or a byte refuses to lex.
+fn scan(source: &str, tokens: &mut Vec<Token>) -> Result<(), LexError> {
     let bytes = source.as_bytes();
-    let mut tokens: Vec<Token<'_>> = Vec::new();
     let mut pos = 0usize;
     let mut line = 1u32;
     // Byte offset one past the last newline, so column is `pos - line_start + 1`.
@@ -133,27 +219,15 @@ pub fn lex(source: &str) -> Result<Vec<Token<'_>>, LexError> {
             // `==` before `=`: match arms are tried in order, so the two-byte
             // guard has to come first or `a == b` lexes as two binding operators.
             b'=' if bytes.get(pos + 1) == Some(&b'=') => {
-                tokens.push(Token {
-                    kind: TokenKind::EqEq,
-                    text: "==",
-                    line,
-                });
+                emit(tokens, TokenKind::EqEq, pos, 2, line);
                 pos += 2;
             }
             b'=' => {
-                tokens.push(Token {
-                    kind: TokenKind::Eq,
-                    text: "=",
-                    line,
-                });
+                emit(tokens, TokenKind::Eq, pos, 1, line);
                 pos += 1;
             }
             b'!' if bytes.get(pos + 1) == Some(&b'=') => {
-                tokens.push(Token {
-                    kind: TokenKind::NotEq,
-                    text: "!=",
-                    line,
-                });
+                emit(tokens, TokenKind::NotEq, pos, 2, line);
                 pos += 2;
             }
             // A bare `!` reaches the catch-all only when it is not `!=`, and the
@@ -220,89 +294,49 @@ pub fn lex(source: &str) -> Result<Vec<Token<'_>>, LexError> {
                         _ => pos += 1,
                     }
                 }
-                let text = source
-                    .get(start..pos)
-                    .ok_or_else(|| LexError::new(open_line, open_column, "invalid UTF-8"))?;
-                tokens.push(Token {
-                    kind: TokenKind::Str,
-                    text,
-                    line: open_line,
-                });
+                // Both offsets are char boundaries: the scan opened just past an
+                // ASCII quote and stopped on one, and every byte it stepped over
+                // in between is payload it never had to interpret.
+                emit(tokens, TokenKind::Str, start, pos - start, open_line);
                 pos += 1; // step over the closing quote
             }
             b'+' => {
-                tokens.push(Token {
-                    kind: TokenKind::BinOp(BinOp::Add),
-                    text: "+",
-                    line,
-                });
+                emit(tokens, TokenKind::BinOp(BinOp::Add), pos, 1, line);
                 pos += 1;
             }
             b'-' => {
-                tokens.push(Token {
-                    kind: TokenKind::BinOp(BinOp::Sub),
-                    text: "-",
-                    line,
-                });
+                emit(tokens, TokenKind::BinOp(BinOp::Sub), pos, 1, line);
                 pos += 1;
             }
             b'*' => {
-                tokens.push(Token {
-                    kind: TokenKind::BinOp(BinOp::Mul),
-                    text: "*",
-                    line,
-                });
+                emit(tokens, TokenKind::BinOp(BinOp::Mul), pos, 1, line);
                 pos += 1;
             }
             // Reached only when the comment guard above did not match, because
             // match arms are tried in order: `//` is a comment, a bare `/` is
             // division.
             b'/' => {
-                tokens.push(Token {
-                    kind: TokenKind::BinOp(BinOp::Div),
-                    text: "/",
-                    line,
-                });
+                emit(tokens, TokenKind::BinOp(BinOp::Div), pos, 1, line);
                 pos += 1;
             }
             b'%' => {
-                tokens.push(Token {
-                    kind: TokenKind::BinOp(BinOp::Mod),
-                    text: "%",
-                    line,
-                });
+                emit(tokens, TokenKind::BinOp(BinOp::Mod), pos, 1, line);
                 pos += 1;
             }
             b'(' => {
-                tokens.push(Token {
-                    kind: TokenKind::LParen,
-                    text: "(",
-                    line,
-                });
+                emit(tokens, TokenKind::LParen, pos, 1, line);
                 pos += 1;
             }
             b')' => {
-                tokens.push(Token {
-                    kind: TokenKind::RParen,
-                    text: ")",
-                    line,
-                });
+                emit(tokens, TokenKind::RParen, pos, 1, line);
                 pos += 1;
             }
             b',' => {
-                tokens.push(Token {
-                    kind: TokenKind::Comma,
-                    text: ",",
-                    line,
-                });
+                emit(tokens, TokenKind::Comma, pos, 1, line);
                 pos += 1;
             }
             b';' => {
-                tokens.push(Token {
-                    kind: TokenKind::Semi,
-                    text: ";",
-                    line,
-                });
+                emit(tokens, TokenKind::Semi, pos, 1, line);
                 pos += 1;
             }
             b'0'..=b'9' => {
@@ -351,14 +385,7 @@ pub fn lex(source: &str) -> Result<Vec<Token<'_>>, LexError> {
                         pos += 1;
                     }
                 }
-                let text = source
-                    .get(start..pos)
-                    .ok_or_else(|| LexError::new(line, column, "invalid UTF-8".to_string()))?;
-                tokens.push(Token {
-                    kind: TokenKind::Number,
-                    text,
-                    line,
-                });
+                emit(tokens, TokenKind::Number, start, pos - start, line);
             }
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => {
                 let start = pos;
@@ -368,15 +395,14 @@ pub fn lex(source: &str) -> Result<Vec<Token<'_>>, LexError> {
                         break;
                     }
                 }
-                let text = source
-                    .get(start..pos)
-                    .ok_or_else(|| LexError::new(line, column, "invalid UTF-8".to_string()))?;
-                let kind = if text == "let" {
+                // Compared as bytes: an identifier is ASCII by the scan above,
+                // so deciding `let` from any other name needs no UTF-8 walk.
+                let kind = if &bytes[start..pos] == b"let" {
                     TokenKind::Let
                 } else {
                     TokenKind::Ident
                 };
-                tokens.push(Token { kind, text, line });
+                emit(tokens, kind, start, pos - start, line);
             }
             other => {
                 // Report the actual character, decoded from the remaining
@@ -394,12 +420,8 @@ pub fn lex(source: &str) -> Result<Vec<Token<'_>>, LexError> {
         }
     }
 
-    tokens.push(Token {
-        kind: TokenKind::Eof,
-        text: "",
-        line,
-    });
-    Ok(tokens)
+    emit(tokens, TokenKind::Eof, bytes.len(), 0, line);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -563,17 +585,70 @@ mod tests {
         assert!(e.message.contains('ই'), "message was {e}");
     }
 
-    /// The zero-allocation claim, made checkable: a token's text points into the
-    /// caller's buffer instead of being copied out.
+    /// The zero-copy claim, made checkable: resolving a token's offset lands
+    /// inside the caller's buffer rather than in a copy the lexer made.
     #[test]
-    fn token_text_is_a_borrow_not_a_copy() {
+    fn token_text_resolves_into_the_callers_buffer() {
         let src = String::from("let x = 1");
         let toks = lex(&src).unwrap();
         let ident = toks.iter().find(|t| t.kind == TokenKind::Ident).unwrap();
-        // Safety: offset 4 is inside `src` ("let x = 1"), so the resulting
-        // pointer is in bounds — which is precisely the claim under test.
-        let expected = unsafe { src.as_ptr().add(4) };
-        assert!(std::ptr::eq(ident.text.as_ptr(), expected));
+        assert_eq!((ident.start, ident.len), (4, 1));
+        // No unsafe needed any more: the offset is data, and `text` borrows the
+        // source it is handed. Offset 4 is the `x` in "let x = 1".
+        assert!(std::ptr::eq(
+            ident.text(&src).as_ptr(),
+            src.as_bytes()[4..].as_ptr()
+        ));
+    }
+
+    /// Sixteen bytes is the number the reuse story rests on: a token stream is
+    /// half the size it was when every token carried a fat pointer, so twice as
+    /// many fit in a cache line.
+    #[test]
+    fn a_token_is_sixteen_bytes_and_carries_no_lifetime() {
+        assert_eq!(std::mem::size_of::<Token>(), 16);
+        fn owns_no_borrow(_: Token) {}
+        let t = lex("1").unwrap()[0];
+        owns_no_borrow(t);
+        assert_eq!(t.text("1"), "1");
+    }
+
+    #[test]
+    fn punctuation_and_eof_resolve_to_their_spelling() {
+        let src = "a == b != c;";
+        let toks = lex(src).unwrap();
+        let texts: Vec<&str> = toks.iter().map(|t| t.text(src)).collect();
+        assert_eq!(texts, vec!["a", "==", "b", "!=", "c", ";", ""]);
+    }
+
+    /// The claim that makes a warm engine allocation-free: refilling a buffer
+    /// keeps its capacity, and a shorter program leaves no stale tokens behind.
+    #[test]
+    fn lex_into_reuses_capacity_and_clears_the_previous_program() {
+        let mut buf = Vec::new();
+        lex_into("1 + 2 + 3 + 4 + 5", &mut buf).unwrap();
+        let capacity = buf.capacity();
+        assert!(capacity >= 10);
+        assert_eq!(buf.len(), 10, "five numbers, four operators, an Eof");
+
+        lex_into("7", &mut buf).unwrap();
+        assert_eq!(buf.capacity(), capacity, "the buffer was reallocated");
+        assert_eq!(buf.len(), 2, "a number and an Eof, nothing left over");
+        assert_eq!(buf[0].text("7"), "7");
+        assert_eq!(buf[1].kind, TokenKind::Eof);
+
+        // A failed lex must not leave half a program for the next caller to read.
+        assert!(lex_into("1 + ?", &mut buf).is_err());
+        assert!(buf.is_empty());
+    }
+
+    /// The invariant every `as u32` in `emit` rests on. Proving it by comparison
+    /// costs nothing; proving it by allocating a 256 MiB source would cost more
+    /// than the guard is worth, and the ABI already tests refusal at its own
+    /// boundary with the same number.
+    #[test]
+    fn the_source_limit_fits_the_offsets_that_index_it() {
+        assert!(u32::try_from(super::MAX_SOURCE_LEN).is_ok());
     }
 
     #[test]
@@ -588,7 +663,7 @@ mod tests {
             .unwrap()
             .iter()
             .find(|t| t.kind == TokenKind::Str)
-            .map(|t| t.text.to_string())
+            .map(|t| t.text(src).to_string())
             .expect("no string token")
     }
 
@@ -601,7 +676,7 @@ mod tests {
     }
 
     /// The lexer finds the end of a literal; it does not interpret it. That is
-    /// what lets a token stay a borrowed slice, and it means the raw backslashes
+    /// what lets a token stay a pair of offsets, and it means the raw backslashes
     /// survive to be decoded by the evaluator, where the line number is known.
     #[test]
     fn escapes_are_scanned_over_not_decoded() {
@@ -686,16 +761,16 @@ mod tests {
     }
 
     #[test]
-    fn a_string_token_borrows_the_source_like_every_other_token() {
+    fn a_string_token_points_into_the_source_like_every_other_token() {
         let src = String::from("let s = \"hi\"");
         let toks = lex(&src).unwrap();
         let s = toks.iter().find(|t| t.kind == TokenKind::Str).unwrap();
-        // Safety: byte offset 9 is the `h` inside the literal — `let s = "` is
-        // nine bytes — so the pointer is in bounds, and the claim under test is
-        // that the token *is* that pointer rather than a copy of it.
-        assert!(std::ptr::eq(s.text.as_ptr(), unsafe {
-            src.as_ptr().add(9)
-        }));
-        assert_eq!(s.text, "hi");
+        // `let s = "` is nine bytes, so the contents start at offset 9.
+        assert_eq!((s.start, s.len), (9, 2));
+        assert!(std::ptr::eq(
+            s.text(&src).as_ptr(),
+            src.as_bytes()[9..].as_ptr()
+        ));
+        assert_eq!(s.text(&src), "hi");
     }
 }

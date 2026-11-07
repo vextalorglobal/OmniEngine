@@ -134,6 +134,28 @@ static int32_t OMNI_CALL reentrant_cb(void *user_data, const OmniValue *args, ui
   return OMNI_HOST_OK;
 }
 
+/* The same refusal, asked of the batch entry point. One guard covers both: a
+ * callback cannot reach the arena reset of omni_exec_many() any more than it
+ * can reach omni_exec()'s. */
+static uint32_t batch_reentrant_status = 0;
+static int32_t OMNI_CALL batch_reentrant_cb(void *user_data, const OmniValue *args, uint32_t argc,
+                                            OmniValue *out) {
+  (void)args;
+  (void)argc;
+  OmniEngine *self = (OmniEngine *)user_data;
+  const char *nested_src = "1 + 1";
+  const char *sources[1] = {nested_src};
+  size_t lengths[1] = {5};
+  OmniValue nested;
+  uint32_t nested_status;
+  batch_reentrant_status =
+      omni_exec_many(self, sources, lengths, 1, &nested, &nested_status);
+  out->tag = OMNI_NUMBER;
+  out->len = 0;
+  out->payload.number = 0.0;
+  return OMNI_HOST_OK;
+}
+
 int main(void) {
   /* Rule 5: agree on the wire format before trusting a single other symbol. A
    * mismatch means the header and the library disagree about where `len` sits,
@@ -354,6 +376,104 @@ int main(void) {
     failures += expect(code == OMNI_OK, "the outer call itself succeeds");
     failures += expect(reentrant_status == OMNI_ERR_REENTRANT,
                        "and omni_exec from inside the callback reports OMNI_ERR_REENTRANT");
+    omni_unregister_host_fn(engine, "reenter", 7);
+  }
+
+  printf("\n-- batch execution (Phase 4) --\n");
+  {
+    /* Four programs, one crossing. The third fails on purpose: a failing item
+     * must not stop the batch, and the fourth must still run. */
+    const char *sources[4] = {"let x = 6; x * 7", "\"hello, \" + \"batch!\"", "1 +", "20 / 4"};
+    size_t lengths[4];
+    for (int i = 0; i < 4; ++i) lengths[i] = strlen(sources[i]);
+    OmniValue out[4];
+    uint32_t statuses[4];
+    uint32_t code = omni_exec_many(engine, sources, lengths, 4, out, statuses);
+
+    failures += expect(code == OMNI_ERR_COMPILE, "the call returns the FIRST failing status");
+    failures += expect(statuses[0] == OMNI_OK && out[0].payload.number == 42.0,
+                       "item 0 evaluated before the failure");
+    failures += expect(statuses[2] == OMNI_ERR_COMPILE && out[2].tag == OMNI_UNDEF,
+                       "the failing item reports its status and OMNI_UNDEF");
+    failures += expect(statuses[3] == OMNI_OK && out[3].payload.number == 5.0,
+                       "and the item after it still ran");
+
+    /* Rule 11's promise: every string result is live at the same time. A loop of
+     * omni_exec() could not offer this -- each call would rewind the last one. */
+    Str batched = copy_string(engine, &out[1]);
+    failures += expect(batched.n == 13 && memcmp(batched.buf, "hello, batch!", 13) == 0,
+                       "a batch string result copies out after the whole batch returned");
+
+    char message[128];
+    size_t n = omni_batch_error(engine, 2, message, sizeof message);
+    failures += expect(n > 0 && strstr(message, "line 1") != NULL,
+                       "omni_batch_error names the failing item's own message");
+    printf("       item 2: %s\n", message);
+    failures += expect(omni_batch_error(engine, 0, message, sizeof message) == 0,
+                       "a successful item has no error to copy");
+    failures += expect(omni_batch_error(engine, 99, message, sizeof message) == 0,
+                       "an index past the batch copies nothing");
+
+    /* Each item is its own execution: item 1 cannot read item 0's `let`. */
+    const char *isolated[2] = {"let secret = 1; secret", "secret"};
+    size_t iso_len[2] = {strlen(isolated[0]), strlen(isolated[1])};
+    OmniValue iso_out[2];
+    uint32_t iso_status[2];
+    code = omni_exec_many(engine, isolated, iso_len, 2, iso_out, iso_status);
+    failures += expect(code == OMNI_ERR_RUNTIME && iso_status[0] == OMNI_OK &&
+                           iso_status[1] == OMNI_ERR_RUNTIME,
+                       "a binding does not survive from one item into the next");
+
+    /* An empty batch reclaims nothing, so a result held across it stays fresh. */
+    const char *held_src = "\"still current\"";
+    OmniValue held;
+    omni_exec(engine, held_src, strlen(held_src), &held);
+    failures += expect(omni_exec_many(engine, NULL, NULL, 0, out, statuses) == OMNI_OK,
+                       "an empty batch accepts NULL arrays");
+    Str still = copy_string(engine, &held);
+    failures += expect(still.n == 13 && memcmp(still.buf, "still current", 13) == 0,
+                       "and expires nothing the host is still holding");
+    failures += expect(omni_batch_error(engine, 2, message, sizeof message) == 0,
+                       "a single exec ends the previous batch's currency");
+
+    /* Argument errors refuse the whole call before any item runs. */
+    failures += expect(omni_exec_many(engine, sources, lengths, OMNI_MAX_BATCH + 1, out, statuses) ==
+                           OMNI_ERR_ARG,
+                       "a count above OMNI_MAX_BATCH is refused");
+    failures += expect(omni_exec_many(engine, NULL, lengths, 4, out, statuses) == OMNI_ERR_ARG,
+                       "a NULL sources array is refused");
+    failures += expect(omni_exec_many(engine, sources, lengths, 4, out, NULL) == OMNI_ERR_ARG,
+                       "a NULL statuses array is refused");
+    const char *bad_utf8 = "\xff\xfe";
+    const char *bad_sources[2] = {"1 + 1", bad_utf8};
+    size_t bad_lengths[2] = {5, 2};
+    OmniValue before = out[0];
+    failures += expect(omni_exec_many(engine, bad_sources, bad_lengths, 2, out, statuses) ==
+                           OMNI_ERR_ARG,
+                       "non-UTF-8 in any item refuses the call");
+    failures += expect(memcmp(&before, &out[0], sizeof before) == 0,
+                       "and writes nothing, rather than half a batch");
+
+    /* execs counts items, not crossings -- the field meaning ABI v4 changed. */
+    OmniStats pre;
+    omni_debug_stats(engine, &pre);
+    omni_exec_many(engine, sources, lengths, 4, out, statuses);
+    OmniStats post;
+    omni_debug_stats(engine, &post);
+    failures += expect(post.execs == pre.execs + 4, "execs counted four items for one crossing");
+    printf("       execs=%" PRIu64 " egress=%" PRIu64 "/%" PRIu64 " high=%" PRIu64 "\n",
+           post.execs, post.egress_bytes_in_use, post.egress_bytes_reserved,
+           post.egress_high_water);
+
+    /* The guard covers the batch entry point too. */
+    batch_reentrant_status = 0;
+    code = omni_register_host_fn(engine, "reenter", 7, 0, batch_reentrant_cb, engine);
+    failures += expect(code == OMNI_OK, "a batch-re-entrant callback registers");
+    const char *batch_call = "reenter()";
+    code = omni_exec(engine, batch_call, strlen(batch_call), &held);
+    failures += expect(code == OMNI_OK, "the outer call succeeds");
+    failures += expect(batch_reentrant_status == OMNI_ERR_REENTRANT,
+                       "and omni_exec_many from inside the callback is refused");
     omni_unregister_host_fn(engine, "reenter", 7);
   }
 

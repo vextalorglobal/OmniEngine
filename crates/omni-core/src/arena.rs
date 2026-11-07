@@ -23,6 +23,10 @@
 //! leave in them. That is the whole reason strings that face a foreign host are
 //! promoted into a rewound block: the failure mode for a caller that ignores the
 //! expiry rule becomes a stale read rather than a use-after-free.
+//!
+//! [`Arena::mark`] and [`Arena::reset_to`] are the third thing a batch needs:
+//! reclaim *back to* a checkpoint instead of back to the beginning, so a run of
+//! executions can keep one warm chunk and one egress rewind between them.
 
 use std::alloc::{Layout, alloc as sys_alloc, dealloc as sys_dealloc};
 use std::mem;
@@ -46,7 +50,8 @@ struct Chunk {
     /// Only meaningful for an oversize block: `true` once [`Arena::rewind`] has
     /// declared every previous claim on it dead, so the next large request can
     /// reuse the mapping instead of asking the system for another one. Bump
-    /// chunks are never individually reusable and always carry `false`.
+    /// chunks are reused by the cursor walking them in order, not by a flag, and
+    /// always carry `false`.
     free: bool,
 }
 
@@ -79,17 +84,46 @@ impl Drop for Chunk {
     }
 }
 
+/// A checkpoint of an arena's bump cursor: how many chunks it held, which one it
+/// was filling, and how far into that one it had reached.
+///
+/// Oversize blocks are deliberately not part of it. [`Arena::reset_to`] reclaims
+/// them all, exactly as [`Arena::reset`] does, because a count cannot record
+/// *which* large blocks were spare and which were live — restoring the count
+/// alone would either leak a claim or hand a live block's bytes to the next
+/// large request. A batch checkpoints right after a reset, when there are none.
+///
+/// The rule that keeps a mark honest, like [`Slot`]'s: it belongs to the arena
+/// that produced it and is only meaningful while that arena is alive. Restoring
+/// it reclaims everything allocated since, so any pointer handed out after the
+/// mark is dangling. A mark taken from a *different* arena, or one whose chunks
+/// have since been reset away, is clamped to what this arena actually holds —
+/// the worst outcome is a wasted chunk, never an out-of-bounds cursor, because
+/// [`Arena::alloc_raw`] re-checks the fit before every allocation.
+#[derive(Debug, Clone, Copy)]
+pub struct Mark {
+    chunks: usize,
+    current: usize,
+    used: usize,
+}
+
 /// A bump allocator over fixed-size chunks, with an escape hatch for objects
 /// larger than a chunk.
 pub struct Arena {
     chunks: Vec<Chunk>,
     /// Blocks too large for a chunk, each in an allocation of its own exact
-    /// size. Kept out of `chunks` so the bump cursor's "the newest chunk is the
-    /// one I am filling" rule never has to think about them, while pointer
-    /// stability still holds because nothing here is ever moved.
+    /// size. Kept out of `chunks` so the bump cursor never has to think about
+    /// them, while pointer stability still holds because nothing here is ever
+    /// moved.
     oversize: Vec<Chunk>,
     chunk_size: usize,
-    /// Bytes claimed in the newest chunk. `usize::MAX` means "no chunk yet".
+    /// Index of the chunk the cursor is filling. Always the last one, except
+    /// after a [`Arena::rewind`] of a multi-chunk arena: the cursor goes back to
+    /// chunk 0 and walks the chunks already mapped before asking for another.
+    /// Without that walk, a cycle needing two chunks would map two fresh ones
+    /// every time and `bytes_reserved` would grow without bound.
+    current: usize,
+    /// Bytes claimed in the chunk at `current`. `usize::MAX` means "no chunk yet".
     used: usize,
     /// Bytes held by *all* oversize blocks, spare ones included. This is what the
     /// system has given us and therefore what `bytes_reserved` reports.
@@ -119,6 +153,7 @@ impl Arena {
             chunks: Vec::new(),
             oversize: Vec::new(),
             chunk_size,
+            current: 0,
             used: usize::MAX,
             oversize_held: 0,
             oversize_live: 0,
@@ -138,6 +173,7 @@ impl Arena {
             layout,
             free: false,
         });
+        self.current = self.chunks.len() - 1;
         self.used = 0;
     }
 
@@ -164,10 +200,19 @@ impl Arena {
 
         let fits = self.used != usize::MAX && self.used + size + align <= self.chunk_size;
         if !fits {
-            self.push_chunk();
+            // A chunk already mapped by an earlier cycle is preferred to a new
+            // one: every chunk is `chunk_size`, so the request that failed to fit
+            // the exhausted one fits the next, and a rewound arena stays bounded
+            // by its largest cycle rather than by how many cycles ran.
+            if self.current + 1 < self.chunks.len() {
+                self.current += 1;
+                self.used = 0;
+            } else {
+                self.push_chunk();
+            }
         }
 
-        let base = self.chunks.last().expect("a chunk is present").ptr as usize;
+        let base = self.chunks[self.current].ptr as usize;
         let raw = base + self.used;
         let aligned = (raw + align - 1) & !(align - 1);
         self.used = (aligned - base) + size;
@@ -241,17 +286,52 @@ impl Arena {
     /// This *invalidates every pointer*, so it may only be used for a block
     /// whose tenants are dropped in the same step. See the module header.
     pub fn reset(&mut self) {
-        if self.chunks.len() > 1 {
-            self.chunks.truncate(1);
+        self.reset_to(Mark {
+            chunks: self.chunks.len().min(1),
+            current: 0,
+            used: 0,
+        });
+    }
+
+    /// Record the bump cursor, for [`Arena::reset_to`].
+    ///
+    /// Takes nothing and allocates nothing: three `usize`s copied out. That is
+    /// what makes it cheap enough to sit at the head of a batch and be restored
+    /// before every item. `Copy` for the same reason — one mark, many restores.
+    pub fn mark(&self) -> Mark {
+        Mark {
+            chunks: self.chunks.len(),
+            current: self.current,
+            used: self.used,
         }
+    }
+
+    /// Reclaim every chunk allocated since `mark`, and the cursor back to where
+    /// it stood. Chunks the mark still names are kept, so the memory the batch
+    /// warmed stays mapped and the next allocation lands where it did before.
+    /// Oversize blocks are all reclaimed, as by [`Arena::reset`]; see [`Mark`].
+    ///
+    /// Like `reset` this invalidates pointers handed out after the mark, and like
+    /// `reset` it leaves [`Arena::high_water`] alone: the watermark describes the
+    /// largest cycle ever run, not this one.
+    pub fn reset_to(&mut self, mark: Mark) {
+        self.chunks.truncate(mark.chunks.min(self.chunks.len()));
         self.oversize.clear();
         self.oversize_held = 0;
         self.oversize_live = 0;
-        if self.chunks.is_empty() {
-            self.used = usize::MAX;
+        // A mark taken before the first chunk existed carries `usize::MAX`;
+        // restoring it means "nothing claimed yet", not "this chunk is full".
+        let used = if mark.used == usize::MAX {
+            0
         } else {
-            self.used = 0;
-        }
+            mark.used.min(self.chunk_size)
+        };
+        self.used = if self.chunks.is_empty() {
+            usize::MAX
+        } else {
+            used
+        };
+        self.current = mark.current.min(self.chunks.len().saturating_sub(1));
         self.allocations = 0;
     }
 
@@ -267,6 +347,7 @@ impl Arena {
     /// instead of climbing.
     pub fn rewind(&mut self) {
         if !self.chunks.is_empty() {
+            self.current = 0;
             self.used = 0;
         }
         self.allocations = 0;
@@ -353,7 +434,7 @@ impl Arena {
         let bump = if self.chunks.is_empty() || self.used == usize::MAX {
             0
         } else {
-            (self.chunks.len() - 1) * self.chunk_size + self.used.min(self.chunk_size)
+            (self.current * self.chunk_size) + self.used.min(self.chunk_size)
         };
         bump + self.oversize_live
     }
@@ -389,9 +470,9 @@ unsafe impl Send for Arena {}
 /// This exists so `unsafe` stays in this file. The engine reads bindings through
 /// `Slot`, and the one rule that keeps it sound is outside the type: every
 /// collection of `Slot`s must be dropped before the arena that owns their memory
-/// is `reset()` or dropped. `Engine::begin_execution` upholds it by clearing its
+/// is `reset()` or dropped. `Engine::reclaim` upholds it by clearing its
 /// binding list in the same step as the arena reset, so the two can never be
-/// reordered.
+/// reordered. `Engine::exec_many` upholds it per item, against `reset_to`.
 ///
 /// `Slot` is for the *reset* block. A `Value` that addresses the rewound egress
 /// block is not a `Slot`; it is read through [`crate::object::StrRef`], under the
@@ -469,6 +550,117 @@ mod tests {
         assert_eq!(a.bytes_in_use(), 0);
         assert_eq!(a.chunk_count(), 0);
         assert!(!a.alloc::<u64>(9).is_null());
+    }
+
+    /// What a batch is built on: the checkpoint keeps the memory the batch
+    /// warmed, and every item starts allocating at the address the first one did.
+    #[test]
+    fn reset_to_a_mark_reuses_the_block_the_mark_named() {
+        let mut a = Arena::with_chunk_size(4096);
+        let kept = a.alloc::<u64>(7);
+        let mark = a.mark();
+        let claimed = a.bytes_in_use();
+        let next = a.alloc::<u64>(0);
+        let reserved = a.bytes_reserved();
+        for round in 0..8 {
+            a.reset_to(mark);
+            assert_eq!(a.allocations(), 0, "round {round}");
+            assert_eq!(
+                a.bytes_in_use(),
+                claimed,
+                "round {round}: only what the mark named is still claimed"
+            );
+            assert_eq!(
+                a.bytes_reserved(),
+                reserved,
+                "round {round}: nothing mapped"
+            );
+            assert!(
+                a.owns(kept as usize),
+                "round {round}: the marked block lives"
+            );
+            assert_eq!(a.alloc::<u64>(round), next, "round {round}: same address");
+        }
+    }
+
+    /// A mark taken on a cold arena names no chunks, so restoring it gives the
+    /// chunk back too. This is the first batch's cost: one chunk per item until
+    /// an item leaves one mapped, after which every later batch reuses it.
+    #[test]
+    fn a_mark_taken_before_any_allocation_reclaims_the_chunk_it_did_not_name() {
+        let mut a = Arena::with_chunk_size(4096);
+        let mark = a.mark();
+        let first = a.alloc::<u64>(1);
+        a.reset_to(mark);
+        assert_eq!(a.chunk_count(), 0);
+        assert_eq!(a.bytes_reserved(), 0);
+        assert_eq!(a.bytes_in_use(), 0);
+        assert!(!a.owns(first as usize));
+        assert!(
+            !a.alloc::<u64>(2).is_null(),
+            "and the arena is still usable"
+        );
+    }
+
+    #[test]
+    fn reset_to_reclaims_the_chunks_and_oversize_blocks_added_since() {
+        let mut a = Arena::with_chunk_size(4096);
+        let kept = a.alloc::<u64>(1);
+        let mark = a.mark();
+        for _ in 0..1000 {
+            let _ = a.alloc::<u64>(0);
+        }
+        let big = a.alloc_raw(20_000, 8);
+        assert!(a.chunk_count() > 1);
+        assert_eq!(a.oversize_count(), 1);
+        a.reset_to(mark);
+        assert_eq!(a.chunk_count(), 1, "the marked chunk stays, the rest go");
+        assert_eq!(a.oversize_count(), 0);
+        assert_eq!(a.bytes_reserved(), 4096);
+        assert_eq!(a.bytes_in_use(), 8);
+        assert!(a.owns(kept as usize));
+        assert!(!a.owns(big as usize));
+    }
+
+    /// The clamp, stated as a test rather than trusted: a mark whose cursor sits
+    /// beyond the end of this arena's chunk must not be believed, or the next
+    /// allocation would write past the block.
+    #[test]
+    fn a_mark_from_a_larger_arena_is_clamped_not_believed() {
+        let mut big = Arena::with_chunk_size(8192);
+        let _ = big.alloc_raw(5000, 8);
+        let foreign = big.mark();
+        let mut small = Arena::with_chunk_size(4096);
+        let _ = small.alloc::<u64>(0);
+        small.reset_to(foreign);
+        assert_eq!(small.chunk_count(), 1, "the block it already held survives");
+        let p = small.alloc::<u64>(1);
+        assert!(
+            small.owns(p as usize),
+            "the cursor was clamped, not trusted"
+        );
+        assert_eq!(
+            small.chunk_count(),
+            2,
+            "a full chunk grows, it does not overflow"
+        );
+    }
+
+    /// Oversize is not checkpointed, so a large block is reclaimed even when the
+    /// mark was taken while it sat there as a spare. Stated because the
+    /// alternative — restoring a block count — cannot tell spare from live.
+    #[test]
+    fn reset_to_reclaims_oversize_even_when_the_mark_predates_the_rewind() {
+        let mut a = Arena::with_chunk_size(4096);
+        let payload = vec![0x41u8; 100_000];
+        let first = build(&mut a, &payload);
+        a.rewind();
+        let mark = a.mark();
+        assert_eq!(build(&mut a, &payload), first, "the spare was reused");
+        a.reset_to(mark);
+        assert_eq!(a.oversize_count(), 0);
+        assert_eq!(a.bytes_reserved(), 0);
+        assert!(!a.owns(first as usize));
     }
 
     #[test]
@@ -573,6 +765,36 @@ mod tests {
                 a.bytes_in_use() >= 100_000,
                 "the live block is counted live"
             );
+        }
+    }
+
+    /// The same claim for the bump path, which a batch is what makes reachable:
+    /// eight 1500-byte results in one cycle need four 4 KiB chunks, and the next
+    /// cycle must walk those four rather than map four more. A cursor that only
+    /// ever filled the newest chunk grew `bytes_reserved` by a whole cycle every
+    /// time, which is a leak wearing a rewind's clothes.
+    #[test]
+    fn a_rewound_multi_chunk_cycle_reuses_every_chunk_it_mapped() {
+        let mut a = Arena::with_chunk_size(4096);
+        let cycle =
+            |a: &mut Arena| -> Vec<*mut u8> { (0..8).map(|_| a.alloc_raw(1500, 8)).collect() };
+        let first = cycle(&mut a);
+        let reserved = a.bytes_reserved();
+        let claimed = a.bytes_in_use();
+        let chunks = a.chunk_count();
+        assert_eq!(chunks, 4, "two 1500-byte claims fit one 4096-byte chunk");
+        for round in 0..8 {
+            a.rewind();
+            assert_eq!(a.bytes_in_use(), 0, "round {round}: nothing claimed");
+            let again = cycle(&mut a);
+            assert_eq!(again, first, "round {round}: the same addresses, in order");
+            assert_eq!(a.chunk_count(), chunks, "round {round}: no new chunk");
+            assert_eq!(
+                a.bytes_reserved(),
+                reserved,
+                "round {round}: nothing mapped"
+            );
+            assert_eq!(a.bytes_in_use(), claimed, "round {round}: same demand");
         }
     }
 

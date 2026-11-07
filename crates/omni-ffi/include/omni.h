@@ -1,5 +1,5 @@
 /*
- * omni.h -- the C ABI of OmniEngine, version 3.
+ * omni.h -- the C ABI of OmniEngine, version 4.
  *
  * Hand-written and authoritative. It mirrors
  * crates/omni-ffi/src/lib.rs, and the Rust side has compile-time asserts
@@ -19,14 +19,20 @@
  * 1. A string result is an address the engine owns, not a copy. omni_exec()
  *    returns tag OMNI_STRING with `payload.ptr` pointing into the engine's
  *    egress block. That block is rewound -- never freed or unmapped -- at the
- *    start of the next omni_exec() on the same engine, so the bytes stay valid
- *    memory for the life of the handle and the documented contract is:
+ *    start of the next omni_exec() or omni_exec_many() on the same engine, so
+ *    the bytes stay valid memory for the life of the handle and the documented
+ *    contract is:
  *
- *        valid until your next omni_exec() on this engine.
+ *        valid until your next omni_exec() or omni_exec_many() on this engine.
  *
  *    Reading it after that is a wrong read, never a crash: you get whatever the
  *    later execution wrote at those addresses. To keep a string, copy it with
  *    omni_str_copy() into storage you own.
+ *
+ *    omni_exec_many() is the one call where several results are live at once:
+ *    it rewinds the block once for the whole batch, so all `count` string
+ *    results stay readable together until your next execution of either kind.
+ *    See rule 11.
  *
  *    `payload.ptr` identifies the string, it is not the first byte of the text:
  *    the engine keeps a length word in front of the bytes it stores. That is
@@ -72,10 +78,11 @@
  * 9. Re-entrancy is refused, not supported. Calling any function in this header
  *    from inside a callback, on the same handle, returns OMNI_ERR_REENTRANT
  *    rather than handing out a second mutable reference to the engine.
- *    omni_str_copy(), omni_unregister_host_fn() and omni_last_error() report it
- *    as 0, because a size_t and a bool carry no status. Rule 8 holds precisely
- *    because this rule does: the arena is reset at the entry of omni_exec(), and
- *    a nested call can never reach that entry.
+ *    omni_str_copy(), omni_unregister_host_fn(), omni_last_error() and
+ *    omni_batch_error() report it as 0, because a size_t and a bool carry no
+ *    status. Rule 8 holds precisely because this rule does: the arena is reset
+ *    at the entry of omni_exec() and of omni_exec_many(), and a nested call can
+ *    never reach that entry.
  *
  * 10. Your callback reports failure by returning OMNI_HOST_ERR, never by
  *    unwinding. A C++ exception, a Python exception and a JavaScript throw all
@@ -83,6 +90,30 @@
  *    frames that are calling you is not recoverable. Put the message in `out` as
  *    an OMNI_STRING and return 1; the script's error becomes
  *    "host function 'name' failed: <message>" at the line of the call.
+ *
+ * 11. A batch is N independent executions, not one long program. Each item
+ *    starts with the bindings the previous item left behind cleared, so item 2
+ *    cannot read item 1's `let`. Host globals and registered functions survive
+ *    every item, as they survive every omni_exec().
+ *
+ *    A failing item does not stop the batch: `out[i]` and `statuses[i]` are
+ *    written for every i, a failed item's value is OMNI_UNDEF, and the call
+ *    returns the status of the FIRST failure (OMNI_OK if there was none). Read
+ *    omni_batch_error(engine, i, buf, cap) for that item's rendered message;
+ *    omni_last_error() only ever holds the final item's.
+ *
+ *    The whole batch shares one egress rewind, so every string result is
+ *    readable when the call returns and stays readable until your next
+ *    execution of either kind. The trade is memory: reserved egress bytes are
+ *    bounded by one batch's total demand rather than by one item's, so a batch
+ *    of 4096 long strings reserves more than 4096 single calls would.
+ *
+ *    Argument errors refuse the whole call before any item runs. A NULL array,
+ *    a count above OMNI_MAX_BATCH, an over-long `lengths[i]`, or non-UTF-8 in
+ *    any item returns OMNI_ERR_ARG and writes nothing -- the same answer
+ *    omni_exec() gives for a malformed source, rather than a half-run batch.
+ *    `count` of 0 is a no-op returning OMNI_OK: nothing is written and nothing
+ *    is reclaimed, so polling an empty queue does not expire held results.
  *
  * ## Linking
  *
@@ -121,13 +152,17 @@ extern "C" {
 
 /* Wire format, not the crate version. See caller rule 5.
  *
- * Version 3 changed no layout: OmniValue is still 16 bytes and OmniStats still
- * 72, and every struct, tag and status through 4 keeps its version-2 meaning.
- * What changed is the surface -- the omni_host_fn callback type, the three
- * registration functions, and the two new statuses. A host compiled against 2
- * still reads correct values from a library that reports 3; it just cannot see
- * the new symbols, which is why the number moved. */
-#define OMNI_ABI_VERSION 3u
+ * Version 4 changed no layout: OmniValue is still 16 bytes and OmniStats still
+ * 72, and every struct, tag and status keeps its version-3 meaning. What changed
+ * is the surface -- omni_exec_many() and omni_batch_error(), which a host
+ * compiled against 3 cannot declare -- and one field's meaning: OmniStats.execs
+ * now counts batch items as well as single calls, so a v3 host reading it as
+ * "number of omni_exec() calls" would draw a wrong conclusion from a correct
+ * number. That is why the version moved rather than staying at 3.
+ *
+ * Version 3 was the callback increment: the omni_host_fn type, the three
+ * registration functions, and statuses 5 and 6. */
+#define OMNI_ABI_VERSION 4u
 
 /* ---- status codes: the u32 returned by every call ---- */
 
@@ -155,7 +190,8 @@ extern "C" {
 #define OMNI_STRING        4u /* payload.ptr + len, engine-owned          */
 
 /* ---- limits: mirrors of omni_core::{object::MAX_STRING_LEN,
- *       engine::{MAX_IDENTIFIER_LEN, MAX_ARGS, MAX_CALL_DEPTH}} ----
+ *       engine::{MAX_IDENTIFIER_LEN, MAX_ARGS, MAX_CALL_DEPTH},
+ *       lexer::MAX_SOURCE_LEN} and omni_ffi::MAX_BATCH ----
  *
  * Restated here because C cannot read a Rust constant; the engine enforces them
  * and refuses a longer payload (OMNI_ERR_ARG from a host, OMNI_ERR_RUNTIME from
@@ -166,6 +202,8 @@ extern "C" {
 #define OMNI_MAX_IDENTIFIER_LEN 32u
 #define OMNI_MAX_ARGS           16u /* arguments a call may pass, and an arity may claim */
 #define OMNI_MAX_CALL_DEPTH     64u /* nested calls one execution may reach              */
+#define OMNI_MAX_SOURCE_LEN     (256u * 1024u * 1024u) /* bytes one program may carry */
+#define OMNI_MAX_BATCH          4096u /* items one omni_exec_many() may carry        */
 
 /* The payload of an OmniValue: whichever arm its tag says is live. */
 typedef union OmniPayload {
@@ -191,14 +229,16 @@ typedef struct OmniValue {
  * to stop, rather than reading a counter from the wrong offset forever. */
 typedef struct OmniStats {
   uint32_t size;                /* sizeof(OmniStats), written by the callee */
-  uint64_t execs;               /* omni_exec() calls started                */
+  uint64_t execs;               /* executions started: one per omni_exec(),
+                                 * one per item of every omni_exec_many()   */
   uint64_t strings;             /* string blocks built, cumulative          */
   uint64_t arena_bytes_in_use;
   uint64_t arena_bytes_reserved;
   uint64_t arena_chunks;
   uint64_t egress_bytes_in_use;
   uint64_t egress_bytes_reserved;
-  uint64_t egress_high_water;   /* largest single execution's egress demand */
+  uint64_t egress_high_water;   /* largest egress demand between two rewinds:
+                                 * one execution, or one whole batch        */
 } OmniStats;
 
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
@@ -298,6 +338,50 @@ OMNI_API uint32_t OMNI_CALL omni_exec_number(OmniEngine *engine,
                                              const char *src,
                                              size_t len,
                                              double *out);
+
+/* Evaluate `count` programs in one crossing. See caller rule 11.
+ *
+ * `sources` is an array of `count` pointers, `lengths` an array of `count`
+ * byte counts, paired by index. Neither string needs a NUL terminator; each
+ * must be UTF-8. A length of 0 is a valid empty program and its pointer may
+ * then be NULL, exactly as in omni_exec().
+ *
+ * `out` receives `count` OmniValues and `statuses` `count` uint32_t status
+ * codes, both caller-owned and both written for every index even when an
+ * earlier item failed. A failed item's value is OMNI_UNDEF.
+ *
+ * Returns OMNI_OK when every item succeeded, otherwise the status of the FIRST
+ * failing item. Returns OMNI_ERR_ARG without writing anything for a NULL
+ * engine, out or statuses array, a count above OMNI_MAX_BATCH, a NULL sources
+ * or lengths array with a nonzero count, an over-long length, or non-UTF-8 in
+ * any item. `count` of 0 returns OMNI_OK, writes nothing, reclaims nothing, and
+ * allows sources and lengths to be NULL.
+ *
+ * Every OMNI_STRING in `out` follows caller rule 1, and all of them are live
+ * together until your next omni_exec() or omni_exec_many(). From inside a
+ * callback on this handle it returns OMNI_ERR_REENTRANT and runs nothing. */
+OMNI_API uint32_t OMNI_CALL omni_exec_many(OmniEngine *engine,
+                                           const char *const *sources,
+                                           const size_t *lengths,
+                                           size_t count,
+                                           OmniValue *out,
+                                           uint32_t *statuses);
+
+/* Copy the rendered error of item `index` of the most recent batch into buf.
+ *
+ * Writes at most cap - 1 bytes, always NUL-terminates, and returns the bytes
+ * written excluding the terminator -- so a return of cap - 1 means truncated.
+ * The text is the rendered error, "line 1: expected a value", as
+ * omni_last_error() gives it.
+ *
+ * Returns 0 without reading or writing when index is past the batch, when that
+ * item succeeded, when no batch is current (a single omni_exec() ends its
+ * currency), when engine or buf is NULL or cap is 0, and when called from
+ * inside a callback on this engine -- a size_t has nowhere to put status 6. */
+OMNI_API size_t OMNI_CALL omni_batch_error(const OmniEngine *engine,
+                                           size_t index,
+                                           char *buf,
+                                           size_t cap);
 
 /* Copy a string result into storage the caller owns.
  *

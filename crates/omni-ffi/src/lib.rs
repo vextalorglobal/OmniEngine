@@ -1,4 +1,4 @@
-//! OmniEngine's C ABI — version 3.
+//! OmniEngine's C ABI — version 4.
 //!
 //! This is the only crate permitted to name a `#[repr(C)]` type or an
 //! `extern "C"` function, which is what keeps `omni-core` from becoming
@@ -16,12 +16,18 @@
 //! leaves this crate addresses the execution arena.
 //!
 //! The consequence is worth stating out loud: **a stale `OmniValue` is a wrong
-//! read, never a dangling one.** A result is valid until the next `omni_exec` on
-//! the same engine; calling `omni_str_copy` after that copies whatever now sits
-//! at those addresses. And because [`omni_str_copy`] re-checks the address
-//! against the engine that owns it, a fabricated pointer — or one that belongs to
-//! *another* engine, or one whose binding has since been redefined — copies zero
-//! bytes rather than reading memory it has no claim on.
+//! read, never a dangling one.** A result is valid until the next `omni_exec` or
+//! `omni_exec_many` on the same engine; calling `omni_str_copy` after that copies
+//! whatever now sits at those addresses. And because [`omni_str_copy`] re-checks
+//! the address against the engine that owns it, a fabricated pointer — or one
+//! that belongs to *another* engine, or one whose binding has since been
+//! redefined — copies zero bytes rather than reading memory it has no claim on.
+//!
+//! [`omni_exec_many`] is the one place where *several* results are live at once.
+//! It rewinds egress once for the whole batch rather than once per item, so all
+//! N string results stay readable together until the next execution of either
+//! kind. The price is stated rather than hidden: reserved egress bytes are
+//! bounded by one batch's total demand, not by one item's.
 //!
 //! **A Rust panic may never unwind into a host.** Unwinding past `extern "C"` is
 //! undefined behaviour, and it is the most common defect in hand-rolled Rust FFI.
@@ -51,13 +57,21 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::slice;
 
-use omni_core::{Engine, ErrorKind, HostError, HostOutcome, Value};
+use omni_core::{Engine, ErrorKind, HostError, HostOutcome, OmniError, Value};
 
 /// The ceilings a host has to size its buffers and names against.
 ///
 /// Re-exported rather than restated: they are part of the ABI's contract, and a
 /// number duplicated on both sides of a module boundary is a number that drifts.
-pub use omni_core::{MAX_ARGS, MAX_CALL_DEPTH, MAX_IDENTIFIER_LEN, MAX_STRING_LEN};
+pub use omni_core::{MAX_ARGS, MAX_CALL_DEPTH, MAX_IDENTIFIER_LEN, MAX_SOURCE_LEN, MAX_STRING_LEN};
+
+/// Items one [`omni_exec_many`] call may carry.
+///
+/// A boundary bound, not a language one: it caps how many pointers this crate
+/// will read from a host array, and with it the size of the per-item error list
+/// the handle retains. 4096 programs in one crossing is already far past the
+/// point where the crossing cost has been amortised to nothing.
+pub const MAX_BATCH: usize = 4096;
 
 pub const OMNI_OK: u32 = 0;
 pub const OMNI_ERR_COMPILE: u32 = 1;
@@ -89,16 +103,16 @@ pub const OMNI_STRING: u32 = 4;
 /// stale `omni.dll` turns into one clear error at import instead of a wrong
 /// number ten thousand calls later.
 ///
-/// Version 3 is the callback increment, and note what it did *not* change:
-/// `OmniValue` is still 16 bytes with the same three fields at the same offsets,
-/// and `OmniStats` is still 72. The bump is for [`omni_host_fn`], which a v2 host
-/// has no way to declare, and for [`OMNI_ERR_HOST`] and [`OMNI_ERR_REENTRANT`],
-/// which a v2 host would read as unknown statuses.
-pub const OMNI_ABI_VERSION: u32 = 3;
-
-/// 256 MiB of source is already absurd; the bound exists so a hostile or buggy
-/// `len` from a host cannot fabricate an out-of-bounds slice.
-const MAX_SOURCE_LEN: usize = 1 << 28;
+/// Version 4 is the batch increment, and like version 3 it changed no layout:
+/// `OmniValue` is still 16 bytes at the same offsets and `OmniStats` is still 72.
+/// The bump is for [`omni_exec_many`] and [`omni_batch_error`], which a v3 host
+/// cannot declare, and for `OmniStats::execs`, which now counts batch items as
+/// well as single calls — a v3 host reading it as "number of omni_exec calls"
+/// would draw a wrong conclusion from a correct number.
+///
+/// Version 3 was the callback increment: [`omni_host_fn`], [`OMNI_ERR_HOST`] and
+/// [`OMNI_ERR_REENTRANT`], none of which a v2 host could declare or recognise.
+pub const OMNI_ABI_VERSION: u32 = 4;
 
 /// The payload of an [`OmniValue`]: whichever arm its tag says is live.
 ///
@@ -254,6 +268,9 @@ impl PartialEq for OmniValue {
 pub struct OmniStats {
     /// `size_of::<OmniStats>()` as the callee understands it.
     pub size: u32,
+    /// Executions started: one per `omni_exec`, one per item of every
+    /// `omni_exec_many`. Not a count of crossings — that is what ABI v4 changed
+    /// about this field, and why the version moved.
     pub execs: u64,
     pub strings: u64,
     pub arena_bytes_in_use: u64,
@@ -285,6 +302,16 @@ const _: () = assert!(std::mem::offset_of!(OmniStats, egress_high_water) == 64);
 /// already pays for `catch_unwind`.
 pub struct OmniEngine {
     inner: RefCell<Engine>,
+    /// The most recent batch's per-item errors, in source order, `None` for an
+    /// item that succeeded. Retained so [`omni_batch_error`] can name the failure
+    /// at index 3 of 256 — the engine's own `last_error` only holds the final
+    /// item's, which is the wrong one for every other index.
+    ///
+    /// Its own cell rather than a field beside `Engine`, so writing it never
+    /// needs a `&mut OmniEngine` while a borrow derived from the same handle is
+    /// live. Cleared by `omni_exec`: after a single execution there is no current
+    /// batch, and a stale message would be worse than none.
+    batch: RefCell<Vec<Option<OmniError>>>,
 }
 
 /// The callback a host registers, and the only shape a host function may have.
@@ -551,6 +578,7 @@ pub extern "C" fn omni_engine_new() -> *mut OmniEngine {
     match catch_unwind(AssertUnwindSafe(|| {
         Box::into_raw(Box::new(OmniEngine {
             inner: RefCell::new(Engine::new()),
+            batch: RefCell::new(Vec::new()),
         }))
     })) {
         Ok(handle) => handle,
@@ -592,8 +620,9 @@ pub unsafe extern "C" fn omni_engine_free(engine: *mut OmniEngine) {
 /// `src`: several hosts hand an empty string or buffer over as a null pointer.
 ///
 /// When the result is a string, `out.payload.ptr` addresses the engine's egress
-/// block and stays readable until the next `omni_exec` on this engine — copy it
-/// out with [`omni_str_copy`] before then if you intend to keep it.
+/// block and stays readable until the next `omni_exec` or [`omni_exec_many`] on
+/// this engine — copy it out with [`omni_str_copy`] before then if you intend to
+/// keep it.
 ///
 /// # Safety
 ///
@@ -630,20 +659,174 @@ pub unsafe extern "C" fn omni_exec(
     };
     // Safety: the null check above ran, and the caller guarantees the handle is
     // live. One handle, one thread.
-    let mut engine = match borrow_mut(unsafe { &*engine }) {
+    let handle = unsafe { &*engine };
+    let mut engine = match borrow_mut(handle) {
         Ok(borrow) => borrow,
         // A host function calling `omni_exec` on the engine that is calling it.
         // Refused rather than aliased — see the module doc's third rule.
         Err(code) => return code,
     };
-    guarded(|| match engine.exec(text) {
-        Ok(value) => {
-            // Safety: `out` was checked non-null and writable.
-            unsafe { *out = encode(&engine, value) };
-            OMNI_OK
+    guarded(|| {
+        // A single execution ends the batch's currency: `omni_batch_error` must
+        // not answer with a message from a call the host has moved on from.
+        handle.batch.borrow_mut().clear();
+        match engine.exec(text) {
+            Ok(value) => {
+                // Safety: `out` was checked non-null and writable.
+                unsafe { *out = encode(&engine, value) };
+                OMNI_OK
+            }
+            Err(error) => status_for(error.kind),
         }
-        Err(error) => status_for(error.kind),
     })
+}
+
+/// Evaluate `count` programs in one crossing, writing one value and one status
+/// per item into caller-owned arrays.
+///
+/// Returns [`OMNI_OK`] when every item succeeded, and otherwise the status of the
+/// **first** item that failed. The per-item answers are in `statuses` either way:
+/// a failing item does not stop the batch, so `out[i]` and `statuses[i]` are
+/// written for every `i` in `0..count`. A failed item's value is [`OMNI_UNDEF`],
+/// and its message is available from [`omni_batch_error`] at that index.
+///
+/// All N string results are readable together when this returns, until the next
+/// `omni_exec` or `omni_exec_many` on the same engine. That is the capability a
+/// loop of single calls cannot offer, and it is why egress rewinds once here.
+///
+/// `count` of zero is a no-op returning [`OMNI_OK`]: nothing is written, nothing
+/// is reclaimed, and `sources` and `lengths` may then be null. A host polling an
+/// empty queue does not expire the results it is still holding.
+///
+/// # Safety
+///
+/// `engine` must come from [`omni_engine_new`]. `sources` must be readable for
+/// `count` pointers and `lengths` for `count` `size_t`s; each `sources[i]` must
+/// be readable for `lengths[i]` bytes and be UTF-8, or be null when that length
+/// is zero. `out` must be writable for `count` [`OmniValue`]s and `statuses` for
+/// `count` `uint32_t`s. A `lengths[i]` beyond the allocation is rejected by the
+/// size bound but is still undefined behaviour.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn omni_exec_many(
+    engine: *mut OmniEngine,
+    sources: *const *const c_char,
+    lengths: *const usize,
+    count: usize,
+    out: *mut OmniValue,
+    statuses: *mut u32,
+) -> u32 {
+    if engine.is_null() || out.is_null() || statuses.is_null() || count > MAX_BATCH {
+        return OMNI_ERR_ARG;
+    }
+    if count == 0 {
+        return OMNI_OK;
+    }
+    if sources.is_null() || lengths.is_null() {
+        return OMNI_ERR_ARG;
+    }
+    // Safety: the null checks ran and the caller guarantees a live handle.
+    let handle = unsafe { &*engine };
+    let mut engine = match borrow_mut(handle) {
+        Ok(borrow) => borrow,
+        Err(code) => return code,
+    };
+    guarded(|| {
+        // Safety: checked non-null, and the caller guarantees `count` readable
+        // elements in each array.
+        let ptrs = unsafe { slice::from_raw_parts(sources, count) };
+        let lens = unsafe { slice::from_raw_parts(lengths, count) };
+        // Every source is validated before any of them runs, so a malformed item
+        // refuses the whole call with nothing written — the same answer
+        // `omni_exec` gives for bad UTF-8, rather than a half-executed batch the
+        // host built wrong.
+        let mut texts = Vec::with_capacity(count);
+        for (&src, &len) in ptrs.iter().zip(lens) {
+            if len > MAX_SOURCE_LEN || (src.is_null() && len != 0) {
+                return OMNI_ERR_ARG;
+            }
+            let text = if len == 0 {
+                ""
+            } else {
+                // Safety: as above, `src` is readable for `len` bytes.
+                let bytes = unsafe { slice::from_raw_parts(src.cast::<u8>(), len) };
+                match std::str::from_utf8(bytes) {
+                    Ok(text) => text,
+                    Err(_) => return OMNI_ERR_ARG,
+                }
+            };
+            texts.push(text);
+        }
+
+        let items = engine.exec_many(&texts);
+        let mut batch = handle.batch.borrow_mut();
+        batch.clear();
+        let mut first = OMNI_OK;
+        for (i, item) in items.iter().enumerate() {
+            let status = match &item.error {
+                Some(error) => status_for(error.kind),
+                None => OMNI_OK,
+            };
+            // Safety: `out` and `statuses` are writable for `count` elements and
+            // `i < count`, because core returns one item per source.
+            unsafe {
+                *out.add(i) = encode(&engine, item.value);
+                *statuses.add(i) = status;
+            }
+            batch.push(item.error.clone());
+            if first == OMNI_OK {
+                first = status;
+            }
+        }
+        first
+    })
+}
+
+/// Copy the rendered error of one item of the most recent batch into `buf`.
+///
+/// Writes at most `cap - 1` bytes and always NUL-terminates, exactly as
+/// [`omni_last_error`] does, and returns the bytes written excluding the
+/// terminator. Returns 0 — writes nothing — when `index` is past the batch, when
+/// that item succeeded, when no batch is current (a single `omni_exec` ends its
+/// currency), when any pointer is null or `cap` is 0, and when called from inside
+/// a callback on this engine.
+///
+/// # Safety
+///
+/// `engine` must come from [`omni_engine_new`] or be null. `buf` must be
+/// writable for `cap` bytes or be null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn omni_batch_error(
+    engine: *const OmniEngine,
+    index: usize,
+    buf: *mut c_char,
+    cap: usize,
+) -> usize {
+    if engine.is_null() || buf.is_null() || cap == 0 {
+        return 0;
+    }
+    // Safety: checked non-null; the caller guarantees a live handle.
+    let handle = unsafe { &*engine };
+    // The same guard `omni_last_error` takes, and for the same reason: mid-
+    // evaluation the batch on record is the *previous* one, and answering from
+    // it would hand a callback a message about a call it is not inside of.
+    let _guard = match borrow(handle) {
+        Ok(guard) => guard,
+        Err(_) => return 0,
+    };
+    let batch = handle.batch.borrow();
+    let Some(Some(error)) = batch.get(index) else {
+        return 0;
+    };
+    let rendered = error.to_string();
+    let message = rendered.as_bytes();
+    let n = message.len().min(cap - 1);
+    // Safety: `buf` holds `cap` writable bytes and n < cap, so the copy and the
+    // terminator at buf[n] both stay inside it.
+    unsafe {
+        ptr::copy_nonoverlapping(message.as_ptr(), buf.cast::<u8>(), n);
+        *buf.add(n) = 0;
+    }
+    n
 }
 
 /// Evaluate `source`, requiring the result to be a number.
@@ -1087,10 +1270,10 @@ mod tests {
     }
 
     #[test]
-    fn the_abi_reports_three_and_the_header_agrees() {
+    fn the_abi_reports_four_and_the_header_agrees() {
         assert_eq!(omni_abi_version(), OMNI_ABI_VERSION);
         assert_eq!(
-            OMNI_ABI_VERSION, 3,
+            OMNI_ABI_VERSION, 4,
             "the header and both SDKs hard-code this"
         );
     }

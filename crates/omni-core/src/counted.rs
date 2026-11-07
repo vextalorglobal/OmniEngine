@@ -1,10 +1,12 @@
 //! Test-only counting allocator.
 //!
 //! Installed as the crate's `#[global_allocator]` under `cfg(test)` so a test can
-//! ask a question the arena's own counters cannot answer: *did this engine leave
-//! any bytes on the general heap?* `Arena::bytes_reserved` measures the bump
-//! blocks; it cannot see a leaked `Vec`, a `String` that never dropped, or a
-//! `Box` forgotten during a refactor.
+//! ask two questions the arena's own counters cannot answer: *did this engine
+//! leave any bytes on the general heap?* and *did it ask for any at all?*
+//! `Arena::bytes_reserved` measures the bump blocks; it cannot see a leaked
+//! `Vec`, a `String` that never dropped, or a `Box` forgotten during a refactor —
+//! and it cannot see a buffer that is allocated and freed on every execution,
+//! which nets to zero live bytes while still costing a malloc per call.
 //!
 //! The counter is per-thread, which is what makes the assertion meaningful under
 //! `cargo test`'s default harness: a global tally would move with every other
@@ -15,6 +17,7 @@ use std::cell::Cell;
 
 thread_local! {
     static LIVE: Cell<isize> = const { Cell::new(0) };
+    static CALLS: Cell<u64> = const { Cell::new(0) };
 }
 
 pub struct Counting;
@@ -26,6 +29,7 @@ unsafe impl GlobalAlloc for Counting {
         let p = unsafe { System.alloc(layout) };
         if !p.is_null() {
             record(layout.size() as isize);
+            count();
         }
         p
     }
@@ -43,6 +47,7 @@ unsafe impl GlobalAlloc for Counting {
             // Only the delta, because `System.realloc` did not free the old block
             // through `Self::dealloc` — it resized in place or moved it.
             record(new_size as isize - layout.size() as isize);
+            count();
         }
         p
     }
@@ -52,7 +57,22 @@ fn record(delta: isize) {
     LIVE.with(|c| c.set(c.get() + delta));
 }
 
+fn count() {
+    CALLS.with(|c| c.set(c.get() + 1));
+}
+
 /// Bytes this thread has allocated and not yet freed.
 pub fn live() -> isize {
     LIVE.with(Cell::get)
+}
+
+/// Allocation requests this thread has made, successful `alloc` and `realloc`
+/// both counted.
+///
+/// The second question, and the one `live` cannot answer: a steady state that
+/// allocates and frees the same buffer every execution nets to zero live bytes
+/// while still paying for a malloc each time. A warm engine that claims to be
+/// allocation-free has to show *this* number not moving.
+pub fn calls() -> u64 {
+    CALLS.with(Cell::get)
 }
