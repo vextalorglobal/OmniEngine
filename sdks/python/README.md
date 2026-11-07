@@ -8,22 +8,39 @@ itself.
 ## Install
 
 ```bash
-pip install -e sdks/python          # from a checkout of this repository
+pip install omniengine              # the release wheel: engine included, no build step
 ```
 
-The name `omniengine` is what the package metadata will publish under; the
-package is **not on PyPI yet**, so today install from the repository path (or
-`pip install /path/to/OmniEngine/sdks/python`). A regular, non-editable install
-works too, but then the SDK is outside the workspace: run inside the repo, or set
-`OMNI_ENGINE_HOME` / `OMNI_ENGINE_LIBRARY` — see below.
-
-The Python package is pure and installs anywhere. The engine is a native
-library, and this SDK does **not** bundle a binary — a wheel that ships a
-stale `.dll` is a bug nobody notices until production. Build it once:
+That name is what the metadata publishes under; **0.1.0 is not on PyPI yet**, so
+today there are two local routes:
 
 ```bash
+pip install -e sdks/python          # from a checkout, using the library you built
 cargo build -p omni-ffi
+
+pip install /path/to/omniengine-0.1.0-py3-none-win_amd64.whl   # a wheel you built
 ```
+
+A **release wheel carries the engine** in `omni/_native/<lib>`, built from the
+same tag in the same CI run. A **checkout install carries nothing** and finds
+your `target/` build at run time, which is what makes `pip install -e` work with
+no configuration.
+
+To build the release wheel yourself, let `setup.py` stage the artifact:
+
+```bash
+cargo build --release -p omni-ffi
+OMNI_NATIVE=build python -m build --wheel sdks/python
+```
+
+`OMNI_NATIVE` selects what goes in: unset/`auto` stages an existing
+`target/release/<lib>` or leaves the wheel pure, `build` runs cargo first,
+`skip` never stages (editable installs and the test suite), and a path stages
+that file. The file must carry this platform's name, load, and answer the ABI
+this SDK speaks — a mismatch fails the build. `OMNI_REQUIRE_NATIVE=1` makes
+"nothing staged" an error, which is how CI refuses to publish a wheel that
+cannot load. The result is a platform-tagged wheel; see
+`docs/GUIDE.md` section 6.6 for why CI retags it `py3-none-<platform>`.
 
 ## Point the SDK at the library
 
@@ -33,7 +50,8 @@ Tried in order:
 | --- | --- |
 | `OMNI_ENGINE_LIBRARY` | full path to `omni.dll` / `libomni.so` / `libomni.dylib` |
 | `OMNI_ENGINE_HOME` | project root; searches `target/debug`, `target/release`, `lib`, `bin` |
-| next to the package | a wheel that bundles the artifact (this one does not) |
+| `<package>/_native/<lib>` | the engine inside a release wheel |
+| next to the package | a package that ships the artifact beside `__init__.py` |
 | upward from this package | a checkout or an editable install just works |
 | upward from the current directory | run from anywhere inside the repo |
 | the bare file name | a system-wide install found by the OS loader |
@@ -203,7 +221,7 @@ the safety rule above; measure it with `engine.stats()` — or run
 ## Tests
 
 ```bash
-python sdks/python/tests/test_ffi.py        # 106 tests, stdlib unittest
+python sdks/python/tests/test_ffi.py        # 107 tests, stdlib unittest
 python sdks/python/bench.py                 # ns/call, gc/call, batch speed-up
 ```
 

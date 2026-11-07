@@ -7,14 +7,28 @@ your results are plain JavaScript values.
 ## Install
 
 ```bash
+npm install omniengine koffi         # the release tarball: five platform engines
+```
+
+The package is **not on npm yet** (0.1.0 is built and packed, not published), so
+today use one of these:
+
+```bash
 npm install ../sdks/nodejs          # a consumer project, installing from this repo
 npm install                         # inside sdks/nodejs, to run the SDK's own tests
 ```
 
-`omniengine` is the name the metadata reserves; the package is **not on npm
-yet**, so install from the repository path today. npm symlinks a `file:` install
-and Node resolves the real path, so the linked package still sits inside the
-workspace and finds the engine with no configuration.
+npm symlinks a `file:` install and Node resolves the real path, so the linked
+package still sits inside the workspace and finds your `target/` build with no
+configuration. A **release tarball carries the engine** in
+`native/<platform>-<arch>/<lib>` — `win32-x64`, `linux-x64`, `linux-arm64`,
+`darwin-x64`, `darwin-arm64` — built from the tagged commit in the same CI run.
+
+`postinstall` loads the artifact for the current machine through the same
+`loadBindings` the API uses, so the ABI and the struct layout are checked before
+your first script runs, and it never downloads anything. A missing engine is a
+warning (the normal state of a checkout install) unless
+`OMNI_STRICT_POSTINSTALL=1`; `OMNI_SKIP_POSTINSTALL=1` skips the check.
 
 `koffi` is an **optional** dependency. That is deliberate: `npm install` should
 not hard-fail on a platform koffi has no prebuild for. Instead you get a clear
@@ -27,14 +41,18 @@ npm install koffi        # if you have not got it; prebuilt, no compiler needed
 Verified working on Node 26 with koffi 3.3.6, using the prebuild bundled in the
 npm tarball — no install script has to run.
 
-## Build the engine once
+## Build the engine for a checkout
 
 ```bash
 cargo build -p omni-ffi
 ```
 
-The package does not ship a binary. A native artifact hidden inside a JS tarball
-goes stale the moment the Rust side changes, and nothing would catch it.
+A checkout install stages nothing; the wrapper finds `target/debug` on its way
+up from the package. Only a release tarball carries binaries, and a release
+tarball is packed by `prepack` — which refuses a version or ABI that disagrees
+with the workspace — so the stale-artifact failure mode is prevented at build
+time rather than by refusing to ship. `npm run pack:check` is the strict form:
+it also requires every advertised platform's engine to be present.
 
 ## Point the SDK at the library
 
@@ -44,6 +62,7 @@ Tried in order:
 | --- | --- |
 | `OMNI_ENGINE_LIBRARY` | full path to `omni.dll` / `libomni.so` / `libomni.dylib` |
 | `OMNI_ENGINE_HOME` | project root; searches `target/debug`, `target/release`, `lib`, `bin` |
+| `native/<platform>-<arch>/` | the engine inside a release tarball |
 | next to this package | a bundle that places the artifact beside `index.js` |
 | upward from this package | a checkout or a linked install |
 | upward from the current directory | run from anywhere inside the repo |
@@ -247,7 +266,7 @@ rule above. Measure it with `engine.stats()` before optimising around it.
 ```bash
 cd sdks/nodejs
 npm install koffi
-npm test                                   # 92 tests, node:test
+npm test                                   # 93 tests, node:test
 node bench.js                              # measured numbers for this machine
 ```
 

@@ -28,16 +28,19 @@ or Phase 3.
 | Phase 2 — core engine | done | 128 `omni-core` tests |
 | Phase 3 — C ABI + header | done | 45 `omni-ffi` tests, PE export table, `examples/c/embed.c` |
 | Phase 4 — extension and Linguist | done (tier 1) | `.gitattributes`, `examples/*.omni` |
-| Phase 5 — SDKs and DX | done | 92 Python + 74 Node tests, CLI, wasm scaffold |
+| Phase 5 — SDKs and DX | done | 107 Python + 93 Node tests, CLI, wasm scaffold |
 | Strings, egress memory, ABI v2 | done | 4 new exports, `omni_str_copy` + `omni_define_string` + `omni_debug_stats` + `omni_abi_version` tested from all four hosts |
 | Host callbacks, re-entrancy, ABI v3 | done | `omni_register_host_fn` + `omni_unregister_host_fn` + `omni_host_fn_count`, a `RefCell` borrow guard on every entry point, and call syntax in the parser |
 | Batch execution, benchmarks, ABI v4 | done | `omni_exec_many` + `omni_batch_error`, checkpointed arena reclamation, three zero-dependency benchmark harnesses and `scripts/bench.sh` (§4.8, §4.9) |
+| Packaging, distribution, release | done | platform wheels with the engine inside, an npm tarball with five engines, `scripts/package.py`, `scripts/check-versions.py`, `.github/workflows/release.yml` (§6.6, `docs/RELEASING.md`) |
 | Same answer from four hosts | done | `scripts/verify-all.sh` — 21 rows, all passing |
 
 ```
-cargo test --workspace        # 225 tests
-./scripts/verify-all.sh       # Rust, C, Python, Node: 42, "hello, world", ABI 4
-./scripts/bench.sh            # three hosts, one crossing each, measured
+cargo test --workspace          # 225 tests
+./scripts/verify-all.sh         # Rust, C, Python, Node: 42, "hello, world", ABI 4
+./scripts/bench.sh              # three hosts, one crossing each, measured
+python scripts/check-versions.py  # one version, one ABI across every surface
+python scripts/package.py         # a clean native archive for this platform
 ```
 
 ---
@@ -57,10 +60,11 @@ have not moved since.
 | **C:** | 100 GB total, **6.5 GB free (94 % used)** |
 | **D:** | 138 GB total, **46 GB free (68 % used)** |
 | `CARGO_HOME` | 982 MB on disk (`du`), 1,067 MB of file bytes — the registry is nearly all of it, and none of it is from this project |
-| `D:\OmniEngine\target` | 266 MB (1.3 MB of it under `target/release`, which holds the benchmark binary) |
-| `target/debug/omni.dll` | 5,577,792 bytes — 5.3 MB, and `du -h` rounds that up to 5.4M |
+| `D:\OmniEngine\target` | 351 MB (21 MB of it under `target/release`: the release library, the benchmark binary, and cargo's release deps) |
+| `target/debug/omni.dll` | 5,630,962 bytes — 5.4 MB as `du -h` reports it |
+| `target/release/omni.dll` | 1,289,387 bytes — the artifact a release package carries |
 | Rust sources | 9,271 lines (`crates/**/*.rs`) |
-| Python, JavaScript, and C sources | 6,342 lines — 2,799 Python, 3,059 JavaScript, 484 C (`sdks/` and `examples/c/`, `node_modules` excluded) |
+| Python, JavaScript, and C sources | 6,792 lines — 2,996 Python, 3,312 JavaScript, 484 C (`sdks/` and `examples/c/`, `node_modules` excluded) |
 
 **The storage premise needed correcting.** The brief said 20 GB allocated, and
 the natural reading was "keep it small on D:". D: is not the problem. C: — where
@@ -933,24 +937,31 @@ statistics on purpose — they are the engine.
 
 ## 6. Phase 5 — Developer experience and the SDKs
 
-Both SDKs are thin, both are stdlib-only or nearly so, and neither vendors the
-engine binary. A consumer installs the wrapper and points it at a library that
-already exists on their machine.
+Both SDKs are thin, both are stdlib-only or nearly so. A **release package
+carries the engine**, built from the same tag in the same CI run; a **checkout
+install** uses the library you built locally. Section 6.3 lists where each one
+looks, and section 6.6 describes the packaging itself.
 
 ### 6.1 Python
 
 ```bash
-# Today, from a checkout:
+# From PyPI, once 0.1.0 is published: a wheel with the engine inside.
+pip install omniengine
+
+# From a checkout, editable, using the local build:
+cargo build -p omni-ffi
 python -m venv .venv && source .venv/Scripts/activate   # bash on Windows
 pip install -e sdks/python
 
-# The registry name the metadata reserves, for when the package is published:
-pip install omniengine
+# Build the release wheel yourself; setup.py stages the artifact:
+OMNI_NATIVE=build python -m build --wheel sdks/python
 ```
 
-Neither package is on PyPI or npm yet. `pip install -e` and `npm install <path>`
-are what was actually run and verified here; the registry form is the intent,
-recorded in `pyproject.toml` and `package.json`, not a claim about the present.
+Neither package is on PyPI or npm yet. What was verified locally: a wheel built
+with `OMNI_NATIVE=<built lib>` and installed into a clean venv **outside the
+repository**, with no `OMNI_*` variables, evaluates `40 + 2` to `42.0` and runs
+a batch — it finds `omni/_native/omni.dll` inside its own package. The registry
+form is now a build-and-upload step (`docs/RELEASING.md`), not an open question.
 
 ```python
 from omni import Engine
@@ -1013,6 +1024,10 @@ deprecation warning on current setuptools.
 ### 6.2 Node.js
 
 ```bash
+# From npm, once 0.1.0 is published: one tarball, five platform engines.
+npm install omniengine koffi
+
+# From a checkout, where the package uses the local target/ build:
 npm install ../sdks/nodejs        # a consumer project installing from this repo
 npm install                       # inside sdks/nodejs, for the SDK's own tests
 ```
@@ -1062,6 +1077,15 @@ an `OmniLibraryError` with an actionable message when you construct an `Engine`,
 rather than as a broken install. koffi 3.3.6 was verified working on Node 26 with
 npm's install script blocked, which is the common hardened-CI configuration.
 
+The published tarball carries one directory per platform:
+`native/win32-x64/omni.dll`, `native/linux-{x64,arm64}/libomni.so`, and
+`native/darwin-{x64,arm64}/libomni.dylib`. `postinstall` loads the one for the
+current machine through the same `loadBindings` the API uses, so the ABI and the
+struct layout are checked before the first script runs, and it never downloads
+anything. A missing artifact is a warning unless `OMNI_STRICT_POSTINSTALL=1`,
+because that is the normal state of a checkout install; `OMNI_SKIP_POSTINSTALL=1`
+skips the check entirely.
+
 The alternative, `ffi-napi`, was rejected: it is unmaintained and breaks on
 modern Node. `node-gyp` was rejected because it makes every install a compile.
 
@@ -1081,37 +1105,42 @@ Identical order in both SDKs, most explicit first:
 | --- | --- | --- |
 | 1 | `OMNI_ENGINE_LIBRARY` (full path) | `OMNI_ENGINE_LIBRARY` |
 | 2 | `OMNI_ENGINE_HOME` + `target/{debug,release}`, `lib`, `bin` | same |
-| 3 | next to the package (a bundled wheel) | next to `index.js` |
-| 4 | upward from the package, `target/{debug,release}` at 6 levels | same |
-| 5 | upward from the current working directory | same |
+| 3 | `<package>/_native/<lib>` (a release wheel) | `<package>/native/<platform>-<arch>/<lib>` (a release tarball) |
+| 4 | next to the module (a wheel that puts it there) | next to `index.js` |
+| 5 | upward from the package, `target/{debug,release}` at 6 levels | same |
+| 6 | upward from the current working directory | same |
 
-The upward walks exist because an installed wheel sits in `site-packages`,
-nowhere near `D:\OmniEngine\target\debug`. The first version of the discovery
-code resolved the package's own location and found the temporary directory the
-venv happened to live in — `…\Temp\omnivenv\target\debug` — which was correct
-code answering the wrong question. Walking from the package *and* from the
-working directory is what makes an editable install, a linked install, and a run
-from inside the repo all work with no configuration.
+The upward walks exist because an installed checkout sits in `site-packages` or
+`node_modules`, nowhere near `D:\OmniEngine\target\debug`. The first version of
+the discovery code resolved the package's own location and found the temporary
+directory the venv happened to live in — `…\Temp\omnivenv\target\debug` — which
+was correct code answering the wrong question. Walking from the package *and*
+from the working directory is what makes an editable install, a linked install,
+and a run from inside the repo all work with no configuration.
 
 One subtlety worth keeping: the walk checks the starting directory *before*
 ascending. A version that ascended first could not find `<repo>/target/debug`
 when run from the repository root, which is the most common case of all. There
 are tests for both of these, in Python and in Node.
 
-Measured, with the engine built and no environment variables set:
+Measured, with no environment variables set:
 
 | How it was installed | Where the script runs | Result |
 | --- | --- | --- |
 | `pip install -e sdks/python` | anywhere | found — the package lives in the repo, so the walk reaches `target/` |
-| `pip install sdks/python` (a real wheel) | inside the repo | found — the working-directory walk reaches `target/` |
-| `pip install sdks/python` | outside the repo | **not found**, by design; set `OMNI_ENGINE_HOME` or `OMNI_ENGINE_LIBRARY` |
-| `npm install ../sdks/nodejs` | anywhere | found — npm symlinks `file:` installs, Node resolves the real path, so the package is in the repo |
+| `pip install -e sdks/python` | outside the repo | found — editable, so the package still lives in the repo |
+| `pip install dist/omniengine-0.1.0-py3-none-win_amd64.whl` (release wheel) | outside the repo | found — `omni/_native/omni.dll`, verified 2026-11-07 |
+| `npm install ../sdks/nodejs` | anywhere | found — npm symlinks `file:` installs, Node resolves the real path |
+| extracted `omniengine-0.1.0.tgz`, koffi on `NODE_PATH` | anywhere | found — `native/win32-x64/omni.dll`; `postinstall` verified ABI 4 |
 | both | anywhere, `OMNI_ENGINE_HOME=D:\OmniEngine` | found |
 
 If nothing is found, the error prints the build command, the list of paths it
-tried, and the loader's own message. That is the whole failure mode, and it is
-deliberate: a wheel that silently shipped its own stale `.dll` would be a worse
-bug, because nobody would notice until production.
+tried, and the loader's own message. The stale-binary concern that shaped the
+first four phases still decides *what* gets bundled: a checkout never stages
+`target/debug`, and a release builds the artifact from the tag being released in
+the same workflow run. The failure mode that argument protected against — a
+wrapper carrying an engine from some other commit — is prevented by the build,
+not by refusing to ship one.
 
 ### 6.4 The CLI
 
@@ -1150,6 +1179,118 @@ cargo build --target wasm32-unknown-unknown -p omni-wasm        # needs the targ
 `wasm-bindgen` is deliberately absent from `Cargo.toml`. Declaring a dependency
 that cannot compile on this machine would put an unusable entry in `Cargo.lock`.
 
+### 6.6 Packaging: what a release contains
+
+Three artifacts, and each one carries the engine it needs:
+
+| Artifact | Shape | Built by |
+| --- | --- | --- |
+| Python wheel | one per platform, `omni/_native/<lib>` inside | `setup.py` + `build`, retagged |
+| npm tarball | one for all platforms, `native/<platform>-<arch>/<lib>` ×5 | `npm pack`, `prepack` guard |
+| C archive | one per target, `lib/`, `include/`, `examples/c/`, README, LICENSE | `scripts/package.py` |
+
+**The wheel.** `pyproject.toml` is metadata and nothing else; `setup.py` exists
+to put a Rust artifact inside a Python package, which setuptools cannot do by
+itself. A `build_py` subclass stages the library after the `.py` files land, and
+`OMNI_NATIVE` chooses where it comes from:
+
+| `OMNI_NATIVE` | Behaviour |
+| --- | --- |
+| unset / `auto` | stage `target/release/<lib>` if present, else build a pure wheel |
+| `build` | run `cargo build --release -p omni-ffi`, then stage the result |
+| `skip` | never stage — editable installs and the SDK's own tests |
+| a path | stage that file or directory, after checking its name and ABI |
+
+Before copying, the file must carry this platform's name, load through
+`ctypes.CDLL`, and answer `omni_abi_version()` with the SDK's own constant, so a
+wheel cannot be built around a library built for another OS or an older commit.
+`OMNI_REQUIRE_NATIVE=1` turns "nothing staged" into a build failure; CI sets it
+so a release job cannot quietly publish a wheel that will not load. The staged
+file is declared as package data (`omni = ["_native/*"]`), because it is data to
+the Python package even though it is code to the machine.
+
+`Distribution.has_ext_modules()` returns true when an artifact will be staged,
+which is what makes setuptools emit a platform-tagged wheel instead of
+`py3-none-any`. The tag that comes out is `cp315-cp315-win_amd64` — true of the
+build interpreter, misleading for a `ctypes` package that works on every CPython
+from 3.9 — so CI retags it:
+
+```bash
+python -m wheel tags --python-tag py3 --abi-tag none --platform-tag win_amd64 \
+    omniengine-0.1.0-cp315-cp315-win_amd64.whl
+```
+
+`py3` and `none` are claims the code can keep: no C extension module is
+imported, the only platform fact is a shared library opened at run time. An
+in-tree build with `OMNI_NATIVE=skip` still produces a pure wheel, which is what
+an editable checkout install wants.
+
+Measured on this machine with the release engine:
+
+| | |
+| --- | --- |
+| `target/release/omni.dll` | 1,289,387 bytes |
+| `omniengine-0.1.0-py3-none-win_amd64.whl` | 541,369 bytes, 8 files |
+| contents | `omni/__init__.py`, `omni/_ffi.py`, `omni/_native/omni.dll`, LICENSE, METADATA, WHEEL, `top_level.txt`, RECORD |
+| install and run outside the repo, no `OMNI_*` set | `42.0`, `packaged wheel`, batch `[2.0, 'two']`; `load_library()` resolved to `site-packages\omni\_native\omni.dll` |
+
+**The npm tarball.** `files` is a whitelist — `index.js`, `lib/`, `native/`,
+`scripts/postinstall.js`, `README.md`, `LICENSE` — so a test file or a build
+leftover cannot ride along. `postinstall` loads the artifact for the current
+machine through `loadBindings`, which means the ABI and nine layout facts (three
+sizes, six offsets) are checked before the first script runs; it downloads nothing, and a missing or
+mismatched engine is a warning unless `OMNI_STRICT_POSTINSTALL=1`. `prepack`
+(which `npm pack` and `npm publish` run automatically) checks that the
+workspace, the wheel metadata and `package.json` agree on the version, that the
+three ABI constants agree, and that `native/` holds one engine per advertised
+platform — a missing engine is a warning during a developer pack, and a failure
+in `npm run pack:check`, which is the strict form CI uses.
+
+Measured, with the Windows release engine staged:
+
+| | |
+| --- | --- |
+| `npm pack --dry-run` | 8 files, 535.7 kB packed, 1.4 MB unpacked |
+| contents | `LICENSE`, `README.md`, `index.js`, `lib/bindings.js`, `lib/discover.js`, `native/win32-x64/omni.dll`, `package.json`, `scripts/postinstall.js` |
+| `postinstall` | `bundled engine verified (win32-x64, ABI 4)` |
+| extracted tarball, koffi on `NODE_PATH` | `42 | packaged npm | [ 2, 'two' ]` |
+
+The published tarball carries five engines, not one, so its packed size is
+larger than the 535.7 kB measured here; the four non-Windows libraries cannot be
+built on this machine, and no number for them is claimed. The same is true of
+the wheel: one platform is measured, the other four are produced by the
+workflow on their own runners.
+
+**The C archive.** `scripts/package.py` builds one target, stages a directory,
+and writes both formats plus a checksum:
+
+```bash
+python scripts/package.py                       # host target, release build
+python scripts/package.py --target aarch64-apple-darwin --skip-build
+```
+
+Measured for the host target (`x86_64-pc-windows-gnu`): the zip is 538,510
+bytes and the tar.gz 537,745 bytes, 6 files each — `include/omni.h`,
+`lib/omni.dll` and `lib/libomni.dll.a`, `examples/c/embed.c`, `README.md`,
+`LICENSE` — and `sha256sum -c` agrees with the `.sha256` sidecar. The shipped
+C example was compiled against the extracted archive's header and import
+library and printed `all C embedding checks passed`, so the archive is not just
+a file listing.
+
+**One workflow.** `.github/workflows/release.yml` runs on a `v*` tag (or by
+hand): a guard job, then the full test suite, then five native builds — Windows
+x64 MSVC, Linux x64, Linux arm64, macOS x64, macOS arm64 — each producing an
+archive, a wheel, and a library for the npm tarball, then the publishes and a
+GitHub release. The guard is `scripts/check-versions.py`, which reads the
+version from Cargo, `pyproject.toml` and `package.json`, the ABI from `omni.h`,
+`_ffi.py` and `bindings.js`, and the tag from `GITHUB_REF_NAME`; any
+disagreement fails the run before an artifact exists. CI sets
+`RUSTUP_TOOLCHAIN=stable` because the committed `rust-toolchain.toml` pins the
+Windows GNU host this machine uses, which is not what a Linux or macOS runner
+needs. Publishing uses PyPI Trusted Publishing (no stored password) and
+`NPM_TOKEN`; the runbook, including what to do when a publish half-succeeds, is
+`docs/RELEASING.md`.
+
 ---
 
 ## 7. Verification
@@ -1160,7 +1301,7 @@ One command, and it is the acceptance test for the whole brief:
 ./scripts/verify-all.sh
 ```
 
-Measured output on 2026-11-07, with the batch increment in it:
+Measured output on 2026-11-07, with the packaging increment in it:
 
 ```
 == OmniEngine cross-host verification ==
@@ -1174,9 +1315,9 @@ Rust tests... Shared library... omni-cli... C embedding... Python SDK... Node SD
   PASS  omni run examples/strings.omni -> hello, world 😀
   PASS  examples/c/embed.c -> 42 via omni.h
   PASS  python ctypes -> 42.0
-  PASS  python SDK tests (106 tests)
+  PASS  python SDK tests (107 tests)
   PASS  node koffi -> 42
-  PASS  node SDK tests (ℹ tests 92 ℹ pass 92 ℹ fail 0 )
+  PASS  node SDK tests (ℹ tests 93 ℹ pass 93 ℹ fail 0 )
   PASS  concat + \u{...} identical in: cli python node
   PASS  the mixed-type message survives the boundary in: cli python node c
   PASS  ABI 4 declared and read identically: header=4 C=4 python=4/lib=4 node=4/lib=4
@@ -1192,6 +1333,13 @@ Rust tests... Shared library... omni-cli... C embedding... Python SDK... Node SD
 
 All checks that could run, passed.
 ```
+
+`verify-all.sh` tests the four hosts against a checkout build. The release
+artifacts are checked separately, because they are what a consumer gets and
+nothing in the suite above touches them: a wheel installed into a clean venv
+outside the repository, an extracted npm tarball, and a C archive compiled
+against its own header. Those runs are recorded in section 6.6, with the sizes
+they produced.
 
 The last twelve rows are the ones that could not exist in one host. The string
 comparison is byte-exact — an escape decoded differently in Rust and Node passes
@@ -1223,16 +1371,16 @@ Against the brief's five phases:
 
 | Phase | Asked for | Verified by |
 | --- | --- | --- |
-| 1 | Workspace on D:, fast compiles, managed `target/` | `cargo test --workspace` 225 tests; `target/` measured at 266 MB |
+| 1 | Workspace on D:, fast compiles, managed `target/` | `cargo test --workspace` 225 tests; `target/` measured at 351 MB |
 | 2 | Ultra-fast memory-safe core, no GC | NaN-boxed 8-byte `Value` asserted for size; arena reset is O(chunks); egress rewind keeps reservations flat over 100,000 executions; no collector exists to pause |
 | 3 | C ABI callable from Python and JavaScript | same `42` and the same `hello, world 😀` from Rust, C, Python, Node; 16 exports confirmed with `objdump -p`; `omni.h` compiles warning-free under `-Wall -Wextra` |
 | 4 | A custom extension GitHub recognises | `.gitattributes` tier 1; the tier-2 limit is stated in section 5.3 rather than glossed over |
-| 5 | `pip`/`npm` SDKs that do not move the language stats | 106 + 92 SDK tests; `linguist-vendored` on `sdks/**`; no binary vendored into either package |
+| 5 | `pip`/`npm` SDKs that do not move the language stats | 107 + 93 SDK tests; `linguist-vendored` on `sdks/**`; release packages carry a CI-built engine, checkouts carry none |
 
 Test totals: **152** in `omni-core`, **59** in `omni-ffi` (18 unit, 13 in
 `tests/batch.rs`, 20 in `tests/ffi_contract.rs`, and 8 in
 `tests/host_callbacks.rs`, which drive the ABI exactly as a host does), **7** in
-`omni-cli`, **7** in `omni-wasm`, **106** Python, **92** Node. The batch and
+`omni-cli`, **7** in `omni-wasm`, **107** Python, **93** Node. The batch and
 callback suites are contract tests against the header, not unit tests of the
 implementation they sit next to.
 
@@ -1253,17 +1401,21 @@ cache and cargo's `deps` contain hardlinks.
 
 | What | Size | Where | Note |
 | --- | --- | --- | --- |
-| Source tree (excluding `target/` and `node_modules`) | 3.0 MB | D: | the whole repository, tracked files only |
-| `target/` total | **266 MB** | D: | 1.3 MB under `target/release`, which is the benchmark binary |
-| `target/debug/omni.dll` | 5.4 MB | D: | the artifact every host loads |
+| Source tree, tracked and to-be-tracked files | 1.1 MB | D: | 66 files, 0.94 MB of file bytes; excludes `target/`, `node_modules/`, `dist/` and `build/` |
+| `target/` total | **351 MB** | D: | 21 MB under `target/release`; release builds are the expensive part |
+| `target/debug/omni.dll` | 5.4 MB | D: | the artifact a checkout's hosts load |
+| `target/release/omni.dll` | 1.3 MB | D: | the artifact a release package carries |
+| `dist/` | 1.6 MB | D: | one wheel and two C archives, locally built |
 | `CARGO_HOME` | 969 MB | C: | 897 MB registry + 170 MB `bin` by file size; none of it from this project |
 | `sdks/nodejs/node_modules` | 2.9 MB | D: | koffi prebuild, gitignored |
 | Free on C: | **6.5 GB** (94 % used) | | the binding constraint |
 | Free on D: | 46 GB (68 % used) | | |
 
-`cargo clean` returns the 266 MB in a second, and it is the only routine way to
+`cargo clean` returns the 351 MB in a second, and it is the only routine way to
 do so. The knobs that keep it that size are in section 2.4: no dependencies, so
-no dependency artifacts; `debug = "line-tables-only"`, so no PDBs.
+no dependency artifacts; `debug = "line-tables-only"`, so no PDBs. A release
+build adds its own `target/release` tree on top — that is the 21 MB, and it is
+also what a wheel or an archive is made from.
 
 **Zero dependencies is a storage decision, not an aesthetic one.** `omni-core`
 and `omni-cli` have no third-party crates, so building and testing this project
@@ -1386,6 +1538,22 @@ state through `RefCell` so a re-entrant call is an error rather than an alias, a
 every host turns an exception into a message instead of an unwind. Batch execution
 then made the boundary carry several programs at once, and the three benchmark
 harnesses (4.9) turned every performance claim in this file into a quoted run.
+A fourth round packaged what existed: wheels and an npm tarball that carry the
+engine, a C archive per target, one tag-driven workflow, and a quickstart that
+fits in a minute. Nothing in that round changed the language or the ABI.
+
+Release-side, three things are deliberately unfinished rather than unknown:
+
+- **0.1.0 is packaged, not published.** The workflow builds every artifact and
+  the local runs in section 6.6 passed, but PyPI and npm have not been touched.
+  Publishing is a tag and two credentials (`docs/RELEASING.md`).
+- **Linux wheels are `manylinux_2_39`.** They are built on Ubuntu 24.04 because
+  that is the runner with the newest glibc, which makes them work on 24.04 and
+  later and *not* on 22.04. Lowering that floor means an older container, not a
+  code change.
+- **Windows arm64 is not in the matrix.** Five targets ship; that one has no
+  runner in the workflow and no artifact claimed for it.
+
 What the same memory model is still waiting for, in rough order:
 
 1. **Booleans, `nil`, `undefined` as literals.** The tags and singletons already

@@ -13,11 +13,56 @@ numbers in this repository are measured runs, not promises: `scripts/bench.sh`
 prints them for this machine. Every claim below is covered by a test that has
 been run on this machine.
 
+## Get started in 60 seconds
+
+Every path ends at the same engine and the same bytes.
+
+**Python** — standard library only; release wheels carry the engine.
+
+```bash
+pip install omniengine
+python -c "import omni; print(omni.Engine().evaluate('40 + 2'))"   # 42.0
 ```
-cargo build -p omni-ffi                          # the shared library
-cargo run -p omni-cli -- run examples/hello.omni # -> 42
-cargo run -p omni-cli -- run examples/strings.omni  # -> hello, world 😀
+
+**Node** — one native dependency (`koffi`); the package carries the engine.
+
+```bash
+npm install omniengine koffi
+node -e "const {Engine}=require('omniengine'); const e=new Engine(); console.log(e.evaluate('40 + 2')); e.close()"
 ```
+
+**C** — download the archive for your platform from the
+[releases page](https://github.com/fahim5536/OmniEngine/releases), then:
+
+```bash
+# Windows archive: MSVC import library
+cl /std:c11 /I include examples\c\embed.c lib\omni.dll.lib
+set PATH=%CD%\lib;%PATH% && embed.exe      # all embedding checks pass
+
+# Linux / macOS archive: link the shared library directly
+cc -std=c11 -I include examples/c/embed.c -L lib -lomni \
+   -Wl,-rpath,'$ORIGIN/lib' -o embed
+./embed
+```
+
+The Windows archive is built with MSVC, so its import library is
+`lib\omni.dll.lib`. This machine builds with the GNU toolchain, where the same
+example links against `lib\libomni.dll.a` — that is the C path tested in the
+checkout (`examples/c/embed.c`).
+
+**Rust / CLI** — the workspace is the source of truth:
+
+```bash
+cargo build -p omni-ffi
+cargo run -p omni-cli -- run examples/hello.omni    # -> 42
+cargo run -p omni-cli -- eval '"omni" + " " + "engine"'  # -> omni engine
+```
+
+> The first `v0.1.0` release is built by
+> [`.github/workflows/release.yml`](.github/workflows/release.yml) but has not
+> been published yet. Until it is, use the checkout commands under
+> [Verify the checkout](#verify-the-checkout); both SDKs also install from their
+> directories with `pip install sdks/python` and `npm install ./sdks/nodejs`.
 
 ## What is here
 
@@ -30,10 +75,13 @@ cargo run -p omni-cli -- run examples/strings.omni  # -> hello, world 😀
 | `sdks/python` | `omni` package on `ctypes` only — no pip dependencies at all. |
 | `sdks/nodejs` | `omniengine` package on `koffi`. |
 | `examples/` | `.omni` programs and `c/embed.c`. |
+| `scripts/package.py` | One native archive per platform: library, import library, header, example, docs. |
+| `.github/workflows/release.yml` | Tag-driven build of five platforms, platform wheels, npm tarball, PyPI and GitHub Release. |
 | `docs/GUIDE.md` | The initialization and execution guide, with measured numbers. |
+| `docs/RELEASING.md` | The release runbook: versions, secrets, artefacts, rollback. |
 | `docs/superpowers/` | The approved design specs and the implementation plan. |
 
-## Try it
+## Verify the checkout
 
 ```bash
 # Rust
@@ -60,6 +108,8 @@ Or run everything at once:
 ```bash
 ./scripts/verify-all.sh   # the same bytes from every host, ABI level, memory, batch
 ./scripts/bench.sh        # ns/exec, crossing cost, batch speed-up -- measured
+python scripts/check-versions.py   # one version, one ABI across every surface
+python scripts/package.py          # a clean native archive for this platform
 ```
 
 It checks that the same bytes come out of the same program on every host, that
@@ -153,7 +203,7 @@ in allocations: 0.00 per execution, 0.004 per *item* inside a 256-batch. Run
   this workspace fetched nothing into `~/.cargo` — the only file it touched is
   cargo's own metadata.
 - **`debug = "line-tables-only"`.** Cuts multi-gigabyte MSVC PDBs on a drive
-  with 7.6 GB free, while keeping stack traces readable.
+  with 6.5 GB free, while keeping stack traces readable.
 - **`unsafe` is four files, and they are named.** In the core it is `arena.rs`
   (the bump pointer), `object.rs` (one `write_at`, the only place a string block
   is written), and `counted.rs` (the `GlobalAlloc` trait requires it); the fourth
