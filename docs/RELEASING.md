@@ -9,7 +9,7 @@ it. The short version:
 
 ```bash
 python scripts/check-versions.py          # one version, one ABI
-./scripts/verify-all.sh                   # 348 Rust, 131 Python, 126 Node checks
+./scripts/verify-all.sh                   # 373 Rust, 140 Python, 134 Node checks
 ./scripts/fuzz.sh                         # libFuzzer if nightly, else the harness
 ./scripts/bench.sh                        # measured numbers, not regressions
 git tag v0.1.0 && git push origin v0.1.0  # the only release action

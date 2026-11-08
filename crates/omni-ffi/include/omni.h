@@ -181,7 +181,12 @@ extern "C" {
  * had grown the struct would have moved the version to 5.
  *
  * Version 3 was the callback increment: the omni_host_fn type, the three
- * registration functions, and statuses 5 and 6. */
+ * registration functions, and statuses 5 and 6.
+ *
+ * Phase 9 is additive inside version 4, exactly as the DevPack timer and the
+ * parallel entry point were: OmniProfile is a new struct, and the three
+ * profiling exports change no existing signature or layout, so a host that
+ * only calls the older functions remains correct. */
 #define OMNI_ABI_VERSION 4u
 
 /* ---- status codes: the u32 returned by every call ---- */
@@ -224,6 +229,7 @@ extern "C" {
 #define OMNI_MAX_CALL_DEPTH     64u /* nested calls one execution may reach              */
 #define OMNI_MAX_SOURCE_LEN     (256u * 1024u * 1024u) /* bytes one program may carry */
 #define OMNI_MAX_BATCH          4096u /* items one batch call may carry            */
+#define OMNI_MAX_OPCODES        64u   /* entries in an OmniProfile heatmap array   */
 
 /* The payload of an OmniValue: whichever arm its tag says is live. */
 typedef union OmniPayload {
@@ -270,6 +276,33 @@ typedef struct OmniStats {
                                  * one execution, or one whole batch        */
 } OmniStats;
 
+/* The most recent execution's profile, for omni_profile().
+ *
+ * `size` follows the OmniStats rule: written by the callee with
+ * sizeof(OmniProfile), compared by the caller against the size it compiled
+ * with. The heatmap arrays index by opcode discriminant -- omni_opcode_name()
+ * translates an index into the mnemonic a host prints. Entries at
+ * opcode_count and above are always zero.
+ *
+ * total_instructions is always the sum of opcode_calls. opcode_ns is the
+ * per-opcode self-time split and stays all-zero unless profiling was enabled
+ * with omni_engine_set_profiling(); the whole-run wall clock elapsed_ns is
+ * recorded either way. peak_bytes is the execution arena's live bytes when the
+ * run ended -- allocation is monotonic between reclamations, so that is the
+ * run's peak live heap, not reserved space. */
+typedef struct OmniProfile {
+  uint32_t size;               /* sizeof(OmniProfile), written by the callee */
+  uint32_t opcode_count;       /* live opcodes; entries past this read zero  */
+  uint64_t total_instructions; /* dispatches of the most recent execution,
+                                * failed runs included                     */
+  uint64_t elapsed_ns;         /* wall-clock ns of the chunk run, dispatch
+                                * loop only                                */
+  uint64_t peak_bytes;         /* live arena bytes at the end of the run    */
+  uint64_t reserved;           /* zero; room to grow without moving offsets */
+  uint64_t opcode_calls[OMNI_MAX_OPCODES]; /* dispatch count per opcode     */
+  uint64_t opcode_ns[OMNI_MAX_OPCODES];    /* self-time per opcode, opt-in  */
+} OmniProfile;
+
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 #define OMNI_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
 #elif defined(__cplusplus) && (__cplusplus >= 201103L)
@@ -294,6 +327,22 @@ OMNI_STATIC_ASSERT(offsetof(OmniStats, last_exec_micros) == 4,
                    "OmniStats::last_exec_micros reuses the padding at offset 4");
 OMNI_STATIC_ASSERT(offsetof(OmniStats, execs) == 8, "OmniStats::execs must stay at offset 8");
 OMNI_STATIC_ASSERT(offsetof(OmniStats, egress_high_water) == 64, "OmniStats tail must stay at 64");
+OMNI_STATIC_ASSERT(sizeof(OmniProfile) == 1064, "OmniProfile must stay 1064 bytes");
+OMNI_STATIC_ASSERT(offsetof(OmniProfile, size) == 0, "OmniProfile::size must stay at offset 0");
+OMNI_STATIC_ASSERT(offsetof(OmniProfile, opcode_count) == 4,
+                   "OmniProfile::opcode_count must stay at offset 4");
+OMNI_STATIC_ASSERT(offsetof(OmniProfile, total_instructions) == 8,
+                   "OmniProfile::total_instructions must stay at offset 8");
+OMNI_STATIC_ASSERT(offsetof(OmniProfile, elapsed_ns) == 16,
+                   "OmniProfile::elapsed_ns must stay at offset 16");
+OMNI_STATIC_ASSERT(offsetof(OmniProfile, peak_bytes) == 24,
+                   "OmniProfile::peak_bytes must stay at offset 24");
+OMNI_STATIC_ASSERT(offsetof(OmniProfile, reserved) == 32,
+                   "OmniProfile::reserved must stay at offset 32");
+OMNI_STATIC_ASSERT(offsetof(OmniProfile, opcode_calls) == 40,
+                   "OmniProfile::opcode_calls must stay at offset 40");
+OMNI_STATIC_ASSERT(offsetof(OmniProfile, opcode_ns) == 552,
+                   "OmniProfile::opcode_ns must stay at offset 552");
 
 /* Opaque. Never dereference; the layout is a Rust private detail. */
 typedef struct OmniEngine OmniEngine;
@@ -585,6 +634,32 @@ OMNI_API uint32_t OMNI_CALL omni_debug_stats(OmniEngine *engine,
 OMNI_API size_t OMNI_CALL omni_last_error(OmniEngine *engine,
                                           char *buf,
                                           size_t cap);
+
+/* Turn per-opcode self-timing on (enabled != 0) or off for this engine.
+ *
+ * The opcode_calls counts and elapsed_ns in omni_profile() are recorded on
+ * every execution; only the opcode_ns split costs a clock read per dispatch,
+ * which is why it is opt-in. Returns OMNI_OK, or OMNI_ERR_ARG for a NULL
+ * engine and OMNI_ERR_REENTRANT from inside a callback on this handle. */
+OMNI_API uint32_t OMNI_CALL omni_engine_set_profiling(OmniEngine *engine,
+                                                      uint32_t enabled);
+
+/* Fill *out with the most recent execution's profile and OMNI_OK, or return
+ * OMNI_ERR_ARG if engine or out is NULL.
+ *
+ * out->size is always rewritten by the callee: compare it with
+ * sizeof(OmniProfile) before believing the rest, as with omni_debug_stats().
+ * From inside a callback on this handle it returns OMNI_ERR_REENTRANT. */
+OMNI_API uint32_t OMNI_CALL omni_profile(OmniEngine *engine,
+                                         OmniProfile *out);
+
+/* Copy the mnemonic of opcode `index` into buf, writing at most cap - 1 bytes
+ * and always NUL-terminating. Returns the bytes written, excluding the
+ * terminator; an index of opcode_count or above writes an empty string and
+ * returns 0, as do a NULL buf and a cap of 0. */
+OMNI_API size_t OMNI_CALL omni_opcode_name(uint32_t index,
+                                           char *buf,
+                                           size_t cap);
 
 /* Test hook: deliberately panics inside the engine so a host can verify the
  * boundary returns OMNI_ERR_PANIC instead of crashing the process.

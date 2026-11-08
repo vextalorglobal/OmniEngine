@@ -105,6 +105,13 @@ const MAX_CALL_DEPTH = 64;
 /** Items one `omni_exec_many` call may carry. */
 const MAX_BATCH = 4096;
 
+/**
+ * Length of the fixed per-opcode arrays in `OmniProfile`. Mirrors
+ * `OMNI_MAX_OPCODES`: the engine writes only the first `opcode_count` slots,
+ * and the rest stay zero.
+ */
+const MAX_OPCODES = 64;
+
 /** What a host callback returns: success, or failure with a message in `out`. */
 const HOST_OK = 0;
 const HOST_ERR = 1;
@@ -227,6 +234,20 @@ function declare(koffi, lib, resolvedPath) {
     egress_high_water: 'uint64_t',
   });
 
+  // The profiler's answer struct: two fixed 64-slot arrays of u64, so 1064
+  // bytes exactly. Declared unconditionally -- the struct exists in this SDK
+  // even when the loaded library predates the exports that fill it.
+  const OmniProfile = koffi.struct('OmniProfile', {
+    size: 'uint32_t',
+    opcode_count: 'uint32_t',
+    total_instructions: 'uint64_t',
+    elapsed_ns: 'uint64_t',
+    peak_bytes: 'uint64_t',
+    reserved: 'uint64_t',
+    opcode_calls: koffi.array('uint64_t', MAX_OPCODES),
+    opcode_ns: koffi.array('uint64_t', MAX_OPCODES),
+  });
+
   // The callback signature. Declared as a proto so koffi knows how to build the
   // trampoline when `koffi.register` is called on a JavaScript function. It is
   // never named inside a signature string below -- koffi rejects a proto used as
@@ -250,6 +271,15 @@ function declare(koffi, lib, resolvedPath) {
     ['koffi.offsetof(OmniStats, last_exec_micros)', koffi.offsetof(OmniStats, 'last_exec_micros'), 4],
     ['koffi.offsetof(OmniStats, execs)', koffi.offsetof(OmniStats, 'execs'), 8],
     ['koffi.offsetof(OmniStats, egress_high_water)', koffi.offsetof(OmniStats, 'egress_high_water'), 64],
+    ['koffi.sizeof(OmniProfile)', koffi.sizeof(OmniProfile), 1064],
+    ['koffi.offsetof(OmniProfile, size)', koffi.offsetof(OmniProfile, 'size'), 0],
+    ['koffi.offsetof(OmniProfile, opcode_count)', koffi.offsetof(OmniProfile, 'opcode_count'), 4],
+    ['koffi.offsetof(OmniProfile, total_instructions)', koffi.offsetof(OmniProfile, 'total_instructions'), 8],
+    ['koffi.offsetof(OmniProfile, elapsed_ns)', koffi.offsetof(OmniProfile, 'elapsed_ns'), 16],
+    ['koffi.offsetof(OmniProfile, peak_bytes)', koffi.offsetof(OmniProfile, 'peak_bytes'), 24],
+    ['koffi.offsetof(OmniProfile, reserved)', koffi.offsetof(OmniProfile, 'reserved'), 32],
+    ['koffi.offsetof(OmniProfile, opcode_calls)', koffi.offsetof(OmniProfile, 'opcode_calls'), 40],
+    ['koffi.offsetof(OmniProfile, opcode_ns)', koffi.offsetof(OmniProfile, 'opcode_ns'), 552],
   ];
   for (const [name, actual, expected] of layout) {
     if (actual !== expected) {
@@ -301,6 +331,29 @@ function declare(koffi, lib, resolvedPath) {
     execParallel = null;
   }
 
+  // Additive in ABI 4 too, after the profiler shipped. A library built before
+  // Phase 9 keeps every other call; Engine.setProfiling() and Engine.profile()
+  // turn the missing symbol into one clear error at the moment profiling is
+  // asked for, not at load time.
+  let setProfiling = null;
+  try {
+    setProfiling = lib.func('uint32_t omni_engine_set_profiling(void *engine, uint32_t enabled)');
+  } catch {
+    setProfiling = null;
+  }
+  let profile = null;
+  try {
+    profile = lib.func('uint32_t omni_profile(void *engine, OmniProfile *out)');
+  } catch {
+    profile = null;
+  }
+  let opcodeName = null;
+  try {
+    opcodeName = lib.func('size_t omni_opcode_name(uint32_t index, char *buf, size_t cap)');
+  } catch {
+    opcodeName = null;
+  }
+
   const bindings = {
     koffi,
     lib,
@@ -308,6 +361,7 @@ function declare(koffi, lib, resolvedPath) {
     OmniPayload,
     OmniValue,
     OmniStats,
+    OmniProfile,
     OmniHostFn,
     statusName,
     tagName,
@@ -320,6 +374,7 @@ function declare(koffi, lib, resolvedPath) {
     MAX_ARGS,
     MAX_CALL_DEPTH,
     MAX_BATCH,
+    MAX_OPCODES,
     HOST_OK,
     HOST_ERR,
     UPDATE,
@@ -343,6 +398,9 @@ function declare(koffi, lib, resolvedPath) {
     // and validates every source before running any of them.
     execMany: lib.func('uint32_t omni_exec_many(void *engine, const void *sources, const void *lengths, size_t count, void *out, void *statuses)'),
     execParallel,
+    setProfiling,
+    profile,
+    opcodeName,
     // `char *` for the destination: koffi needs to know it is writable, and a
     // Buffer is what the caller owns. The ABI writes no NUL and reads no NUL --
     // `cap` and the return value are the whole contract.
@@ -402,6 +460,7 @@ module.exports = {
   MAX_ARGS,
   MAX_CALL_DEPTH,
   MAX_BATCH,
+  MAX_OPCODES,
   HOST_OK,
   HOST_ERR,
   UPDATE,

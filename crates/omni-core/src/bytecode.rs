@@ -31,6 +31,7 @@ use crate::lexer::BinOp;
 pub(crate) enum OpCode {
     PushNumber,
     PushStr,
+    PushFolded,
     PushNil,
     PushUndef,
     Load,
@@ -51,12 +52,50 @@ pub(crate) enum OpCode {
     Import,
 }
 
+/// How many opcodes exist. The size of every profile heatmap array.
+pub const OPCODE_COUNT: usize = 21;
+
+/// Every opcode in discriminant order, indexed the way profile heatmaps and
+/// [`opcode_name`] are. A test keeps this table and the enum in lockstep.
+pub(crate) const OPCODES: [OpCode; OPCODE_COUNT] = [
+    OpCode::PushNumber,
+    OpCode::PushStr,
+    OpCode::PushFolded,
+    OpCode::PushNil,
+    OpCode::PushUndef,
+    OpCode::Load,
+    OpCode::Store,
+    OpCode::Pop,
+    OpCode::Add,
+    OpCode::Sub,
+    OpCode::Mul,
+    OpCode::Div,
+    OpCode::Mod,
+    OpCode::Eq,
+    OpCode::Ne,
+    OpCode::Neg,
+    OpCode::Jump,
+    OpCode::JumpIfFalse,
+    OpCode::Call,
+    OpCode::Ret,
+    OpCode::Import,
+];
+
+/// The mnemonic for a heatmap index, or `None` past [`OPCODE_COUNT`].
+///
+/// This is how a foreign host turns a profile's array indices into names
+/// without shipping its own table; the FFI wraps it as `omni_opcode_name`.
+pub fn opcode_name(index: u32) -> Option<&'static str> {
+    OPCODES.get(index as usize).map(|op| op.mnemonic())
+}
+
 #[allow(dead_code)]
 impl OpCode {
     pub(crate) fn mnemonic(self) -> &'static str {
         match self {
             OpCode::PushNumber => "PUSH_NUMBER",
             OpCode::PushStr => "PUSH_STR",
+            OpCode::PushFolded => "PUSH_FOLDED",
             OpCode::PushNil => "PUSH_NIL",
             OpCode::PushUndef => "PUSH_UNDEF",
             OpCode::Load => "LOAD",
@@ -88,6 +127,7 @@ impl OpCode {
         Some(match self {
             OpCode::PushNumber
             | OpCode::PushStr
+            | OpCode::PushFolded
             | OpCode::PushNil
             | OpCode::PushUndef
             | OpCode::Load
@@ -113,9 +153,10 @@ impl OpCode {
 pub(crate) struct Instr {
     pub op: OpCode,
     /// Source span for literals and imports, name offset for loads/stores/calls,
-    /// jump target for branches, and unused otherwise.
+    /// jump target for branches, the low 32 bits of a folded `f64` for
+    /// [`OpCode::PushFolded`], and unused otherwise.
     pub a: u32,
-    /// Length for source spans and names.
+    /// Length for source spans and names, the high 32 bits of a folded `f64`.
     pub b: u32,
     /// Argument count for `Call`.
     pub c: u32,
@@ -464,6 +505,10 @@ pub(crate) fn disassemble(chunk: &Chunk, source: &str) -> String {
                     text.to_string()
                 }
             }
+            OpCode::PushFolded => format!(
+                "{}",
+                f64::from_bits(u64::from(instr.a) | (u64::from(instr.b) << 32))
+            ),
             OpCode::Load | OpCode::Store => chunk.name(instr).to_string(),
             OpCode::Call => format!("{}({})", chunk.name(instr), instr.c),
             OpCode::Jump | OpCode::JumpIfFalse => format!("-> {}", instr.a),
@@ -625,11 +670,28 @@ mod tests {
     #[test]
     fn stack_effects_describe_the_fixed_instructions() {
         assert_eq!(OpCode::PushNumber.stack_effect(), Some((0, 1)));
+        assert_eq!(OpCode::PushFolded.stack_effect(), Some((0, 1)));
         assert_eq!(OpCode::Add.stack_effect(), Some((2, 1)));
         assert_eq!(OpCode::Store.stack_effect(), Some((1, 1)));
         assert_eq!(OpCode::JumpIfFalse.stack_effect(), Some((1, 0)));
         assert_eq!(OpCode::Call.stack_effect(), None);
         assert_eq!(OpCode::Ret.stack_effect(), None);
+    }
+
+    #[test]
+    fn the_opcode_table_names_every_opcode_in_discriminant_order() {
+        for (index, op) in OPCODES.iter().copied().enumerate() {
+            assert_eq!(
+                op as usize,
+                index,
+                "{} sits at {}",
+                op.mnemonic(),
+                op as usize
+            );
+            assert_eq!(opcode_name(index as u32), Some(op.mnemonic()));
+        }
+        assert_eq!(opcode_name(OPCODE_COUNT as u32), None);
+        assert_eq!(opcode_name(u32::MAX), None);
     }
 
     #[test]

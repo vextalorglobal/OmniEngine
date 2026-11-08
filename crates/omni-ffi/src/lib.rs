@@ -300,6 +300,70 @@ const _: () = assert!(std::mem::offset_of!(OmniStats, last_exec_micros) == 4);
 const _: () = assert!(std::mem::offset_of!(OmniStats, execs) == 8);
 const _: () = assert!(std::mem::offset_of!(OmniStats, egress_high_water) == 64);
 
+/// How many entries [`OmniProfile`]'s heatmap arrays hold. Larger than any
+/// realistic instruction set, so the struct can grow its table without moving
+/// the ABI; the live count is `opcode_count`, and entries past it read zero.
+pub const OMNI_MAX_OPCODES: usize = 64;
+
+/// The most recent execution's profile, as the host reads it.
+///
+/// `size` follows the [`OmniStats`] rule: written by the callee, compared by
+/// the caller against the size it compiled with. The heatmap indices are the
+/// core's opcode discriminants — [`omni_opcode_name`] translates one into the
+/// mnemonic the host prints.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OmniProfile {
+    /// `size_of::<OmniProfile>()` as the callee understands it.
+    pub size: u32,
+    /// Live opcodes the core defines; entries below this index mean something,
+    /// the rest are always zero.
+    pub opcode_count: u32,
+    /// Instructions dispatched by the most recent execution, failed ones
+    /// included. Always the sum of `opcode_calls`.
+    pub total_instructions: u64,
+    /// Wall-clock nanoseconds of the most recent chunk run, dispatch loop only.
+    pub elapsed_ns: u64,
+    /// Bytes the execution arena held when the run ended: the execution's peak
+    /// live heap, not reserved space.
+    pub peak_bytes: u64,
+    /// Zero today; kept so a future field can grow the struct without moving
+    /// every offset behind it.
+    pub reserved: u64,
+    /// One dispatch count per opcode index. Always recorded.
+    pub opcode_calls: [u64; OMNI_MAX_OPCODES],
+    /// Self-time per opcode in nanoseconds, zero unless profiling was enabled
+    /// for that execution.
+    pub opcode_ns: [u64; OMNI_MAX_OPCODES],
+}
+
+const _: () = assert!(std::mem::size_of::<OmniProfile>() == 1064);
+const _: () = assert!(std::mem::align_of::<OmniProfile>() == 8);
+const _: () = assert!(std::mem::offset_of!(OmniProfile, size) == 0);
+const _: () = assert!(std::mem::offset_of!(OmniProfile, opcode_count) == 4);
+const _: () = assert!(std::mem::offset_of!(OmniProfile, total_instructions) == 8);
+const _: () = assert!(std::mem::offset_of!(OmniProfile, elapsed_ns) == 16);
+const _: () = assert!(std::mem::offset_of!(OmniProfile, peak_bytes) == 24);
+const _: () = assert!(std::mem::offset_of!(OmniProfile, reserved) == 32);
+const _: () = assert!(std::mem::offset_of!(OmniProfile, opcode_calls) == 40);
+const _: () = assert!(std::mem::offset_of!(OmniProfile, opcode_ns) == 552);
+
+// `[u64; 64]` has no std `Default`, and the derive needs one for the arrays.
+impl Default for OmniProfile {
+    fn default() -> OmniProfile {
+        OmniProfile {
+            size: 0,
+            opcode_count: 0,
+            total_instructions: 0,
+            elapsed_ns: 0,
+            peak_bytes: 0,
+            reserved: 0,
+            opcode_calls: [0u64; OMNI_MAX_OPCODES],
+            opcode_ns: [0u64; OMNI_MAX_OPCODES],
+        }
+    }
+}
+
 /// An opaque engine handle.
 ///
 /// Has no `#[repr(C)]` because C never looks inside it, and `Engine` owns its
@@ -1283,6 +1347,109 @@ pub unsafe extern "C" fn omni_last_error(
         *buf.add(n) = 0;
     }
     n
+}
+
+/// Turn per-opcode self-timing on (`enabled != 0`) or off for this engine.
+///
+/// The counts in [`omni_profile`] are always recorded; only the nanosecond
+/// split costs anything, which is why it is opt-in. Returns [`OMNI_OK`], or
+/// [`OMNI_ERR_ARG`] for a null engine and [`OMNI_ERR_REENTRANT`] from inside a
+/// callback on the same handle.
+///
+/// # Safety
+///
+/// `engine` must come from [`omni_engine_new`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn omni_engine_set_profiling(engine: *mut OmniEngine, enabled: u32) -> u32 {
+    if engine.is_null() {
+        return OMNI_ERR_ARG;
+    }
+    // Safety: the null check above ran, and the caller guarantees the handle is
+    // live.
+    let mut engine = match borrow_mut(unsafe { &*engine }) {
+        Ok(engine) => engine,
+        Err(code) => return code,
+    };
+    engine.set_profiling(enabled != 0);
+    OMNI_OK
+}
+
+/// Copy the most recent execution's profile into caller-owned storage.
+///
+/// Reads through the shared borrow, so it may be called any time the handle is
+/// free. From inside a callback on the same handle it answers
+/// [`OMNI_ERR_REENTRANT`], like every other read; either way the profile
+/// describes the *last completed* execution. Returns [`OMNI_OK`], or
+/// [`OMNI_ERR_ARG`] for a null argument.
+///
+/// `out->size` is always rewritten by the callee: compare it with
+/// `sizeof(OmniProfile)` before believing the rest, as with [`OmniStats`].
+///
+/// # Safety
+///
+/// `engine` must come from [`omni_engine_new`]; `out` must be writable for
+/// `size_of::<OmniProfile>()` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn omni_profile(engine: *mut OmniEngine, out: *mut OmniProfile) -> u32 {
+    if engine.is_null() || out.is_null() {
+        return OMNI_ERR_ARG;
+    }
+    let profile = {
+        // Safety: the null check above ran, and the caller guarantees the handle
+        // is live.
+        let engine = match borrow(unsafe { &*engine }) {
+            Ok(engine) => engine,
+            Err(code) => return code,
+        };
+        let profile = engine.profile();
+        let mut calls = [0u64; OMNI_MAX_OPCODES];
+        let mut ns = [0u64; OMNI_MAX_OPCODES];
+        let count = profile.opcode_calls.len().min(OMNI_MAX_OPCODES);
+        calls[..count].copy_from_slice(&profile.opcode_calls[..count]);
+        ns[..count].copy_from_slice(&profile.opcode_ns[..count]);
+        OmniProfile {
+            size: std::mem::size_of::<OmniProfile>() as u32,
+            opcode_count: omni_core::OPCODE_COUNT as u32,
+            total_instructions: profile.total_instructions,
+            elapsed_ns: profile.elapsed_ns,
+            peak_bytes: profile.peak_bytes,
+            reserved: 0,
+            opcode_calls: calls,
+            opcode_ns: ns,
+        }
+    };
+    // Safety: `out` was checked non-null and writable for the struct's own size,
+    // and `OmniProfile` is `Copy` with no drop.
+    unsafe { *out = profile };
+    OMNI_OK
+}
+
+/// Copy the mnemonic of opcode `index` into caller-owned storage.
+///
+/// Writes at most `cap - 1` bytes and always NUL-terminates, so a too-small
+/// buffer truncates instead of overflowing. Returns the number of bytes written
+/// excluding the terminator; an unknown index writes an empty string and
+/// returns 0, like a null `buf` or a `cap` of 0.
+///
+/// # Safety
+///
+/// `buf` must be writable for `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn omni_opcode_name(index: u32, buf: *mut c_char, cap: usize) -> usize {
+    if buf.is_null() || cap == 0 {
+        return 0;
+    }
+    guarded_len(|| {
+        // Safety: the caller promises `buf` is writable for `cap` bytes, and the
+        // copy below never writes past `cap`.
+        let name = omni_core::opcode_name(index).map_or(&[][..], str::as_bytes);
+        let n = name.len().min(cap - 1);
+        unsafe {
+            ptr::copy_nonoverlapping(name.as_ptr(), buf.cast::<u8>(), n);
+            *buf.add(n) = 0;
+        }
+        n
+    })
 }
 
 /// Test hook that proves the panic boundary is wired, from Rust or from a host.

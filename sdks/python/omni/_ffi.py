@@ -65,6 +65,7 @@ __all__ = [
     "MAX_ARGS",
     "MAX_CALL_DEPTH",
     "MAX_BATCH",
+    "OMNI_MAX_OPCODES",
     "OMNI_ABI_VERSION",
     "OMNI_HOST_OK",
     "OMNI_HOST_ERR",
@@ -80,6 +81,8 @@ __all__ = [
     "OmniValue",
     "OmniStats",
     "Stats",
+    "OmniProfile",
+    "Profile",
     "RawEngine",
     "HostFunction",
     "OmniError",
@@ -181,6 +184,11 @@ MAX_CALL_DEPTH = 64
 #: ``OMNI_MAX_BATCH``: a boundary bound on how many pointers the engine will read
 #: from a host array, not a limit of the language.
 MAX_BATCH = 4096
+
+#: Length of the fixed opcode-call and opcode-nanosecond arrays in
+#: ``OmniProfile``. Mirrors ``OMNI_MAX_OPCODES``; the engine writes only the
+#: first ``opcode_count`` slots, and the rest stay zero.
+OMNI_MAX_OPCODES = 64
 
 
 #: What a host function receives and returns: the arguments the script passed,
@@ -297,9 +305,51 @@ class Stats:
     egress_high_water: int
 
 
+class OmniProfile(Structure):
+    """Mirror of ``OmniProfile``: what one execution cost, at opcode granularity.
+
+    The two fixed arrays hold one slot per opcode the engine could ever name
+    (``OMNI_MAX_OPCODES`` of them); only the first ``opcode_count`` slots are
+    written, so the tail is always zero.
+    """
+
+    _fields_ = [
+        ("size", c_uint32),
+        ("opcode_count", c_uint32),
+        ("total_instructions", c_uint64),
+        ("elapsed_ns", c_uint64),
+        ("peak_bytes", c_uint64),
+        ("reserved", c_uint64),
+        ("opcode_calls", c_uint64 * OMNI_MAX_OPCODES),
+        ("opcode_ns", c_uint64 * OMNI_MAX_OPCODES),
+    ]
+
+
+@dataclass(frozen=True)
+class Profile:
+    """What the most recent execution cost, copied out of :class:`OmniProfile`.
+
+    ``opcode_calls`` and ``opcode_ns`` are keyed by opcode mnemonic (names the
+    engine itself reports through ``omni_opcode_name``), and contain an entry
+    for every opcode this build knows -- including the ones the program never
+    used, whose counts are 0. That is deliberate: a heatmap you can sum without
+    missing a category, and a table every build fills the same way.
+
+    ``opcode_ns`` is all zeros unless profiling was enabled on the engine
+    before the execution ran; the call counts and the three scalar counters are
+    always recorded.
+    """
+
+    total_instructions: int
+    elapsed_ns: int
+    peak_bytes: int
+    opcode_calls: dict[str, int]
+    opcode_ns: dict[str, int]
+
+
 # Fail loudly at import time if the struct ever drifts from the Rust layout,
-# instead of returning garbage numbers at run time. These are the same eleven
-# facts the Rust side asserts and omni.h states with _Static_assert; a Python
+# instead of returning garbage numbers at run time. These are the same facts
+# the Rust side asserts and omni.h states with _Static_assert; a Python
 # that disagrees says the SDK and the compiled library are out of sync.
 _LAYOUT = [
     ("ctypes.sizeof(OmniValue)", ctypes.sizeof(OmniValue), 16),
@@ -312,6 +362,15 @@ _LAYOUT = [
     ("OmniStats.last_exec_micros.offset", OmniStats.last_exec_micros.offset, 4),
     ("OmniStats.execs.offset", OmniStats.execs.offset, 8),
     ("OmniStats.egress_high_water.offset", OmniStats.egress_high_water.offset, 64),
+    ("ctypes.sizeof(OmniProfile)", ctypes.sizeof(OmniProfile), 1064),
+    ("OmniProfile.size.offset", OmniProfile.size.offset, 0),
+    ("OmniProfile.opcode_count.offset", OmniProfile.opcode_count.offset, 4),
+    ("OmniProfile.total_instructions.offset", OmniProfile.total_instructions.offset, 8),
+    ("OmniProfile.elapsed_ns.offset", OmniProfile.elapsed_ns.offset, 16),
+    ("OmniProfile.peak_bytes.offset", OmniProfile.peak_bytes.offset, 24),
+    ("OmniProfile.reserved.offset", OmniProfile.reserved.offset, 32),
+    ("OmniProfile.opcode_calls.offset", OmniProfile.opcode_calls.offset, 40),
+    ("OmniProfile.opcode_ns.offset", OmniProfile.opcode_ns.offset, 552),
 ]
 for _name, _actual, _expected in _LAYOUT:
     if _actual != _expected:  # pragma: no cover - layout regression
@@ -590,6 +649,20 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
             c_size_t,
         ]
         lib.omni_check_update.restype = c_int32
+
+    # Additive in ABI 4, like omni_exec_parallel and omni_check_update before
+    # them. A library built before the profiler existed still serves every
+    # other call; RawEngine.set_profiling() and RawEngine.profile() turn the
+    # missing symbol into one clear error at the moment profiling is asked for.
+    if hasattr(lib, "omni_engine_set_profiling"):
+        lib.omni_engine_set_profiling.argtypes = [c_void_p, c_uint32]
+        lib.omni_engine_set_profiling.restype = c_uint32
+    if hasattr(lib, "omni_profile"):
+        lib.omni_profile.argtypes = [c_void_p, POINTER(OmniProfile)]
+        lib.omni_profile.restype = c_uint32
+    if hasattr(lib, "omni_opcode_name"):
+        lib.omni_opcode_name.argtypes = [c_uint32, POINTER(ctypes.c_char), c_size_t]
+        lib.omni_opcode_name.restype = c_size_t
     return lib
 
 
@@ -1097,6 +1170,73 @@ class RawEngine:
             egress_bytes_in_use=out.egress_bytes_in_use,
             egress_bytes_reserved=out.egress_bytes_reserved,
             egress_high_water=out.egress_high_water,
+        )
+
+    def set_profiling(self, enabled: bool) -> None:
+        """Turn per-opcode nanosecond timing on or off for later executions.
+
+        The call counts and scalar counters are always recorded; this switch
+        only controls the ``opcode_ns`` split, which costs a timer read per
+        opcode and is off by default.
+
+        Raises:
+            OmniLibraryError: the loaded library predates the profiler exports.
+            OmniError: the engine refused the call.
+        """
+        function = getattr(self._lib, "omni_engine_set_profiling", None)
+        if function is None:
+            raise OmniLibraryError(
+                "the loaded OmniEngine library predates the profiler "
+                "(omni_engine_set_profiling). Rebuild it with:\n"
+                "    cargo build -p omni-ffi"
+            )
+        status = function(self._handle, 1 if enabled else 0)
+        if status != OMNI_OK:
+            raise OmniError(status, self.last_error())
+
+    def profile(self) -> Profile:
+        """What the most recent execution cost, at opcode granularity.
+
+        Always describes the *last* execution on this engine, whatever it was:
+        a single :meth:`exec`, one item of a batch, or a failure. A fresh
+        engine reports all zeros with ``elapsed_ns == 0``.
+
+        Raises:
+            OmniLibraryError: the loaded library predates the profiler exports.
+            OmniError: the engine refused the call.
+        """
+        function = getattr(self._lib, "omni_profile", None)
+        names = getattr(self._lib, "omni_opcode_name", None)
+        if function is None or names is None:
+            raise OmniLibraryError(
+                "the loaded OmniEngine library predates the profiler "
+                "(omni_profile). Rebuild it with:\n    cargo build -p omni-ffi"
+            )
+        out = OmniProfile()
+        status = function(self._handle, byref(out))
+        if status != OMNI_OK:
+            raise OmniError(status, self.last_error())
+        if out.size != ctypes.sizeof(OmniProfile):
+            raise OmniError(
+                OMNI_ERR_ARG,
+                f"the library says OmniProfile is {out.size} bytes; this SDK "
+                f"reads {ctypes.sizeof(OmniProfile)}",
+            )
+        count = min(int(out.opcode_count), OMNI_MAX_OPCODES)
+        buf = ctypes.create_string_buffer(64)
+        calls: dict[str, int] = {}
+        nanos: dict[str, int] = {}
+        for index in range(count):
+            written = names(index, buf, 64)
+            name = buf.raw[:written].decode("utf-8", "replace") if written else f"opcode-{index}"
+            calls[name] = out.opcode_calls[index]
+            nanos[name] = out.opcode_ns[index]
+        return Profile(
+            total_instructions=out.total_instructions,
+            elapsed_ns=out.elapsed_ns,
+            peak_bytes=out.peak_bytes,
+            opcode_calls=calls,
+            opcode_ns=nanos,
         )
 
     def last_error(self, cap: int = 4096) -> str:

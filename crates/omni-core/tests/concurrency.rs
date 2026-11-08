@@ -36,8 +36,10 @@ fn sixty_four_threads_run_engines_under_strict_gas() {
 
                 // A long program must fail inside *this* engine's gas, and a
                 // good program after it must still run: one exhausted item
-                // cannot poison the context.
-                let long = format!("1{}", " + 1".repeat(6_000));
+                // cannot poison the context. The chain names a variable so the
+                // optimizer cannot fold it away — gas must still burn one
+                // instruction per term.
+                let long = format!("let x = 1\nx{}", " + 1".repeat(6_000));
                 let error = engine.exec(&long).unwrap_err();
                 assert_eq!(error.kind, ErrorKind::Runtime);
                 assert!(
@@ -120,7 +122,8 @@ fn a_fork_copies_configuration_but_not_execution_history() {
 fn parallel_batches_preserve_order_and_isolate_failures() {
     let mut engine = Engine::new();
     engine.set_step_limit(400);
-    let long = format!("1{}", " + 1".repeat(500));
+    // Names a variable so the optimizer cannot fold the chain into one push.
+    let long = format!("let x = 1\nx{}", " + 1".repeat(500));
     let sources = ["1 + 1", "1 / 0", long.as_str(), "\"alpha\"", "2 * 21"];
 
     let items = engine.exec_parallel(&sources, 4);

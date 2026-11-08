@@ -83,6 +83,9 @@ const VERSION = '0.1.0';
 /** Default size for the buffer that error text is copied into. */
 const ERROR_BUFFER_SIZE = 4096;
 
+/** Room for one opcode mnemonic; the longest is well under 32 bytes. */
+const OPCODE_NAME_BUFFER_SIZE = 64;
+
 /** Where a release check looks when the caller names nothing else. */
 const DEFAULT_UPDATE_URL =
   'https://github.com/fahim5536/omniengine/releases/latest/download/omni-update.json';
@@ -151,6 +154,8 @@ class Engine {
     this._valueOut = this._b.koffi.alloc(this._b.OmniValue, 1);
     this._numberOut = this._b.koffi.alloc('double', 1);
     this._statsOut = this._b.koffi.alloc(this._b.OmniStats, 1);
+    this._profileOut = this._b.koffi.alloc(this._b.OmniProfile, 1);
+    this._opcodeNameBuf = Buffer.alloc(OPCODE_NAME_BUFFER_SIZE);
     this._errorBuf = Buffer.alloc(ERROR_BUFFER_SIZE);
     // Batch scratch, grown once to the largest batch this engine has been handed
     // and reused after that. koffi passes a TypedArray's own memory for a
@@ -691,6 +696,82 @@ class Engine {
   }
 
   /**
+   * Turn per-opcode nanosecond timing on or off for later evaluations.
+   *
+   * The instruction counts and the scalar counters are always recorded; this
+   * switch only controls the per-opcode timing split, which costs a timer read
+   * per opcode and starts off.
+   *
+   * @param {boolean} enabled
+   * @throws {OmniLibraryError} if the loaded library predates the profiler
+   */
+  setProfiling(enabled) {
+    const b = this._require();
+    if (!b.setProfiling) {
+      throw new OmniLibraryError(
+        'the loaded OmniEngine library predates the profiler (omni_engine_set_profiling). Rebuild it with:\n' +
+          '    cargo build -p omni-ffi'
+      );
+    }
+    const status = b.setProfiling(this._handle, enabled ? 1 : 0);
+    this._lastStatus = status;
+    if (status !== STATUS.OK) throw new OmniError(status, this._error(b, status));
+  }
+
+  /**
+   * What the most recent evaluation cost, at opcode granularity.
+   *
+   * `opcodeCalls` maps every opcode mnemonic this build knows to how often the
+   * last program dispatched it (zero for the ones it did not use), `opcodeNs`
+   * is the same table in nanoseconds -- all zeros unless profiling was enabled
+   * first -- and `peakBytes` is the arena high-water mark of that execution.
+   *
+   * The picture always describes the *last* evaluation: a single `run`, one
+   * item of a `runMany` batch, or a failure.
+   *
+   * @returns {{totalInstructions: number, elapsedNs: number, peakBytes: number,
+   *   opcodeCalls: Record<string, number>, opcodeNs: Record<string, number>}}
+   * @throws {OmniLibraryError} if the loaded library predates the profiler
+   */
+  profile() {
+    const b = this._require();
+    if (!b.profile || !b.opcodeName) {
+      throw new OmniLibraryError(
+        'the loaded OmniEngine library predates the profiler (omni_profile). Rebuild it with:\n' +
+          '    cargo build -p omni-ffi'
+      );
+    }
+    const status = b.profile(this._handle, this._profileOut);
+    this._lastStatus = status;
+    if (status !== STATUS.OK) throw new OmniError(status, this._error(b, status));
+    const raw = b.koffi.decode(this._profileOut, b.OmniProfile);
+    if (raw.size !== b.koffi.sizeof(b.OmniProfile)) {
+      throw new OmniError(
+        STATUS.ERR_ARG,
+        `the library says OmniProfile is ${raw.size} bytes; this SDK reads ${b.koffi.sizeof(b.OmniProfile)}`
+      );
+    }
+    const count = Math.min(Number(raw.opcode_count), b.MAX_OPCODES);
+    const opcodeCalls = {};
+    const opcodeNs = {};
+    for (let i = 0; i < count; i++) {
+      const written = b.opcodeName(i, this._opcodeNameBuf, this._opcodeNameBuf.length);
+      const name = written
+        ? this._opcodeNameBuf.toString('utf8', 0, written)
+        : `opcode-${i}`;
+      opcodeCalls[name] = Number(raw.opcode_calls[i]);
+      opcodeNs[name] = Number(raw.opcode_ns[i]);
+    }
+    return {
+      totalInstructions: Number(raw.total_instructions),
+      elapsedNs: Number(raw.elapsed_ns),
+      peakBytes: Number(raw.peak_bytes),
+      opcodeCalls,
+      opcodeNs,
+    };
+  }
+
+  /**
    * Deliberately panic inside the engine and report the status.
    * Proves from a host that a Rust panic cannot unwind into the process.
    * Not part of the language; named after the ABI's test hook.
@@ -711,7 +792,7 @@ class Engine {
     this._hostFns.clear();
     if (this._handle) b.engineFree(this._handle);
     this._handle = null;
-    for (const ptr of [this._valueOut, this._numberOut, this._statsOut, this._batchValues]) {
+    for (const ptr of [this._valueOut, this._numberOut, this._statsOut, this._profileOut, this._batchValues]) {
       if (ptr) {
         b.koffi.free(ptr);
       }
@@ -719,6 +800,8 @@ class Engine {
     this._valueOut = null;
     this._numberOut = null;
     this._statsOut = null;
+    this._profileOut = null;
+    this._opcodeNameBuf = null;
     this._batchAddrs = null;
     this._batchLengths = null;
     this._batchStatuses = null;
@@ -1190,6 +1273,9 @@ module.exports = {
   },
   get MAX_BATCH() {
     return bindingsModule.MAX_BATCH;
+  },
+  get MAX_OPCODES() {
+    return bindingsModule.MAX_OPCODES;
   },
   get MAX_MANIFEST_LEN() {
     return bindingsModule.MAX_MANIFEST_LEN;

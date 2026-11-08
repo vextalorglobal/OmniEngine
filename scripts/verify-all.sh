@@ -9,10 +9,10 @@
 #
 # Later sections take one answer through every host that is present and compare
 # what came back: strings and errors, a function the host owns, one crossing for
-# many programs, the DevPack surfaces, and finally the update path -- a release
-# check, a refused checksum, and a binary that replaces itself. That comparison
-# is the only way to catch a bridge that is internally consistent and
-# externally wrong.
+# many programs, the DevPack surfaces, the profiler heatmaps, and finally the
+# update path -- a release check, a refused checksum, and a binary that replaces
+# itself. That comparison is the only way to catch a bridge that is internally
+# consistent and externally wrong.
 #
 # Exits non-zero if anything that could run, failed.
 
@@ -142,6 +142,81 @@ PY
 else
   fail "concurrency stress suite"
   tail -20 "$OUT/concurrency.log"
+fi
+
+# The Phase 9 row is the optimizer's and the profiler's whole proof in one
+# place. The Rust suites show the folded bytecode dispatches fewer instructions
+# and beats the raw stream; the SDK half reads the heatmap back through two
+# hosts and checks the claims a single suite cannot: the constant folded, the
+# four arithmetic opcodes gone, the heatmap summing to the instruction count,
+# and a runtime error that must survive folding at its exact position.
+printf 'Optimizer, profiler, and their heatmaps... '
+if cargo test -p omni-core --test optimizer >"$OUT/optimizer.log" 2>&1 && \
+   cargo test -p omni-core --test profiler >"$OUT/profiler.log" 2>&1; then
+  opt=$(grep -oE '[0-9]+ passed' "$OUT/optimizer.log" | awk '{s += $1} END {print s+0}')
+  prof=$(grep -oE '[0-9]+ passed' "$OUT/profiler.log" | awk '{s += $1} END {print s+0}')
+  heat_hosts=''
+  heat_wrong=''
+  py_host=''
+  if have python || have py; then
+    py_host=$(have python && echo python || echo "py -3")
+  fi
+  if [[ -n "$py_host" ]]; then
+    got=$(cd sdks/python && $py_host -c '
+import sys; sys.path.insert(0, ".")
+import omni
+with omni.Engine() as e:
+    value = e.run("(2 + 3) * 4 - 8 / 2").value
+    p = e.profile()
+    arithmetic = sum(p.opcode_calls.get(n, 0) for n in ("ADD", "SUB", "MUL", "DIV"))
+    # Four folds happen, but folding collapses the whole expression, so the
+    # stream the VM runs is one PUSH_FOLDED and one RET: two dispatches.
+    ok = (
+        value == 16.0
+        and p.opcode_calls["PUSH_FOLDED"] == 1
+        and arithmetic == 0
+        and sum(p.opcode_calls.values()) == p.total_instructions
+        and p.total_instructions == 2
+    )
+    try:
+        e.run("let x = 1\nx / 0")
+        pos = "no error"
+    except omni.OmniError as err:
+        pos = str(err)
+    ok = ok and "[Line 2, Col 3]" in pos and "division by zero" in pos
+    print("ok" if ok else "bad %s %s" % (value, pos))
+' 2>&1)
+    [[ "$got" == ok* ]] && heat_hosts+=' python' || heat_wrong+=" python='$got'"
+  fi
+  if have node && [[ -d sdks/nodejs/node_modules/koffi ]]; then
+    got=$(cd sdks/nodejs && node -e '
+const { Engine } = require("./index.js");
+const e = new Engine();
+const value = e.run("(2 + 3) * 4 - 8 / 2").value;
+const p = e.profile();
+const arithmetic = ["ADD", "SUB", "MUL", "DIV"].reduce((s, n) => s + p.opcodeCalls[n], 0);
+let ok = value === 16 && p.opcodeCalls.PUSH_FOLDED === 1 && arithmetic === 0 &&
+  Object.values(p.opcodeCalls).reduce((a, b) => a + b, 0) === p.totalInstructions &&
+  p.totalInstructions === 2;
+let pos = "no error";
+try { e.run("let x = 1\nx / 0"); } catch (err) { pos = String(err); }
+ok = ok && pos.includes("[Line 2, Col 3]") && pos.includes("division by zero");
+console.log(ok ? "ok" : `bad ${value} ${pos}`);
+e.close();
+' 2>&1)
+    [[ "$got" == ok* ]] && heat_hosts+=' node' || heat_wrong+=" node='$got'"
+  fi
+  if [[ -n "$heat_wrong" ]]; then
+    fail "the profile heatmap or the folded error position differs:$heat_wrong"
+  elif [[ -n "$heat_hosts" ]]; then
+    pass "${opt:-?} optimizer tests, ${prof:-?} profiler tests, one folded program profiled identically in:$heat_hosts"
+  else
+    pass "${opt:-?} optimizer tests, ${prof:-?} profiler tests (no host to read the heatmap)"
+  fi
+else
+  fail "optimizer or profiler suite"
+  tail -20 "$OUT/optimizer.log"
+  tail -20 "$OUT/profiler.log"
 fi
 
 printf 'Shared library... '

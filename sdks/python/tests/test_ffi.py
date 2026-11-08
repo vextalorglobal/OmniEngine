@@ -1131,6 +1131,18 @@ class AbiLayout(unittest.TestCase):
         self.assertEqual(_ffi.OmniStats.execs.offset, 8)
         self.assertEqual(_ffi.OmniStats.egress_high_water.offset, 64)
 
+    def test_profile_struct_matches_the_c_header(self) -> None:
+        self.assertEqual(_ffi.OMNI_MAX_OPCODES, 64)
+        self.assertEqual(_ffi.ctypes.sizeof(_ffi.OmniProfile), 1064)
+        self.assertEqual(_ffi.OmniProfile.size.offset, 0)
+        self.assertEqual(_ffi.OmniProfile.opcode_count.offset, 4)
+        self.assertEqual(_ffi.OmniProfile.total_instructions.offset, 8)
+        self.assertEqual(_ffi.OmniProfile.elapsed_ns.offset, 16)
+        self.assertEqual(_ffi.OmniProfile.peak_bytes.offset, 24)
+        self.assertEqual(_ffi.OmniProfile.reserved.offset, 32)
+        self.assertEqual(_ffi.OmniProfile.opcode_calls.offset, 40)
+        self.assertEqual(_ffi.OmniProfile.opcode_ns.offset, 552)
+
     def test_number_and_ptr_arms_share_the_same_eight_bytes(self) -> None:
         raw = _ffi.OmniValue()
         raw.number = 1.0
@@ -1312,6 +1324,121 @@ class PositionsAndTimer(unittest.TestCase):
         self.assertGreater(stats.last_exec_micros, 0)
         self.assertEqual(stats.execs, 1)
         self.assertIsInstance(stats.last_exec_micros, int)
+
+
+class Profiling(unittest.TestCase):
+    """Phase 9's diagnostics: per-opcode heatmaps over the Python boundary."""
+
+    MNEMONICS = [
+        "PUSH_NUMBER",
+        "PUSH_STR",
+        "PUSH_FOLDED",
+        "PUSH_NIL",
+        "PUSH_UNDEF",
+        "LOAD",
+        "STORE",
+        "POP",
+        "ADD",
+        "SUB",
+        "MUL",
+        "DIV",
+        "MOD",
+        "EQ",
+        "NE",
+        "NEG",
+        "JUMP",
+        "JUMP_IF_FALSE",
+        "CALL",
+        "RET",
+        "IMPORT",
+    ]
+
+    def setUp(self) -> None:
+        self.engine = omni.Engine()
+        self.addCleanup(self.engine.close)
+
+    def test_a_fresh_engine_profiles_as_all_zeros(self) -> None:
+        profile = self.engine.profile()
+        self.assertEqual(profile.total_instructions, 0)
+        self.assertEqual(profile.elapsed_ns, 0)
+        self.assertEqual(profile.peak_bytes, 0)
+        # Every opcode this build knows is present, even the unused ones, so a
+        # heatmap sums the same way on every build.
+        self.assertEqual(set(profile.opcode_calls), set(self.MNEMONICS))
+        self.assertEqual(set(profile.opcode_ns), set(self.MNEMONICS))
+        self.assertEqual(sum(profile.opcode_calls.values()), 0)
+        self.assertEqual(sum(profile.opcode_ns.values()), 0)
+
+    def test_the_heatmap_sums_to_the_instruction_count(self) -> None:
+        result = self.engine.run("let x = 2 + 3\nx * 4")
+        self.assertEqual(result.value, 20.0)
+        profile = self.engine.profile()
+        self.assertEqual(sum(profile.opcode_calls.values()), profile.total_instructions)
+        self.assertGreater(profile.total_instructions, 0)
+        self.assertEqual(profile.opcode_calls["ADD"], 0)  # folded at compile time
+        self.assertEqual(profile.opcode_calls["PUSH_FOLDED"], 1)
+        self.assertEqual(profile.opcode_calls["STORE"], 1)
+        self.assertEqual(profile.opcode_calls["LOAD"], 1)
+        self.assertEqual(profile.opcode_calls["MUL"], 1)
+
+    def test_per_opcode_timing_stays_zero_until_enabled(self) -> None:
+        self.engine.run("1 + 1")
+        profile = self.engine.profile()
+        self.assertEqual(sum(profile.opcode_ns.values()), 0)
+        self.assertGreater(profile.elapsed_ns, 0)  # the scalar timer is always on
+        self.engine.set_profiling(True)
+        self.engine.run("let x = 1\nx" + " + 1" * 2_000)
+        profile = self.engine.profile()
+        self.assertGreater(sum(profile.opcode_ns.values()), 0)
+        self.assertLessEqual(sum(profile.opcode_ns.values()), profile.elapsed_ns)
+        self.engine.set_profiling(False)
+        self.engine.run("let x = 1\nx" + " + 1" * 2_000)
+        self.assertEqual(sum(self.engine.profile().opcode_ns.values()), 0)
+
+    def test_peak_bytes_bounds_a_string_heavy_program(self) -> None:
+        self.engine.run("1 + 2")
+        self.assertEqual(self.engine.profile().peak_bytes, 0)
+        text = '"' + "x" * 64_000 + '"'
+        result = self.engine.run(text)
+        self.assertEqual(len(result.value), 64_000)
+        profile = self.engine.profile()
+        self.assertGreaterEqual(profile.peak_bytes, 64_000)
+        self.assertLess(profile.peak_bytes, 2 * 64_000)
+
+    def test_the_profile_is_per_execution(self) -> None:
+        self.engine.run('"' + "x" * 64_000 + '"')
+        self.engine.run("7")
+        profile = self.engine.profile()
+        self.assertEqual(profile.total_instructions, 2)  # PUSH_NUMBER + RET
+        self.assertEqual(profile.peak_bytes, 0)
+
+    def test_a_failed_execution_is_profiled_like_a_successful_one(self) -> None:
+        self.engine.set_profiling(True)
+        with self.assertRaises(omni.OmniError):
+            self.engine.run("1 / 0")
+        profile = self.engine.profile()
+        self.assertEqual(profile.opcode_calls["DIV"], 1)
+        self.assertEqual(sum(profile.opcode_calls.values()), profile.total_instructions)
+        self.assertGreater(sum(profile.opcode_ns.values()), 0)
+
+    def test_a_batch_profiles_its_last_item(self) -> None:
+        results = self.engine.run_many(["2 + 21", "2 * 21"])
+        self.assertEqual([item.value for item in results], [23.0, 42.0])
+        profile = self.engine.profile()
+        self.assertEqual(profile.total_instructions, 2)  # PUSH_FOLDED + RET
+        self.assertEqual(profile.opcode_calls["PUSH_FOLDED"], 1)
+
+    def test_the_raw_binding_reports_the_same_numbers(self) -> None:
+        raw = _ffi.RawEngine()
+        self.addCleanup(raw.close)
+        raw.set_profiling(True)
+        status, value = raw.exec("2 + 3")
+        self.assertEqual(status, _ffi.OMNI_OK)
+        profile = raw.profile()
+        self.assertEqual(profile.total_instructions, 2)
+        self.assertEqual(profile.opcode_calls["PUSH_FOLDED"], 1)
+        self.assertEqual(profile.opcode_calls["ADD"], 0)
+        self.assertGreater(profile.elapsed_ns, 0)
 
 
 if __name__ == "__main__":

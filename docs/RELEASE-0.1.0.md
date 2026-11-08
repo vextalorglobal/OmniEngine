@@ -49,6 +49,27 @@ that do not start with `_`, and refuses escapes, cycles, and nesting past 16.
 The module root and filesystem roots are opt-in Rust APIs, so imports and reads
 fail closed by default.
 
+**An optimizing compiler front.** Before the VM runs a chunk, an ahead-of-time
+pass folds constant arithmetic into one `PushFolded` opcode and erases dead
+constant statements. Both transformations are provably unable to fail or to
+have a side effect, so the sequence of runtime errors — each with its line and
+column — is identical with the pass on or off; `Div` and `Mod` by zero are
+never folded, because those errors must keep firing at their own positions. A
+10,000-term addition collapses from 20,002 dispatches to 2, and the pass's
+rewrite buffers are engine-owned and recycled, so a warm execution still
+allocates nothing.
+
+**Profiling at opcode granularity.** Three additive ABI-4 exports —
+`omni_engine_set_profiling`, `omni_profile`, `omni_opcode_name` — hand a host
+the cost of the last execution: instructions dispatched, wall-clock time, peak
+arena bytes, and per-opcode call and nanosecond heatmaps, keyed by the
+engine's own mnemonics through `profile()` in Python and in Node. Counts are
+always recorded; the nanosecond split is opt-in, because timing every dispatch
+is the one thing a profile must not pay for by default. The profile resets per
+execution and is engine-local, so parallel workers and forked engines cannot
+observe each other. The export table goes from 17 to 20; nothing else in the
+ABI moved.
+
 **Hardened execution.** A program cannot run forever or grow without bound. Each
 top-level execution carries a deterministic budget of 16,777,216 VM
 instructions, shared with every module it imports, and a backward jump or an
@@ -89,9 +110,10 @@ Both SDKs can report the same answer (`omni.check_updates()`,
 in the engine's `omni_check_update` export so every surface agrees on what
 "newer" means. Plain HTTP is refused by default.
 
-**Quality.** 36 of 36 cross-host verification rows pass on this machine: 348 Rust
-tests, 131 Python, 126 Node, plus the C embedding example and the deterministic
-fuzz harness. `cargo fmt --check` and `cargo clippy -- -D warnings` are clean.
+**Quality.** 37 of 37 cross-host verification rows pass on this machine: 373
+Rust tests, 140 Python, 134 Node, plus the C embedding example and the
+deterministic fuzz harness. `cargo fmt --check` and `cargo clippy -- -D
+warnings` are clean.
 
 **Packaging.** A platform wheel carries the engine in `omni/_native/`; the npm
 tarball carries five engines under `native/<platform>-<arch>/`; each C target

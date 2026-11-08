@@ -69,6 +69,7 @@ from ._ffi import (
     MAX_MANIFEST_LEN,
     MAX_SOURCE_LEN,
     MAX_STRING_LEN,
+    OMNI_MAX_OPCODES,
     OMNI_ABI_VERSION,
     OMNI_ERR_REENTRANT,
     OMNI_ERR_RUNTIME,
@@ -84,6 +85,7 @@ from ._ffi import (
     OmniError,
     OmniLibraryError,
     OmniValue,
+    Profile,
     RawEngine,
     Stats,
     library_file_name,
@@ -94,6 +96,7 @@ __all__ = [
     "Engine",
     "Result",
     "Stats",
+    "Profile",
     "UpdateCheck",
     "BackgroundUpdateCheck",
     "check_updates",
@@ -112,6 +115,7 @@ __all__ = [
     "MAX_ARGS",
     "MAX_BATCH",
     "MAX_CALL_DEPTH",
+    "OMNI_MAX_OPCODES",
     "OMNI_ABI_VERSION",
     "__version__",
 ]
@@ -793,6 +797,35 @@ class Engine:
         ``*_bytes_reserved`` only ever grows to the largest single request.
         """
         return self._require().stats()
+
+    def set_profiling(self, enabled: bool) -> None:
+        """Turn per-opcode nanosecond timing on or off for later evaluations.
+
+        The instruction counts and the scalar counters are always recorded;
+        this switch only controls the per-opcode timing split, which costs a
+        timer read per opcode and starts off.
+
+        Raises:
+            OmniLibraryError: the loaded library predates the profiler.
+        """
+        self._require().set_profiling(enabled)
+
+    def profile(self) -> Profile:
+        """What the most recent evaluation cost, at opcode granularity.
+
+        ``opcode_calls`` maps every opcode mnemonic this build knows to how
+        often the last program dispatched it (zero for the ones it did not
+        use), ``opcode_ns`` is the same table in nanoseconds -- all zeros
+        unless profiling was enabled first -- and ``peak_bytes`` is the arena
+        high-water mark of that execution.
+
+        The picture always describes the *last* evaluation: a single
+        :meth:`run`, one item of a :meth:`run_many` batch, or a failure.
+
+        Raises:
+            OmniLibraryError: the loaded library predates the profiler.
+        """
+        return self._require().profile()
 
     def close(self) -> None:
         """Release the engine, and every host function registered on it.

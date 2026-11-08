@@ -95,7 +95,10 @@ returns the language value as a native JS primitive: `number`, `string`,
 `lower`, `contains`, `replace`, `slice`, `type_of`, `fs.read_text`,
 `fs.write_text`, `json.parse`, `json.stringify` — need no registration, and
 `stats().lastExecMicros` reports the most recent execution
-in microseconds. `json.parse` and `json.stringify` cover the scalar kinds ABI 4
+in microseconds. `setProfiling(true)` turns on the per-opcode nanosecond split,
+and `profile()` returns the most recent execution's cost: `totalInstructions`,
+`elapsedNs`, `peakBytes`, and `opcodeCalls` / `opcodeNs` as objects keyed by
+opcode mnemonic. `json.parse` and `json.stringify` cover the scalar kinds ABI 4
 can carry and refuse arrays and objects. The two `fs` builtins fail closed
 through this SDK: permission roots are granted by a Rust embedder, and ABI 4 has
 no export that adds one, so a script gets
@@ -341,7 +344,7 @@ rule above. Measure it with `engine.stats()` before optimising around it.
 ```bash
 cd sdks/nodejs
 npm install koffi
-npm test                                   # 116 tests, node:test
+npm test                                   # 134 tests, node:test
 node bench.js                              # measured numbers for this machine
 ```
 

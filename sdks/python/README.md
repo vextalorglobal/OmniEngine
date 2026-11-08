@@ -88,6 +88,10 @@ builtins — `abs`, `min`, `max`, `clamp`, `floor`, `ceil`, `round`, `pow`,
 `type_of`, `fs.read_text`, `fs.write_text`, `json.parse`, `json.stringify` —
 need no registration, and
 `stats().last_exec_micros` reports the most recent execution in microseconds.
+`set_profiling(True)` turns on the per-opcode nanosecond split, and `profile()`
+returns the most recent execution's cost: `total_instructions`, `elapsed_ns`,
+`peak_bytes`, and `opcode_calls` / `opcode_ns` as dicts keyed by opcode
+mnemonic.
 `json.parse` and `json.stringify` cover the scalar kinds ABI 4 can carry and
 refuse arrays and objects. The two `fs` builtins fail closed through this SDK:
 permission roots are granted by a Rust embedder, and ABI 4 has no export that
@@ -299,7 +303,7 @@ the safety rule above; measure it with `engine.stats()` — or run
 ## Tests
 
 ```bash
-python sdks/python/tests/test_ffi.py        # 122 tests, stdlib unittest
+python sdks/python/tests/test_ffi.py        # 140 tests, stdlib unittest
 python sdks/python/bench.py                 # ns/call, gc/call, batch speed-up
 ```
 

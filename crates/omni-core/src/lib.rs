@@ -27,6 +27,7 @@ pub mod fuzz_api;
 pub mod json;
 pub mod lexer;
 pub mod object;
+pub mod optimizer;
 pub mod update;
 pub mod value;
 
@@ -40,13 +41,15 @@ pub mod counted;
 static COUNTED: counted::Counting = counted::Counting;
 
 pub use arena::{Arena, Mark};
+pub use bytecode::{OPCODE_COUNT, opcode_name};
 pub use engine::{
     BatchItem, DEFAULT_STEP_LIMIT, Engine, ErrorKind, HostCall, HostError, HostOutcome, MAX_ARGS,
     MAX_CALL_DEPTH, MAX_IDENTIFIER_LEN, MAX_MODULE_DEPTH, MAX_NESTING, MAX_STACK_DEPTH, OmniError,
-    Stats,
+    Profile, Stats,
 };
 pub use lexer::{BinOp, LexError, MAX_SOURCE_LEN, Token, TokenKind, lex, lex_into};
 pub use object::{MAX_STRING_LEN, StrRef};
+pub use optimizer::OptimizeStats;
 pub use value::Value;
 
 /// OmniEngine's language semantics version, not the crate's. Bumped when a

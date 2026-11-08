@@ -10,7 +10,7 @@ JavaScript can call, a custom file extension that GitHub recognises, and
 SDKs that install through `pip` and `npm`.
 
 Two numbering systems are in use and both are kept, because the brief's five
-phases are how the work was asked for and how section 10 is scored. **"Phase 1–5"
+phases are how the work was asked for and how section 11 is scored. **"Phase 1–5"
 means the brief's deliverables** (workspace, core, bridge, Linguist, SDKs).
 **"The strings increment" or "ABI v2"** means the second round of work on the
 language and the bridge — strings, the egress memory model, and the four new
@@ -37,11 +37,12 @@ or Phase 3.
 | Phase 6 — bytecode VM, modules, sandbox | done | AST lowering and a stack VM behind the unchanged ABI 4, `import` with namespace isolation, `fs` / `json` builtins (21 total), 226 `omni-core` tests (§7) |
 | Phase 7 — hardened security and fuzzing | done | shared execution gas, a 65,536-value VM stack cap, a 128-level parser nesting cap, symlink-safe writes, cargo-fuzz targets plus a deterministic in-repo harness, 233 `omni-core` tests (§8) |
 | Phase 8 — concurrency and parallel execution | done | `Send + Sync` core, `Engine::fork`, engine-local module caches, `omni_exec_parallel`, 64-thread stress suite, `run_parallel` / `runParallel`, 243 `omni-core` tests (§9) |
+| Phase 9 — optimizer, profiler, diagnostics | done | constant folding + DCE ahead of the VM, `OmniProfile` heatmaps through three additive ABI-4 exports, 261 `omni-core` tests (§10) |
 | Auto-updater and CLI manager | done | `omni_check_update` in the C ABI, `omni update` / `omni check-update` / `omniup`, `omni.check_updates()` and `checkUpdates()`, `scripts/cli-binaries.py` + `scripts/make-manifest.py` (§6.4–6.5) |
-| Same answer from four hosts | done | `scripts/verify-all.sh` — 36 rows, all passing |
+| Same answer from four hosts | done | `scripts/verify-all.sh` — 37 rows, all passing |
 
 ```
-cargo test --workspace          # 348 tests
+cargo test --workspace          # 373 tests
 ./scripts/verify-all.sh         # Rust, C, Python, Node: 42, "hello, world", ABI 4
 ./scripts/fuzz.sh               # libFuzzer when nightly is present, harness otherwise
 ./scripts/bench.sh              # three hosts, one crossing each, measured
@@ -699,7 +700,7 @@ whole — `[Line 1, Col 5]: expected a name, found ''=''` — and the contract t
 asserts both the line and the column survive the boundary. Note the doubled
 quotes around `=`: that is the engine, not the SDK. `display_kind` renders a
 symbol as `'='` and the message template wraps it in quotes a second time. The
-hosts pass the text through untouched rather than prettifying it, and section 13
+hosts pass the text through untouched rather than prettifying it, and section 14
 records the one-character fix.
 
 **A zero-length program is legal even from a null pointer.** Node hands an empty
@@ -2012,7 +2013,183 @@ bounds; the only new ABI symbol is `omni_exec_parallel`.
 
 ---
 
-## 10. Verification
+## 10. Phase 9 — Bytecode optimizer, profiler, and diagnostics
+
+Phase 8 made the engine parallel. Phase 9 makes the work it does visible and
+smaller: an ahead-of-time optimizer pass runs between lowering and the VM, and
+three additive ABI-4 exports hand a host the cost of one execution at opcode
+granularity.
+
+### 10.1 One pass, two transformations, one invariant
+
+The optimizer lives in [optimizer.rs](file:///D:/OmniEngine/crates/omni-core/src/optimizer.rs)
+and runs once per execution, after lowering and before the VM, on streams the
+compiler produced — never on hand-built chunks. Both transformations are keyed
+to one rule: **anything removed or rewritten must be provably unable to fail
+and unable to have a side effect**, so the sequence of runtime errors, each
+with its line and column, is identical with the pass on and off. That is what
+"ahead-of-time" buys here: the pass is not a hint, it is a semantics-preserving
+rewrite, and the suite in §10.5 asserts the equivalence directly.
+
+**Constant folding** is a linear scan that mirrors the VM's operand stack,
+remembering which slots hold compile-time-known numbers. When both operands of
+`Add`, `Sub`, `Mul`, `Div`, or `Mod` — or the operand of `Neg` — are constants,
+the two pushes and the operator collapse into one `PushFolded`, a new opcode
+that carries the `f64`'s 64 bits across its two 32-bit operands and cannot
+fail at runtime, because there is no source text left to parse. `Div` and
+`Mod` fold only when the divisor is non-zero: "division by zero" is a runtime
+error that must keep firing at its own position, so the fold is refused and
+the stream is left alone. `Store` keeps its operand's constancy (it pops and
+pushes the same value), `Call` poisons the mirror, and every other opcode
+mirrors conservatively.
+
+**Dead code elimination** erases a non-final statement whose whole computation
+is one constant push followed by the statement-separating `Pop`. The push must
+have no remaining way to fail: a number literal that parses, a folded
+constant, `nil`/`undef`, or a string whose escapes decoded at compile time. A
+string with a bad escape keeps its runtime error. Calls, loads, stores, and
+imports are never touched.
+
+**Positions are never rewritten.** A folded constant inherits the operator's
+`line`/`column` — the fold for `2 + 3` reports where the `+` was — and every
+surviving instruction keeps its own position, so a later error in the same
+expression still names the right place.
+
+### 10.2 The pass recycles its buffers like everything else
+
+The `Optimizer` owns two rewrite buffers (`code` and `consts`) held by the
+engine and recycled the way the token buffer and the AST are: a warm execution
+asks the system allocator for nothing, because the buffers keep the capacity of
+the largest program the engine has compiled. Two buffers serve both passes —
+the folded stream is written into `code` and swapped in, then the dead-code
+pass rewrites *that* into `code` again — and a swap hands the freshly compiled
+stream back to the optimizer for next time, so the capacity is never lost.
+
+Three Rust-side knobs, all forked with the engine: `set_optimize(bool)` turns
+the pass off for a host that wants to compare streams, `optimize()` reads the
+setting, and `last_optimize()` reports `OptimizeStats { folded, elided }` — the
+work the pass did to the most recent execution, zeroed when the pass is
+disabled or the program failed to compile.
+
+### 10.3 The profiler: one execution, one instruction at a time
+
+[engine.rs](file:///D:/OmniEngine/crates/omni-core/src/engine.rs) gains a
+`Profile` the engine fills on every chunk run:
+
+| Field | Semantics |
+| --- | --- |
+| `total_instructions` | instructions dispatched, successful or not — always the sum of `opcode_calls` |
+| `elapsed_ns` | wall-clock nanoseconds of the dispatch loop, measured on every execution |
+| `peak_bytes` | bytes the execution arena held when the run ended; allocation is monotonic between reclamations, so this is the execution's peak live heap, not reserved space |
+| `opcode_calls` | one count per opcode dispatch — always recorded; the increment is negligible beside the gas charge already paid |
+| `opcode_ns` | per-opcode self-time, zero unless profiling is enabled |
+
+The split between the last two rows is the cost decision. Counting costs one
+indexed increment per instruction; timing costs two clock reads per dispatch,
+bracketing the handler. Counts are therefore always on, and the nanosecond
+split is opt-in through `set_profiling(bool)` (also forked, also
+engine-local).
+
+The profile resets at the top of every chunk run, so it always describes
+exactly the last execution: one single call, one batch item, or the final item
+of a batch or a parallel run. A failed execution is profiled like a successful
+one — the counters stop where the error did. A fresh engine profiles as all
+zeros. Nothing is shared: no static table, so parallel workers and forked
+engines cannot observe each other's profiles.
+
+### 10.4 The ABI and the SDKs
+
+Three exports, all additive within ABI 4, bring the table from seventeen to
+twenty:
+
+```c
+OMNI_API uint32_t OMNI_CALL omni_engine_set_profiling(OmniEngine *engine, uint32_t enabled);
+OMNI_API uint32_t OMNI_CALL omni_profile(OmniEngine *engine, OmniProfile *out);
+OMNI_API size_t OMNI_CALL omni_opcode_name(uint32_t index, char *buf, size_t cap);
+```
+
+`OmniProfile` is a 1,064-byte caller-owned struct — `size`, `opcode_count`,
+`total_instructions`, `elapsed_ns`, `peak_bytes`, a `reserved` slot, then two
+fixed arrays of 64 `uint64_t`s (`opcode_calls`, `opcode_ns`) — pinned by Rust
+const asserts, C `_Static_assert`s, a Python ctypes layout list, and Node
+koffi sizeof/offsetof checks, the same four-sided pin `OmniStats` gets.
+`omni_profile` reads through the shared borrow (usable any time the handle is
+free; `OMNI_ERR_REENTRANT` from inside a callback), always rewrites `out->size`
+for the caller to compare, and copies the core's opcode count so a host never
+reads past the live part of the arrays. `omni_opcode_name` translates an index
+into its mnemonic — `PUSH_FOLDED` included — writing at most `cap - 1` bytes
+and NUL-terminating, so a host that cannot read Rust still gets the engine's
+own names for its heatmap keys.
+
+Both SDKs follow the additive-export pattern established by
+`omni_exec_parallel`: against an older library every existing call keeps
+working and only the profile calls fail, with the rebuild instruction in the
+message. Python adds `Engine.set_profiling(bool)` and `Engine.profile()` — a
+frozen `Profile` with `total_instructions`, `elapsed_ns`, `peak_bytes`,
+`opcode_calls`, and `opcode_ns`, the last two as dicts keyed by mnemonic. Node
+adds `setProfiling(enabled)` and `profile()`, returning the same facts as
+`totalInstructions`, `elapsedNs`, `peakBytes`, `opcodeCalls`, and `opcodeNs`.
+Both read the names through `omni_opcode_name`, so the key sets are identical
+in both hosts.
+
+### 10.5 Verification
+
+The optimizer suite in
+[tests/optimizer.rs](file:///D:/OmniEngine/crates/omni-core/tests/optimizer.rs)
+(11 tests) asserts the invariant from both sides: folding respects precedence
+and float arithmetic, `Div`/`Mod` by zero survive to runtime at their own
+positions, dead statements vanish while calls, stores, and imports never do, a
+bad escape is never elided, and `OptimizeStats` resets and honours the switch
+and the fork. Three tests answer the brief's performance question with
+measurements rather than arguments:
+
+- `optimized_execution_dispatches_fewer_instructions` runs a 10,000-term
+  `1 + 1 + …` spine and asserts the optimized stream dispatches 2 instructions
+  where the raw stream dispatches 20,002 — a hundred-fold gap, asserted, not
+  waved at.
+- `dead_strings_make_repeated_executions_faster` puts a dead 40 KiB string
+  literal in front of `2 + 3` and sums 500 runs: optimized execution never
+  builds the string (`peak_bytes` stays 0) and must beat the raw run's total
+  time, which pays to decode and allocate it every run.
+- `folding_reduces_gas_consumption` runs `1 + 1 + 1` under a 4-step budget:
+  folded, it passes; raw, it dies at the step limit. The optimizer makes gas
+  spend smaller, which is the same as making programs faster under a cap.
+
+The profiler suite in
+[tests/profiler.rs](file:///D:/OmniEngine/crates/omni-core/tests/profiler.rs)
+(6 tests) covers the heatmap summing to the instruction count, the nanosecond
+split staying zero until enabled, peak bytes bounding a string-heavy program,
+per-execution reset and fork independence, a failed execution profiled like a
+successful one, and batch semantics (each item profiled, the last reported).
+
+[tests/profile.rs](file:///D:/OmniEngine/crates/omni-ffi/tests/profile.rs) in
+`omni-ffi` is the contract test at the C boundary (7 tests): the struct
+crosses with every field intact, every heatmap index names through
+`omni_opcode_name`, the toggle controls the nanosecond split, `peak_bytes`
+crosses, a borrowed handle refuses profile reads, null arguments are refused,
+and the surface is additive within ABI 4. The Python suite adds eight profile
+tests and Node adds eight — both including the struct-layout pin and the
+missing-symbol fallback.
+
+Row 37 of `scripts/verify-all.sh` (§11) is the cross-host form of the same
+facts: the two Rust suites, then `(2 + 3) * 4 - 8 / 2` evaluated in Python and
+Node must answer 16.0 with the whole expression collapsed to one `PUSH_FOLDED`
+dispatch (four folds, but the stream the VM runs is one push and one `RET`),
+zero arithmetic dispatches, the heatmap summing to the instruction count, and
+`let x = 1` / `x / 0` still failing at `[Line 2, Col 3]` — folded
+optimizations in the same program as an unfoldable division.
+
+### 10.6 What Phase 9 did not change
+
+ABI 4, the 16-byte `OmniValue`, language version 2, and every existing export
+are untouched; the three profiler exports bring the table to twenty. With the
+pass disabled, the bytecode is exactly what Phase 6 compiled. The CLI and wasm
+scaffold did not move. `PushFolded` is the one new opcode, and it exists only
+as an optimizer output — the compiler never emits it.
+
+---
+
+## 11. Verification
 
 One command, and it is the acceptance test for the whole brief:
 
@@ -2020,25 +2197,26 @@ One command, and it is the acceptance test for the whole brief:
 ./scripts/verify-all.sh
 ```
 
-Measured output on 2026-11-08, with the Phase 8 concurrency increment in it:
+Measured output on 2026-11-08, with the Phase 9 optimizer and profiler increment in it:
 
 ```
 == OmniEngine cross-host verification ==
    workspace: /d/OmniEngine
 
-Rust tests... Deterministic fuzz harness... Concurrent execution contexts... Shared library... omni-cli... C embedding... Python SDK... Node SDK... A string is the same bytes in every host... One type error, the same text everywhere... Every surface agrees on the ABI level... String results do not grow memory... A host function answers the same bytes in every host... A host failure is data, and says so identically... Re-entering the engine from a callback is refused, not crashed... The registry says the same thing from both sides... A batch answers the same items in every host... A failing item names itself identically in every host... A batch counts items, not crossings, and reserves nothing extra... A batch inside a host callback is refused, not crashed... The DevPack math, string and type builtins answer the same in every host... A second-line error names line and byte column in every host... eval_str and eval hand back native values... The last execution timer crosses as microseconds... omni --version names what it speaks... a build that matches the release... a newer release is offered... another ABI is refused, not offered... a wrong checksum leaves the target alone... a dry run downloads nothing... a verified update replaces the bytes... a running binary updates itself... 
+Rust tests... Deterministic fuzz harness... Concurrent execution contexts... Optimizer, profiler, and their heatmaps... Shared library... omni-cli... C embedding... Python SDK... Node SDK... A string is the same bytes in every host... One type error, the same text everywhere... Every surface agrees on the ABI level... String results do not grow memory... A host function answers the same bytes in every host... A host failure is data, and says so identically... Re-entering the engine from a callback is refused, not crashed... The registry says the same thing from both sides... A batch answers the same items in every host... A failing item names itself identically in every host... A batch counts items, not crossings, and reserves nothing extra... A batch inside a host callback is refused, not crashed... The DevPack math, string and type builtins answer the same in every host... A second-line error names line and byte column in every host... eval_str and eval hand back native values... The last execution timer crosses as microseconds... omni --version names what it speaks... a build that matches the release... a newer release is offered... another ABI is refused, not offered... a wrong checksum leaves the target alone... a dry run downloads nothing... a verified update replaces the bytes... a running binary updates itself... 
 == Results ==
-  PASS  cargo test --workspace (348 tests)
+  PASS  cargo test --workspace (373 tests)
   PASS  fuzz harness: 1200 inputs x 4 stages, 1200 decoder chunks, 146 executed, 0 panics
-  PASS  7 concurrency tests, 64 gas-bounded items across 8 workers (1.1ms 60326 items/s)
-  PASS  omni.dll (6.5M)
+  PASS  7 concurrency tests, 64 gas-bounded items across 8 workers (6.5ms 9837 items/s)
+  PASS  11 optimizer tests, 6 profiler tests, one folded program profiled identically in: python node
+  PASS  omni.dll (6.6M)
   PASS  omni run examples/hello.omni -> 42
   PASS  omni run examples/strings.omni -> hello, world 😀
   PASS  examples/c/embed.c -> 42 via omni.h
   PASS  python ctypes -> 42.0
-  PASS  python SDK tests (131 tests)
+  PASS  python SDK tests (140 tests)
   PASS  node koffi -> 42
-  PASS  node SDK tests (ℹ tests 126 ℹ pass 126 ℹ fail 0 )
+  PASS  node SDK tests (ℹ tests 134 ℹ pass 134 ℹ fail 0 )
   PASS  concat + \u{...} identical in: cli python node
   PASS  the mixed-type message survives the boundary in: cli python node c
   PASS  ABI 4 declared and read identically: header=4 C=4 python=4/lib=4 node=4/lib=4
@@ -2089,6 +2267,15 @@ across eight workers and requires every answer in source order plus an `execs`
 delta of exactly 64. A lost write, a shared cursor, or an item claimed twice
 would all break that accounting.
 
+The fourth row is the Phase 9 increment (§10): the optimizer and profiler
+Rust suites, then the same folded program in Python and Node. Each host must
+answer 16.0 for `(2 + 3) * 4 - 8 / 2` with the whole expression collapsed to
+one `PUSH_FOLDED` dispatch and zero arithmetic dispatches, its heatmap must sum
+to its instruction count, and `let x = 1` / `x / 0` must still fail at
+`[Line 2, Col 3]` with the division's own message. The row is the cross-host
+form of the invariant the optimizer suite asserts in Rust: the fold changed
+the cost, not the answer or the positions.
+
 The cross-host and update rows are the ones that could not exist in one host. The string
 comparison is byte-exact — an escape decoded differently in Rust and Node passes
 both test suites and is still a broken bridge — and the ABI row reads the number
@@ -2124,7 +2311,7 @@ deleted. On Unix the same row asserts no backup is left.
 The script degrades to `SKIP` rather than lying. `cargo`, `gcc`, `python` and
 `node` each have their own guard, Node without `koffi` is skipped with
 `npm install koffi` in the reason, and each cross-host row skips itself when fewer
-than two hosts answered. Nothing was skipped on this machine — all thirty-six
+than two hosts answered. Nothing was skipped on this machine — all thirty-seven
 rows ran. The Rust row runs the suite once into a log and reads its exit status;
 an earlier version piped cargo into `grep` under `pipefail`, which let a failing
 suite inherit a successful-looking pipeline and briefly hid a stale CLI test. `omni-wasm` has no row here because `wasm32-unknown-unknown` is not
@@ -2136,19 +2323,21 @@ Against the brief's five phases:
 
 | Phase | Asked for | Verified by |
 | --- | --- | --- |
-| 1 | Workspace on D:, fast compiles, managed `target/` | `cargo test --workspace` 348 tests; `target/` measured at 351 MB |
+| 1 | Workspace on D:, fast compiles, managed `target/` | `cargo test --workspace` 373 tests; `target/` measured at 351 MB |
 | 2 | Ultra-fast memory-safe core, no GC | NaN-boxed 8-byte `Value` asserted for size; arena reset is O(chunks); egress rewind keeps reservations flat over 100,000 executions; no collector exists to pause |
-| 3 | C ABI callable from Python and JavaScript | same `42` and the same `hello, world 😀` from Rust, C, Python, Node; 17 exports confirmed with `objdump -p`; `omni.h` compiles warning-free under `-Wall -Wextra` |
+| 3 | C ABI callable from Python and JavaScript | same `42` and the same `hello, world 😀` from Rust, C, Python, Node; 20 exports confirmed with `objdump -p`; `omni.h` compiles warning-free under `-Wall -Wextra` |
 | 4 | A custom extension GitHub recognises | `.gitattributes` tier 1; the tier-2 limit is stated in section 5.3 rather than glossed over |
-| 5 | `pip`/`npm` SDKs that do not move the language stats | 131 + 126 SDK tests; `linguist-vendored` on `sdks/**`; release packages carry a CI-built engine, checkouts carry none |
+| 5 | `pip`/`npm` SDKs that do not move the language stats | 140 + 134 SDK tests; `linguist-vendored` on `sdks/**`; release packages carry a CI-built engine, checkouts carry none |
 
-Test totals: **243** in `omni-core`, **71** in `omni-ffi` (21 unit, 13 in
-`tests/batch.rs`, 20 in `tests/ffi_contract.rs`, 8 in
-`tests/host_callbacks.rs`, and 9 in `tests/parallel.rs`), **27** in
-`omni-cli` (12 library tests for the updater and the writer, 10 for `omni`, 5
-for `omniup`), **7** in `omni-wasm`, **131** Python, **126** Node. The batch,
-callback, and parallel suites are contract tests against the header, not unit
-tests of the implementation they sit next to.
+Test totals: **261** in `omni-core` (237 unit, 7 in `tests/concurrency.rs`, 11 in
+`tests/optimizer.rs`, 6 in `tests/profiler.rs`), **78** in `omni-ffi` (21 unit,
+13 in `tests/batch.rs`, 20 in `tests/ffi_contract.rs`, 8 in
+`tests/host_callbacks.rs`, 9 in `tests/parallel.rs`, and 7 in
+`tests/profile.rs`), **27** in `omni-cli` (12 library tests for the updater and
+the writer, 10 for `omni`, 5 for `omniup`), **7** in `omni-wasm`, **140**
+Python, **134** Node. The batch, callback, parallel, and profile suites are
+contract tests against the header, not unit tests of the implementation they
+sit next to.
 
 Static checks are part of the definition of done:
 
@@ -2159,7 +2348,7 @@ cargo fmt --all --check                                  # clean
 
 ---
 
-## 11. Storage ledger
+## 12. Storage ledger
 
 Measured, all of it on this machine, at the time of writing. Sizes are `du`,
 which is what the drive charges; file-byte totals differ because the registry
@@ -2196,7 +2385,7 @@ complexity one.
 
 ---
 
-## 12. Troubleshooting
+## 13. Troubleshooting
 
 **`link: missing operand after '■'`** — MSVC's linker is being shadowed by Git
 for Windows' coreutils `link.exe`. Run `where link`. This workspace pins the GNU
@@ -2303,7 +2492,7 @@ the call site.
 
 ---
 
-## 13. What comes next
+## 14. What comes next
 
 Three increments shipped after the first bridge. Strings made `OmniValue` a union,
 promoted a result's bytes into a block a host can copy from, and made
@@ -2328,7 +2517,10 @@ fuzz surface with both libFuzzer targets and a deterministic harness. An eighth
 made the core shareable across threads without moving the C contract: `Engine`
 is `Send + Sync` and forkable, gas and module caches became engine-local, a batch
 can run over a worker group (`omni_exec_parallel`), and both SDKs expose the
-parallel shape with a sequential fallback. The next
+parallel shape with a sequential fallback. A ninth made the bytecode cheaper to
+run and its cost visible: an ahead-of-time optimizer that folds constants and
+erases dead statements without moving an error position, and opcode-granularity
+profiles through three additive exports. The next
 language increment is still the one section 3.7 lists — control flow,
 collections, and user-defined functions.
 
@@ -2357,9 +2549,9 @@ What the same memory model is still waiting for, in rough order:
    say the crossing is 36–240 ns and the wrapper is microseconds, and the
    wrapper's biggest single cost is copying string bytes out. A borrow API —
    pointer valid until the next execution, on the same rule 1 a host already
-   lives under — is the next performance increment, and the benches are the
-   instrument it will be judged by. A batch already makes all N results live at
-   once, so a borrow and a batch compose.
+   lives under — is the largest performance increment still on the list, and
+   the benches are the instrument it will be judged by. A batch already makes
+   all N results live at once, so a borrow and a batch compose.
 4. **User-defined functions and control flow.** The AST and the VM are in place:
    `Jump`, `JumpIfFalse`, and `Call` are defined, and the branch opcodes are
    tested against hand-built chunks. What remains is a function value, a frame,

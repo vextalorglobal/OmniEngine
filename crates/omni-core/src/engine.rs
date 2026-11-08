@@ -54,6 +54,7 @@ use crate::bytecode::{Callable, Chunk, Instr, OpCode};
 use crate::json;
 use crate::lexer::{BinOp, LexError, Token, lex_into};
 use crate::object::{self, MAX_STRING_LEN, StrRef};
+use crate::optimizer::{OptimizeStats, Optimizer};
 
 /// Longest identifier the arena binding cell can hold inline. A bump allocator
 /// wants fixed-size cells, so the limit is stated as a language rule rather than
@@ -435,6 +436,39 @@ pub struct Stats {
     pub egress_high_water: u64,
 }
 
+/// What the most recent execution did, one instruction at a time.
+///
+/// Reset at the top of every chunk run, so it always describes exactly the
+/// last execution this engine performed — one batch item or one worker's
+/// program, never an aggregate. Engine-local by construction: no static, no
+/// shared table, so parallel workers and forked engines cannot observe each
+/// other's profiles.
+///
+/// The heatmap indices are opcode discriminants; [`crate::bytecode::opcode_name`]
+/// names them for a host that cannot read Rust.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Profile {
+    /// Instructions dispatched, successful or not. Always the sum of
+    /// `opcode_calls`; kept as its own field so a host reads one number
+    /// instead of summing sixty-four.
+    pub total_instructions: u64,
+    /// Wall-clock nanoseconds of the chunk run, dispatch loop only. Measured
+    /// on every execution; the per-opcode split in `opcode_ns` is the part
+    /// that costs and is therefore opt-in.
+    pub elapsed_ns: u64,
+    /// Bytes the execution arena held when the run ended. Allocation is
+    /// monotonic between reclamations, so this is the execution's peak: the
+    /// high-water mark of live heap, not of reserved space.
+    pub peak_bytes: u64,
+    /// One count per opcode dispatch. Always recorded: one indexed increment
+    /// per instruction, negligible beside the gas charge already paid.
+    pub opcode_calls: [u64; crate::bytecode::OPCODE_COUNT],
+    /// Self-time per opcode in nanoseconds, zero unless profiling was enabled
+    /// for the execution. Bracketing every dispatch with a clock read is the
+    /// one thing a profile must not pay for by default.
+    pub opcode_ns: [u64; crate::bytecode::OPCODE_COUNT],
+}
+
 /// An OmniEngine execution context.
 ///
 /// Owns its identifier strings so it carries no lifetime: a borrowed engine
@@ -506,6 +540,23 @@ pub struct Engine {
     fs_write_roots: Vec<PathBuf>,
     /// Instructions one top-level execution may run. See [`DEFAULT_STEP_LIMIT`].
     step_limit: u64,
+    /// Run the optimizer pass between lowering and execution. On by default:
+    /// the pass is semantics-preserving (see [`crate::optimizer`]), so a host
+    /// disables it only to compare streams or to reproduce a bug.
+    optimize: bool,
+    /// Record per-opcode self-time in [`Profile`]. Off by default: the
+    /// invocation heatmap is always counted, but bracketing every dispatch
+    /// with a clock read costs tens of nanoseconds per instruction, which is
+    /// the very thing a profiler is meant to measure rather than pay for.
+    profiling: bool,
+    /// The most recent execution's profile, reset at the top of every chunk
+    /// run so a batch item and a worker see only their own instructions.
+    profile: Profile,
+    /// What the optimizer did to the most recent execution's chunk.
+    last_optimize: OptimizeStats,
+    /// The optimizer's rewrite buffers, recycled like every other engine
+    /// buffer so a warm execution asks the system allocator for nothing.
+    optimizer: Optimizer,
     last_value: Value,
     last_error: Option<OmniError>,
     execs: u64,
@@ -536,6 +587,11 @@ impl Engine {
             fs_read_roots: Vec::new(),
             fs_write_roots: Vec::new(),
             step_limit: DEFAULT_STEP_LIMIT,
+            optimize: true,
+            profiling: false,
+            profile: Profile::default(),
+            last_optimize: OptimizeStats::default(),
+            optimizer: Optimizer::default(),
             last_value: Value::UNDEF,
             last_error: None,
             execs: 0,
@@ -662,6 +718,8 @@ impl Engine {
         child.fs_read_roots = self.fs_read_roots.clone();
         child.fs_write_roots = self.fs_write_roots.clone();
         child.step_limit = self.step_limit;
+        child.optimize = self.optimize;
+        child.profiling = self.profiling;
         child.module_cache = self.module_cache.clone();
         for global in &self.globals {
             if global.value.is_string() {
@@ -1103,7 +1161,45 @@ impl Engine {
         self.step_limit = steps;
     }
 
-    /// Lex, parse, lower, and run, handing every owned buffer back afterwards.
+    /// Whether the optimizer pass runs between lowering and execution. On by
+    /// default; `fork()` copies the setting.
+    pub fn optimize(&self) -> bool {
+        self.optimize
+    }
+
+    /// Turn the optimizer pass on or off. A host disables it to compare
+    /// streams or reproduce a bug; programs behave identically either way.
+    pub fn set_optimize(&mut self, enabled: bool) {
+        self.optimize = enabled;
+    }
+
+    /// What the optimizer did to the most recent execution: `{ folded,
+    /// elided }`. Zero after a failed compile — the pass never ran.
+    pub fn last_optimize(&self) -> OptimizeStats {
+        self.last_optimize
+    }
+
+    /// Whether per-opcode self-time is being recorded. Invocation counts are
+    /// always recorded; this only gates the clock reads.
+    pub fn profiling(&self) -> bool {
+        self.profiling
+    }
+
+    /// Enable or disable per-opcode self-time recording for future
+    /// executions. `fork()` copies the setting; the counters themselves are
+    /// always engine-local and reset per execution.
+    pub fn set_profiling(&mut self, enabled: bool) {
+        self.profiling = enabled;
+    }
+
+    /// The most recent execution's profile: instruction count, wall-clock
+    /// time, peak arena bytes, and the per-opcode heatmap and self-times.
+    pub fn profile(&self) -> Profile {
+        self.profile
+    }
+
+    /// Lex, parse, lower, optimize, and run, handing every owned buffer back
+    /// afterwards.
     ///
     /// The five buffers are taken out of `self` so the parser and the lowering
     /// pass can borrow the engine immutably — they need to know which call
@@ -1115,11 +1211,16 @@ impl Engine {
         let mut chunk = std::mem::take(&mut self.chunk);
         let mut stack = std::mem::take(&mut self.stack);
         let mut tasks = std::mem::take(&mut self.tasks);
+        let mut optimizer = std::mem::take(&mut self.optimizer);
+        self.last_optimize = OptimizeStats::default();
 
         let result = (|| -> Result<Value, OmniError> {
             lex_into(source, &mut tokens)?;
             ast.parse_into(source, &tokens)?;
             crate::bytecode::compile(&ast, source, &*self, &mut chunk, &mut tasks)?;
+            if self.optimize {
+                self.last_optimize = optimizer.optimize(&mut chunk, source);
+            }
             self.run_chunk(&chunk, source, &mut stack, budget)
         })();
 
@@ -1128,6 +1229,7 @@ impl Engine {
         self.chunk = chunk;
         self.stack = stack;
         self.tasks = tasks;
+        self.optimizer = optimizer;
         result
     }
 
@@ -1146,6 +1248,11 @@ impl Engine {
     }
 
     /// Execute one chunk. The stack is the engine's, cleared but not freed.
+    ///
+    /// The dispatch loop is split from [`Engine::exec_one`] so the profile can
+    /// wrap each instruction: the heatmap count is one increment every arm
+    /// pays, and the per-opcode self-time is a clock pair only while profiling
+    /// is enabled.
     fn run_chunk(
         &mut self,
         chunk: &Chunk,
@@ -1154,135 +1261,189 @@ impl Engine {
         budget: &mut Budget,
     ) -> Result<Value, OmniError> {
         stack.clear();
+        self.profile = Profile::default();
+        let started = Instant::now();
+        let result = self.run_chunk_inner(chunk, source, stack, budget);
+        self.profile.elapsed_ns = elapsed_nanos(started.elapsed());
+        // Allocation is monotonic between reclamations, so what the arena
+        // holds now is the largest it held at any point this execution.
+        self.profile.peak_bytes = self.arena.bytes_in_use() as u64;
+        result
+    }
+
+    fn run_chunk_inner(
+        &mut self,
+        chunk: &Chunk,
+        source: &str,
+        stack: &mut Stack,
+        budget: &mut Budget,
+    ) -> Result<Value, OmniError> {
         let mut ip = 0usize;
         while ip < chunk.code.len() {
             let instr = chunk.code[ip];
             let at = instr.pos();
             budget.charge(at)?;
+            let slot = instr.op as usize;
+            debug_assert!(slot < crate::bytecode::OPCODE_COUNT);
+            self.profile.total_instructions = self.profile.total_instructions.saturating_add(1);
+            self.profile.opcode_calls[slot] = self.profile.opcode_calls[slot].saturating_add(1);
             ip += 1;
-            match instr.op {
-                OpCode::PushNumber => {
-                    let text = literal_span(source, instr);
-                    let number = text.parse::<f64>().map_err(|_| {
-                        OmniError::new(
-                            ErrorKind::Parse,
-                            at,
-                            format!("'{text}' is not a valid number"),
-                        )
-                    })?;
-                    push(stack, Value::from_f64(number), at)?;
-                }
-                OpCode::PushStr => {
-                    let bytes = decode_literal(literal_span(source, instr), at)?;
-                    let value = self.new_string(&bytes, at, ErrorKind::Runtime)?;
-                    push(stack, value, at)?;
-                }
-                OpCode::PushNil => push(stack, Value::NIL, at)?,
-                OpCode::PushUndef => push(stack, Value::UNDEF, at)?,
-                OpCode::Load => {
-                    let name = chunk.name(instr);
-                    match self.lookup(name) {
-                        Some(value) => push(stack, value, at)?,
-                        None => return Err(self.undefined_name(name, at)),
-                    }
-                }
-                OpCode::Store => {
-                    let value = top(stack, at)?;
-                    let name = chunk.name(instr);
-                    self.bind(name, value, at)?;
-                }
-                OpCode::Pop => {
-                    pop(stack, at)?;
-                }
-                OpCode::Add => self.binary(stack, BinOp::Add, at)?,
-                OpCode::Sub => self.binary(stack, BinOp::Sub, at)?,
-                OpCode::Mul => self.binary(stack, BinOp::Mul, at)?,
-                OpCode::Div => self.binary(stack, BinOp::Div, at)?,
-                OpCode::Mod => self.binary(stack, BinOp::Mod, at)?,
-                OpCode::Eq => {
-                    let rhs = pop(stack, at)?;
-                    let lhs = pop(stack, at)?;
-                    push(stack, Value::bool(self.eq_values(lhs, rhs)), at)?;
-                }
-                OpCode::Ne => {
-                    let rhs = pop(stack, at)?;
-                    let lhs = pop(stack, at)?;
-                    push(stack, Value::bool(!self.eq_values(lhs, rhs)), at)?;
-                }
-                OpCode::Neg => {
-                    let value = pop(stack, at)?;
-                    let number = value.as_f64().ok_or_else(|| {
-                        OmniError::new(
-                            ErrorKind::Runtime,
-                            at,
-                            format!(
-                                "type mismatch: cannot apply unary '-' to {}: {}",
-                                kind_of(value),
-                                self.show(value)
-                            ),
-                        )
-                    })?;
-                    push(stack, Value::from_f64(-number), at)?;
-                }
-                OpCode::Jump => {
-                    ip = instr.a as usize;
-                }
-                OpCode::JumpIfFalse => {
-                    let value = pop(stack, at)?;
-                    if !self.truthy(value) {
-                        ip = instr.a as usize;
-                    }
-                }
-                OpCode::Call => {
-                    let name = chunk.name(instr);
-                    let count = instr.c as usize;
-                    let start = stack.len().checked_sub(count).ok_or_else(|| {
-                        OmniError::new(ErrorKind::Panic, at, "the VM stack underflowed in a call")
-                    })?;
-                    let Some((callable, arity)) = self.resolve_call(name) else {
-                        return Err(OmniError::new(
-                            ErrorKind::Runtime,
-                            at,
-                            format!(
-                                "unknown function '{name}' \
-                                 (no host function or builtin has that name)"
-                            ),
-                        ));
-                    };
-                    if count != arity {
-                        return Err(OmniError::new(
-                            ErrorKind::Runtime,
-                            at,
-                            format!(
-                                "Mismatched arity in call '{name}': takes {arity} argument{}, got {count}",
-                                if arity == 1 { "" } else { "s" }
-                            ),
-                        ));
-                    }
-                    let result = match callable {
-                        Callable::Host(index) => self.invoke_host(index, name, &stack[start..], at),
-                        Callable::Builtin(which) => {
-                            self.invoke_builtin(which, name, &stack[start..], at)
-                        }
-                    };
-                    let value = result?;
-                    stack.truncate(start);
-                    push(stack, value, at)?;
-                }
-                OpCode::Ret => return Ok(pop(stack, at).unwrap_or(Value::UNDEF)),
-                OpCode::Import => {
-                    let bytes = decode_literal(literal_span(source, instr), at)?;
-                    let request = std::str::from_utf8(&bytes).map_err(|_| {
-                        OmniError::new(ErrorKind::Runtime, at, "import needs a UTF-8 module name")
-                    })?;
-                    self.import_module(request, at, budget)?;
-                    push(stack, Value::UNDEF, at)?;
-                }
+            let outcome = if self.profiling {
+                let started = Instant::now();
+                let outcome = self.exec_one(chunk, source, stack, budget, instr, &mut ip);
+                let elapsed = elapsed_nanos(started.elapsed());
+                self.profile.opcode_ns[slot] = self.profile.opcode_ns[slot].saturating_add(elapsed);
+                outcome
+            } else {
+                self.exec_one(chunk, source, stack, budget, instr, &mut ip)
+            };
+            if let Some(value) = outcome? {
+                return Ok(value);
             }
         }
         // A chunk with no `Ret` — hand-built by a test or a future tool — ends
         // with its top of stack as the result.
         Ok(stack.pop().unwrap_or(Value::UNDEF))
+    }
+
+    /// Execute exactly one instruction. Returns the program's result when the
+    /// instruction is `Ret` (or a `Ret`-less stream's implicit end is never
+    /// reached here), `None` to continue.
+    #[allow(clippy::too_many_arguments)]
+    fn exec_one(
+        &mut self,
+        chunk: &Chunk,
+        source: &str,
+        stack: &mut Stack,
+        budget: &mut Budget,
+        instr: Instr,
+        ip: &mut usize,
+    ) -> Result<Option<Value>, OmniError> {
+        let at = instr.pos();
+        match instr.op {
+            OpCode::PushNumber => {
+                let text = literal_span(source, instr);
+                let number = text.parse::<f64>().map_err(|_| {
+                    OmniError::new(
+                        ErrorKind::Parse,
+                        at,
+                        format!("'{text}' is not a valid number"),
+                    )
+                })?;
+                push(stack, Value::from_f64(number), at)?;
+            }
+            OpCode::PushStr => {
+                let bytes = decode_literal(literal_span(source, instr), at)?;
+                let value = self.new_string(&bytes, at, ErrorKind::Runtime)?;
+                push(stack, value, at)?;
+            }
+            OpCode::PushFolded => {
+                let bits = u64::from(instr.a) | (u64::from(instr.b) << 32);
+                push(stack, Value::from_f64(f64::from_bits(bits)), at)?;
+            }
+            OpCode::PushNil => push(stack, Value::NIL, at)?,
+            OpCode::PushUndef => push(stack, Value::UNDEF, at)?,
+            OpCode::Load => {
+                let name = chunk.name(instr);
+                match self.lookup(name) {
+                    Some(value) => push(stack, value, at)?,
+                    None => return Err(self.undefined_name(name, at)),
+                }
+            }
+            OpCode::Store => {
+                let value = top(stack, at)?;
+                let name = chunk.name(instr);
+                self.bind(name, value, at)?;
+            }
+            OpCode::Pop => {
+                pop(stack, at)?;
+            }
+            OpCode::Add => self.binary(stack, BinOp::Add, at)?,
+            OpCode::Sub => self.binary(stack, BinOp::Sub, at)?,
+            OpCode::Mul => self.binary(stack, BinOp::Mul, at)?,
+            OpCode::Div => self.binary(stack, BinOp::Div, at)?,
+            OpCode::Mod => self.binary(stack, BinOp::Mod, at)?,
+            OpCode::Eq => {
+                let rhs = pop(stack, at)?;
+                let lhs = pop(stack, at)?;
+                push(stack, Value::bool(self.eq_values(lhs, rhs)), at)?;
+            }
+            OpCode::Ne => {
+                let rhs = pop(stack, at)?;
+                let lhs = pop(stack, at)?;
+                push(stack, Value::bool(!self.eq_values(lhs, rhs)), at)?;
+            }
+            OpCode::Neg => {
+                let value = pop(stack, at)?;
+                let number = value.as_f64().ok_or_else(|| {
+                    OmniError::new(
+                        ErrorKind::Runtime,
+                        at,
+                        format!(
+                            "type mismatch: cannot apply unary '-' to {}: {}",
+                            kind_of(value),
+                            self.show(value)
+                        ),
+                    )
+                })?;
+                push(stack, Value::from_f64(-number), at)?;
+            }
+            OpCode::Jump => {
+                *ip = instr.a as usize;
+            }
+            OpCode::JumpIfFalse => {
+                let value = pop(stack, at)?;
+                if !self.truthy(value) {
+                    *ip = instr.a as usize;
+                }
+            }
+            OpCode::Call => {
+                let name = chunk.name(instr);
+                let count = instr.c as usize;
+                let start = stack.len().checked_sub(count).ok_or_else(|| {
+                    OmniError::new(ErrorKind::Panic, at, "the VM stack underflowed in a call")
+                })?;
+                let Some((callable, arity)) = self.resolve_call(name) else {
+                    return Err(OmniError::new(
+                        ErrorKind::Runtime,
+                        at,
+                        format!(
+                            "unknown function '{name}' \
+                             (no host function or builtin has that name)"
+                        ),
+                    ));
+                };
+                if count != arity {
+                    return Err(OmniError::new(
+                        ErrorKind::Runtime,
+                        at,
+                        format!(
+                            "Mismatched arity in call '{name}': takes {arity} argument{}, got {count}",
+                            if arity == 1 { "" } else { "s" }
+                        ),
+                    ));
+                }
+                let result = match callable {
+                    Callable::Host(index) => self.invoke_host(index, name, &stack[start..], at),
+                    Callable::Builtin(which) => {
+                        self.invoke_builtin(which, name, &stack[start..], at)
+                    }
+                };
+                let value = result?;
+                stack.truncate(start);
+                push(stack, value, at)?;
+            }
+            OpCode::Ret => return Ok(Some(pop(stack, at).unwrap_or(Value::UNDEF))),
+            OpCode::Import => {
+                let bytes = decode_literal(literal_span(source, instr), at)?;
+                let request = std::str::from_utf8(&bytes).map_err(|_| {
+                    OmniError::new(ErrorKind::Runtime, at, "import needs a UTF-8 module name")
+                })?;
+                self.import_module(request, at, budget)?;
+                push(stack, Value::UNDEF, at)?;
+            }
+        }
+        Ok(None)
     }
 
     fn binary(&mut self, stack: &mut Stack, op: BinOp, at: Pos) -> Result<(), OmniError> {
@@ -2250,7 +2411,7 @@ impl Engine {
 }
 
 /// The literal text an instruction's span addresses.
-fn literal_span(source: &str, instr: Instr) -> &str {
+pub(crate) fn literal_span(source: &str, instr: Instr) -> &str {
     let start = instr.a as usize;
     source
         .get(start..start.saturating_add(instr.b as usize))
@@ -2372,6 +2533,12 @@ const _: () = {
 /// what makes that a stated limit rather than a silent wrap.
 fn elapsed_micros(elapsed: Duration) -> u32 {
     u32::try_from(elapsed.as_micros()).unwrap_or(u32::MAX)
+}
+
+/// `Duration::as_nanos` is a `u128`; the profile's nanosecond fields saturate
+/// rather than wrap, on the same stated-limit rule as [`elapsed_micros`].
+fn elapsed_nanos(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// One of the helpers every host gets without registering anything.
@@ -2502,7 +2669,7 @@ fn unreadable_string(at: Pos, value: Value) -> OmniError {
 /// surrogate and anything above `0x10FFFF` as out of range. There is no
 /// surrogate-pair joining, because these strings are UTF-8 and a code-unit escape
 /// would be a second encoding rule nobody asked for — write `"😀"` or `"\u{1F600}"`.
-fn decode_literal(raw: &str, at: Pos) -> Result<Cow<'_, [u8]>, OmniError> {
+pub(crate) fn decode_literal(raw: &str, at: Pos) -> Result<Cow<'_, [u8]>, OmniError> {
     let bytes = raw.as_bytes();
     // Most literals contain no escape at all, and for those the decoded value
     // *is* the source text. Borrowing it skips both the allocation and the copy
