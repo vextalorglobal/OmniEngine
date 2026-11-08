@@ -27,14 +27,28 @@ mutable reference. `omni_exec_many` / `run_many` / `runMany` carries up to 4,096
 programs in one crossing; a failing item reports its own status and text without
 stopping the rest.
 
-**A standard toolkit.** Seventeen builtins need no host registration. Math:
+**A bytecode VM behind the same ABI.** Source is lexed, parsed into a flat AST,
+lowered into bytecode, and run on a stack VM. The lowering pass never recurses,
+so expression depth costs heap the engine already owns rather than the host's
+stack. `omni_exec` and `omni_exec_many` did not move: ABI 4 is unchanged and
+`OmniValue` is still 16 bytes. Language version 2 adds `import "path"`, which
+loads a module into an isolated namespace — a fresh child engine that sees
+builtins but not the embedder's globals or callbacks, exports top-level names
+that do not start with `_`, and refuses escapes, cycles, and nesting past 16.
+The module root and filesystem roots are opt-in Rust APIs, so imports and reads
+fail closed by default.
+
+**A standard toolkit.** Twenty-one builtins need no host registration. Math:
 `abs`, `min`, `max`, `clamp`, `floor`, `ceil`, `round`, `pow`, `sqrt`. Text:
 `len`, `trim`, `upper`, `lower`, `contains`, `replace`, `slice`. Inspection:
-`type_of`. `slice` takes character offsets so it cannot cut a UTF-8 character in
-half, while `len` still counts bytes; `sqrt` of a negative and a `pow` that
-overflows fail loudly instead of returning `NaN` or infinity. A runtime error
-names its position as `[Line 2, Col 13]` with a byte column that reads
-identically in every host, a wrong argument count says
+`type_of`. Sandboxed I/O and data: `fs.read_text`, `fs.write_text`,
+`json.parse`, `json.stringify`. `slice` takes character offsets so it cannot cut
+a UTF-8 character in half, while `len` still counts bytes; `sqrt` of a negative
+and a `pow` that overflows fail loudly instead of returning `NaN` or infinity.
+`json` handles the four scalar kinds a 16-byte value can carry and refuses
+arrays and objects by name; `fs` accepts only paths inside a root the embedder
+granted. A runtime error names its position as `[Line 2, Col 13]` with a byte
+column that reads identically in every host, a wrong argument count says
 `[Line 1, Col 1]: Mismatched arity in call 'clamp': takes 3 arguments, got 2`,
 `last_exec_micros` carries the most recent execution time in microseconds
 through bytes that were already padding, and `eval_str` / `eval` hand back
@@ -49,7 +63,7 @@ Both SDKs can report the same answer (`omni.check_updates()`,
 in the engine's `omni_check_update` export so every surface agrees on what
 "newer" means. Plain HTTP is refused by default.
 
-**Quality.** 34 of 34 cross-host verification rows pass on this machine: 272 Rust
+**Quality.** 34 of 34 cross-host verification rows pass on this machine: 322 Rust
 tests, 122 Python, 116 Node, plus the C embedding example. `cargo fmt --check` and
 `cargo clippy -- -D warnings` are clean.
 

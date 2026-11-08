@@ -90,10 +90,17 @@ engine.eval('len("héllo")');                      // 6 (bytes)
 
 A `Result` is `{ tag, number, text, value }`. `eval` skips the wrapper and
 returns the language value as a native JS primitive: `number`, `string`,
-`boolean`, or `null` for an empty program. Seventeen builtins — `abs`, `min`,
+`boolean`, or `null` for an empty program. Twenty-one builtins — `abs`, `min`,
 `max`, `clamp`, `floor`, `ceil`, `round`, `pow`, `sqrt`, `len`, `trim`, `upper`,
-`lower`, `contains`, `replace`, `slice`, `type_of` — need no registration, and `stats().lastExecMicros` reports the most recent execution
-in microseconds. `text` is a `Buffer` with the
+`lower`, `contains`, `replace`, `slice`, `type_of`, `fs.read_text`,
+`fs.write_text`, `json.parse`, `json.stringify` — need no registration, and
+`stats().lastExecMicros` reports the most recent execution
+in microseconds. `json.parse` and `json.stringify` cover the scalar kinds ABI 4
+can carry and refuse arrays and objects. The two `fs` builtins fail closed
+through this SDK: permission roots are granted by a Rust embedder, and ABI 4 has
+no export that adds one, so a script gets
+`fs.read_text is disabled: this engine has no filesystem read permission`
+rather than disk access. `text` is a `Buffer` with the
 exact bytes of a string result — NULs included, because OmniEngine strings are
 length-delimited rather than C strings — and `value` is those bytes decoded as
 UTF-8. `number` is `0` for a string, on purpose: those eight payload bytes are

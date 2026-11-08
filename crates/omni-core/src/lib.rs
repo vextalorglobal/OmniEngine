@@ -18,7 +18,10 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod arena;
+pub mod ast;
+pub mod bytecode;
 pub mod engine;
+pub mod json;
 pub mod lexer;
 pub mod object;
 pub mod update;
@@ -36,7 +39,7 @@ static COUNTED: counted::Counting = counted::Counting;
 pub use arena::{Arena, Mark};
 pub use engine::{
     BatchItem, Engine, ErrorKind, HostCall, HostError, HostOutcome, MAX_ARGS, MAX_CALL_DEPTH,
-    MAX_IDENTIFIER_LEN, OmniError, Stats,
+    MAX_IDENTIFIER_LEN, MAX_MODULE_DEPTH, OmniError, Stats,
 };
 pub use lexer::{BinOp, LexError, MAX_SOURCE_LEN, Token, TokenKind, lex, lex_into};
 pub use object::{MAX_STRING_LEN, StrRef};
@@ -48,4 +51,9 @@ pub use value::Value;
 /// Phase 2 (strings, `==`, `!=`) does not bump it: no Phase 1 program changes
 /// meaning, because `==` and string literals did not parse at all and `+` on two
 /// numbers is unchanged.
-pub const LANGUAGE_VERSION: u32 = 1;
+///
+/// Phase 6 does, because `import` is now a keyword: a program that used
+/// `import` as a variable name stops lexing. No other program that parsed at
+/// version 1 changes meaning — the VM is an implementation of the same
+/// semantics, not a revision of them.
+pub const LANGUAGE_VERSION: u32 = 2;

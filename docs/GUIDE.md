@@ -10,7 +10,7 @@ JavaScript can call, a custom file extension that GitHub recognises, and
 SDKs that install through `pip` and `npm`.
 
 Two numbering systems are in use and both are kept, because the brief's five
-phases are how the work was asked for and how section 7 is scored. **"Phase 1–5"
+phases are how the work was asked for and how section 8 is scored. **"Phase 1–5"
 means the brief's deliverables** (workspace, core, bridge, Linguist, SDKs).
 **"The strings increment" or "ABI v2"** means the second round of work on the
 language and the bridge — strings, the egress memory model, and the four new
@@ -34,11 +34,12 @@ or Phase 3.
 | Batch execution, benchmarks, ABI v4 | done | `omni_exec_many` + `omni_batch_error`, checkpointed arena reclamation, three zero-dependency benchmark harnesses and `scripts/bench.sh` (§4.8, §4.9) |
 | Packaging, distribution, release | done | platform wheels with the engine inside, an npm tarball with five engines, `scripts/package.py`, `scripts/check-versions.py`, `.github/workflows/release.yml` (§6.7, `docs/RELEASING.md`) |
 | DevPack: builtins, positions, timer, sugar | done | 17 builtins, `[Line N, Col M]` errors, `last_exec_micros` in ABI-4 padding, `eval_str` / `eval` (§3.5, §4.4, §6.1–6.2) |
+| Phase 6 — bytecode VM, modules, sandbox | done | AST lowering and a stack VM behind the unchanged ABI 4, `import` with namespace isolation, `fs` / `json` builtins (21 total), 226 `omni-core` tests (§7) |
 | Auto-updater and CLI manager | done | `omni_check_update` in the C ABI, `omni update` / `omni check-update` / `omniup`, `omni.check_updates()` and `checkUpdates()`, `scripts/cli-binaries.py` + `scripts/make-manifest.py` (§6.4–6.5) |
 | Same answer from four hosts | done | `scripts/verify-all.sh` — 34 rows, all passing |
 
 ```
-cargo test --workspace          # 272 tests
+cargo test --workspace          # 322 tests
 ./scripts/verify-all.sh         # Rust, C, Python, Node: 42, "hello, world", ABI 4
 ./scripts/bench.sh              # three hosts, one crossing each, measured
 python scripts/check-versions.py  # one version, one ABI across every surface
@@ -357,28 +358,33 @@ undefined variable. Columns are byte offsets from the start of the line, which i
 what makes the lexer cheap; the error text carries the decoded character so the
 number is never the only clue.
 
-### 3.4 The engine parses and evaluates in one pass
+### 3.4 The grammar, and how a program is executed
 
-The core deliberately has **no AST type**. `Engine::exec` lexes once and then
-walks the token stream while evaluating, because an expression language with no
-user-defined functions has nothing to reuse a tree for. Adding an AST later is a
-refactor-with-a-home (section 10), not a rewrite.
+A program is lexed into a token buffer, parsed into a flat AST, lowered into
+bytecode, and executed by a stack VM (section 7). The AST is deliberately flat:
+a node is an index into one `Vec<Node>`, every child is a `u32`, and `NONE` is
+the absent child. The parser never calls a `Node` by value and lowering never
+recurses, so expression depth costs heap that the engine already owns rather
+than native stack.
 
 ```
 program  := ( stmt )*                      // ';' is an optional separator
-stmt     := 'let' IDENT '=' expr | expr
+stmt     := 'let' IDENT '=' expr | 'import' STRING | expr
 expr     := additive ( ( '==' | '!=' ) additive )*
 additive := term ( ( '+' | '-' ) term )*
 term     := factor ( ( '*' | '/' | '%' ) factor )*
 factor   := ( '-' | '+' )? primary
-primary  := NUMBER | STRING | call | IDENT | '(' expr ')'
-call     := IDENT '(' ( expr ( ',' expr )* )? ')'      // <= MAX_ARGS arguments
+primary  := NUMBER | STRING | call | qualified | '(' expr ')'
+call     := qualified '(' ( expr ( ',' expr )* )? ')'  // <= MAX_ARGS arguments
+qualified := IDENT ( '.' IDENT )?
 ```
 
 The `IDENT '('` lookahead is what separates a call from a name: `pair` reads a
 binding and `pair()` reads the host function registry, so a host may install both
-under one name and the grammar tells them apart without a second namespace. The
-rule sits at the *primary* level, which is why a call binds tighter than every
+under one name and the grammar tells them apart without a second namespace. A
+dotted name is a module export (`math.answer`) and a dotted call is checked
+against the registry exactly like a bare one. The call rule sits at the
+*primary* level, which is why a call binds tighter than every
 operator — `square(6) + 1` is 37, not a parse error.
 Precedence comes from the recursive descent, left-to-right, so `2 + 3 * 4` is
 14 and `(2 + 3) * 4` is 20 — both tested. Comparison is one level looser than
@@ -405,7 +411,7 @@ fallen into:
 
 ### 3.5 Builtins, positions, and the execution timer
 
-Seventeen builtins are callable from any script with the same syntax a host
+Twenty-one builtins are callable from any script with the same syntax a host
 function uses. A host registration with the same name wins, and arity is
 checked before the call is entered, so a builtin can never see a call it was
 not written for.
@@ -423,6 +429,10 @@ not written for.
 | `replace(text, old, new)` | 3 | leftmost-first; an empty `old` is a no-op, not an insertion between characters |
 | `slice(text, start, end)` | 3 | **character** offsets, clamped to the string; an inverted range is empty |
 | `type_of(value)` | 1 | `"number"`, `"string"`, `"boolean"`, or `"null"` |
+| `fs.read_text(path)` | 1 | UTF-8 text from a file inside a granted read root; at most `MAX_STRING_LEN` |
+| `fs.write_text(path, text)` | 2 | writes UTF-8 bytes inside a granted write root; returns `null` |
+| `json.parse(text)` | 1 | one scalar: number, string, boolean, or `null` |
+| `json.stringify(value)` | 1 | JSON text for a scalar; `undefined` is a runtime error |
 
 `slice` deliberately counts characters while `len` counts bytes: a byte cut can
 land inside a multi-byte character and produce text no host can decode, so the
@@ -430,6 +440,22 @@ cutting operation pays for a character walk and the measuring operation keeps
 reporting the storage a caller allocates for. `type_of` answers `"null"` only
 for a value a host callback produced, because the grammar has no `null` literal
 yet; there is no `"array"` or `"object"` because ABI 4 has no collection type.
+
+The `fs` and `json` builtins are sandboxed. No permission root exists by
+default, so both filesystem calls fail closed with
+`fs.read_text is disabled: this engine has no filesystem read permission`. A
+Rust embedder opts in with `Engine::allow_fs_read(path)` or
+`Engine::allow_fs_write(path)`, which canonicalize the directory and return an
+`io::Result`. A read canonicalizes the target and requires it under a read
+root; a write canonicalizes the target's parent, so a new file is allowed and
+`..` is not. A target outside every root is the engine's
+`path '…' is outside the allowed read roots`, not the platform's wording, so
+the same bytes reach every host. JSON covers the four scalar kinds a 16-byte
+value can carry; an array or object is a deliberate error rather than a
+string-shaped stand-in, and `json.stringify(undefined)` is refused because
+dropping it would produce text that parses back as a different program's value.
+Stringification escapes quotes, backslashes, and control characters and passes
+non-ASCII UTF-8 through.
 
 The string builtins reuse one scratch buffer on the engine, then copy the result
 into the egress block: a chain such as `upper(trim(s))` builds no temporary
@@ -668,7 +694,7 @@ whole — `[Line 1, Col 5]: expected a name, found ''=''` — and the contract t
 asserts both the line and the column survive the boundary. Note the doubled
 quotes around `=`: that is the engine, not the SDK. `display_kind` renders a
 symbol as `'='` and the message template wraps it in quotes a second time. The
-hosts pass the text through untouched rather than prettifying it, and section 10
+hosts pass the text through untouched rather than prettifying it, and section 11
 records the one-character fix.
 
 **A zero-length program is legal even from a null pointer.** Node hands an empty
@@ -1244,7 +1270,7 @@ The CLI installs globally from the checkout; both binaries land in `~/.cargo/bin
 
 ```bash
 cargo install --path crates/omni-cli   # omni and omniup
-omni --version                         # omni 0.1.0 (language v1, ABI 4)
+omni --version                         # omni 0.1.0 (language v2, ABI 4)
 omni run examples/hello.omni           # 42
 ```
 
@@ -1254,7 +1280,7 @@ Running it without installing works too:
 cargo run -p omni-cli -- run examples/hello.omni      # 42
 cargo run -p omni-cli -- run examples/strings.omni    # hello, world 😀
 cargo run -p omni-cli -- eval "2 + 3 * 4"             # 14
-cargo run -p omni-cli -- --version                    # omni 0.1.0 (language v1, ABI 4)
+cargo run -p omni-cli -- --version                    # omni 0.1.0 (language v2, ABI 4)
 cargo run -p omni-cli -- check-update                 # 0, or 10 when newer exists
 cargo run -p omni-cli -- update --dry-run             # 10, downloads nothing
 ```
@@ -1284,7 +1310,7 @@ should be readable, so it asks the owner. That distinction is a test
 (`a_string_result_prints_its_content`), not a comment.
 
 `--version` answers without loading a program or touching the network: it reads
-the compiled-in `CARGO_PKG_VERSION`, says `language v1`, and reports the ABI the
+the compiled-in `CARGO_PKG_VERSION`, says `language v2`, and reports the ABI the
 binary was built against. A script that gates on the engine's version pays for
 one process spawn, nothing else.
 
@@ -1542,7 +1568,135 @@ needs. Publishing uses PyPI Trusted Publishing (no stored password) and
 
 ---
 
-## 7. Verification
+## 7. Phase 6 — Bytecode VM, modules, and the sandbox
+
+### 7.1 Four stages behind the same four exports
+
+Phase 6 replaced the fused parse-and-evaluate walk with four stages:
+
+```
+source -> lexer -> flat AST -> lowering -> Chunk -> stack VM
+```
+
+Nothing above the core changed. `omni_exec`, `omni_exec_many`,
+`omni_register_host_fn`, and the 16-byte `OmniValue` are the same ABI 4
+functions with the same bytes on the wire, because the VM is an implementation
+of `Engine::exec` rather than a new entry point. What did change is the
+language level: `import` is now a keyword, so `LANGUAGE_VERSION` is 2 and
+`omni --version` prints `language v2`. A script that used `import` as an
+identifier is the only kind that sees a difference.
+
+### 7.2 The instruction set
+
+The VM is a stack machine. An instruction is fixed-size and carries its own
+source position, so a runtime failure points at the operator or name that
+caused it without a side table.
+
+| OpCode | Operands | Effect | Lowered from |
+| --- | --- | --- | --- |
+| `PUSH_NUMBER` | source span | push a number literal | a number |
+| `PUSH_STR` | source span | decode and push a string literal | a string |
+| `PUSH_NIL` | — | push `null` | reserved for a future `nil` literal |
+| `PUSH_UNDEF` | — | push `undefined` | an empty program |
+| `LOAD` | name offset, length | push a binding | `x`, `ns.x` |
+| `STORE` | name offset, length | pop into a binding, push it back | `let x = e` |
+| `POP` | — | discard the top | a non-final statement |
+| `ADD` … `MOD` | — | pop two, push one | `+ - * / %` |
+| `EQ`, `NE` | — | pop two, push a boolean | `==`, `!=` |
+| `NEG` | — | pop one, push its negation | unary `-` |
+| `JUMP` | target | continue at `target` | reserved for control flow |
+| `JUMP_IF_FALSE` | target | pop and branch when falsy | reserved for control flow |
+| `CALL` | name offset, length, argc | pop `argc` values, push one result | `f(a, b)` |
+| `RET` | — | return the top of the stack | end of every chunk |
+| `IMPORT` | source span | load a module, bind its namespace | `import "m"` |
+
+`Jump`, `JumpIfFalse`, and `PushNil` have no lowering source yet — the grammar
+has no `if` and no `nil` literal — but they are part of the VM contract and the
+dispatch loop, and `bytecode.rs` exercises them with hand-built chunks so the
+control-flow path is tested before the syntax that emits it exists. A chunk
+that would underflow its stack is a runtime fault with a position, not a panic.
+
+### 7.3 Lowering
+
+Each statement is lowered post-order, and the only piece of native recursion is
+the descent the parser already did. The compiler walks an explicit `Task` stack
+owned by the engine:
+
+- `Visit(node, depth)` pushes the work for one node. Children go on in reverse
+  execution order, so the leftmost operand pops first; the combining
+  instruction sits underneath them and emits only once they are done.
+- `Emit(op, …)` appends the instruction.
+
+The rules are one line each: `let e` lowers `e` then `STORE` (the value stays,
+so a `let` evaluates to its binding); a binary node lowers both operands then
+its opcode; a call interns its name and then schedules `CALL` under its
+argument visits. Names live in `Chunk::names` and an instruction addresses a
+byte slice, so `LOAD`/`STORE`/`CALL` stay fixed-size and a warm program allocates
+no `String` per identifier. String literals stay as source spans and are decoded
+when `PUSH_STR` runs, which is what keeps `1 / 0` reported before a bad escape
+later in the same expression.
+
+The order of the three call checks is the fused parser's, because it is
+observable: depth (`calls are nested 64 deep…`), then existence
+(`unknown function 'f' …`), then the arguments. `nope(1 / 0)` must name `nope`.
+Depth is syntactic — the number of enclosing calls — so `id(id(…))` hits the
+same limit at the same nesting it always did, without growing the VM stack.
+
+The buffers — tokens, AST, chunk, VM stack, and the lowering work stack — are
+all engine-owned and cleared rather than freed. A 100,000-term `1 + 1 + …`
+lowers and runs without touching the native stack; the test lives in
+`engine.rs`, and the Python SDK's 2,000-term row runs through the same path.
+
+### 7.4 Modules
+
+Language version 2 adds one statement, `import "path"`. The request resolves to
+`<module_root>/<path>[.omni]`, is canonicalized, and must start with the
+canonical module root; absolute paths, `..`, and symlinks that leave the root are
+refused by that one check. The namespace is the file stem, so `lib/math` and
+`lib/math.omni` both bind `math`.
+
+Each module runs in a **fresh child engine**. It sees builtins, including `fs`
+and `json`; it inherits the parent's filesystem roots and module root; it does
+**not** inherit the parent's globals or host-function registrations, so a module
+cannot call a callback the embedder never exposed to it. After it runs, every
+top-level `let` whose name has no dot and does not start with `_` is exported —
+the leading underscore is the entire privacy rule. Imported names are dotted and
+are not re-exported. Values are copied into the importing execution: scalars by
+value, strings by copying the bytes out of the child arena before it is
+reclaimed.
+
+There are no function values at language version 2, so a module exports data,
+not behaviour. `math.answer` is a `LOAD`; `math.answer()` fails with the ordinary
+unknown-function error naming `math.answer`. Import depth is capped at 16
+(`MAX_MODULE_DEPTH`); a cycle is detected against the canonical paths currently
+loading and reported as `circular import: a -> b -> a`; an error inside a module
+keeps its line and column and gains the prefix `in module 'math': …`. There is
+no module cache in Phase 6 — importing the same file twice executes it twice,
+which keeps exported strings owned by the execution that used them. Permission
+is opt-in: `Engine::set_module_root` must be called, or imports fail with
+`import is disabled: this engine has no module root`.
+
+### 7.5 The filesystem and JSON builtins
+
+`fs.read_text` and `fs.write_text` are described with the rest of the toolkit in
+§3.5: no root means fail closed, canonicalization decides containment, and the
+refusal is the engine's text rather than the platform's. `json.parse` and
+`json.stringify` handle exactly the four scalar kinds a 16-byte value can carry,
+and refuse arrays and objects by name instead of inventing a collection type the
+ABI cannot return.
+
+### 7.6 What Phase 6 did not change
+
+The thirty-four verification rows are the same thirty-four rows. The FFI tests,
+the SDKs, the batch API, the updater, and the packaging are untouched. The new
+surface is Rust-level (`set_module_root`, `allow_fs_read`, `allow_fs_write`) or
+script-level (`import`, four builtins); wiring permissions into the CLI and the
+SDK constructors is a later increment, so a script run through `omni` can call
+`json.parse` but cannot read a file.
+
+---
+
+## 8. Verification
 
 One command, and it is the acceptance test for the whole brief:
 
@@ -1558,7 +1712,7 @@ Measured output on 2026-11-07, with the DevPack and updater increments in it:
 
 Rust tests... Shared library... omni-cli... C embedding... Python SDK... Node SDK... A string is the same bytes in every host... One type error, the same text everywhere... Every surface agrees on the ABI level... String results do not grow memory... A host function answers the same bytes in every host... A host failure is data, and says so identically... Re-entering the engine from a callback is refused, not crashed... The registry says the same thing from both sides... A batch answers the same items in every host... A failing item names itself identically in every host... A batch counts items, not crossings, and reserves nothing extra... A batch inside a host callback is refused, not crashed... The DevPack math, string and type builtins answer the same in every host... A second-line error names line and byte column in every host... eval_str and eval hand back native values... The last execution timer crosses as microseconds...
 == Results ==
-  PASS  cargo test --workspace (272 tests)
+  PASS  cargo test --workspace (322 tests)
   PASS  omni.dll (5.8M)
   PASS  omni run examples/hello.omni -> 42
   PASS  omni run examples/strings.omni -> hello, world 😀
@@ -1583,14 +1737,14 @@ Rust tests... Shared library... omni-cli... C embedding... Python SDK... Node SD
   PASS  line 2, column 13, and the operator's message in: cli python node
   PASS  int/number, str/string, bool/boolean with no wrapper in: python node
   PASS  one 200 KB execution timed, non-zero and in microseconds: python(857us) node(883us)
-  PASS  omni --version -> omni 0.1.0 (language v1, ABI 4)
+  PASS  omni --version -> omni 0.1.0 (language v2, ABI 4)
   PASS  omni check-update -> 0, omni 0.1.0 is up to date (ABI 4)
   PASS  omni check-update -> 10, omni 99.0.0 is available; this build is 0.1.0
   PASS  omni check-update -> 11, release 99.0.0 speaks ABI 5; this build speaks ABI 4
   PASS  omniup update -> 3, target unchanged
   PASS  omniup update --dry-run -> 10, nothing fetched
   PASS  omniup update -> 0, target now the release bytes
-  PASS  the replaced binary still runs: omni 0.1.0 (language v1, ABI 4)
+  PASS  the replaced binary still runs: omni 0.1.0 (language v2, ABI 4)
   PASS  omni update -> 0, the running image is kept at omni.exe.bak
 
 All checks that could run, passed.
@@ -1650,7 +1804,7 @@ Against the brief's five phases:
 
 | Phase | Asked for | Verified by |
 | --- | --- | --- |
-| 1 | Workspace on D:, fast compiles, managed `target/` | `cargo test --workspace` 272 tests; `target/` measured at 351 MB |
+| 1 | Workspace on D:, fast compiles, managed `target/` | `cargo test --workspace` 322 tests; `target/` measured at 351 MB |
 | 2 | Ultra-fast memory-safe core, no GC | NaN-boxed 8-byte `Value` asserted for size; arena reset is O(chunks); egress rewind keeps reservations flat over 100,000 executions; no collector exists to pause |
 | 3 | C ABI callable from Python and JavaScript | same `42` and the same `hello, world 😀` from Rust, C, Python, Node; 16 exports confirmed with `objdump -p`; `omni.h` compiles warning-free under `-Wall -Wextra` |
 | 4 | A custom extension GitHub recognises | `.gitattributes` tier 1; the tier-2 limit is stated in section 5.3 rather than glossed over |
@@ -1673,7 +1827,7 @@ cargo fmt --all --check                                  # clean
 
 ---
 
-## 8. Storage ledger
+## 9. Storage ledger
 
 Measured, all of it on this machine, at the time of writing. Sizes are `du`,
 which is what the drive charges; file-byte totals differ because the registry
@@ -1710,7 +1864,7 @@ complexity one.
 
 ---
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
 **`link: missing operand after '■'`** — MSVC's linker is being shadowed by Git
 for Windows' coreutils `link.exe`. Run `where link`. This workspace pins the GNU
@@ -1808,7 +1962,7 @@ the call site.
 
 ---
 
-## 10. What comes next
+## 11. What comes next
 
 Three increments shipped after the first bridge. Strings made `OmniValue` a union,
 promoted a result's bytes into a block a host can copy from, and made
@@ -1824,8 +1978,11 @@ fits in a minute. Nothing in that round changed the language or the ABI. A fifth
 round added the developer toolkit without moving the ABI either: seventeen
 math, string and type builtins, errors that point at a line and byte column in every host, an
 execution timer in four bytes that were already padding, and native-value sugar
-(`eval_str` / `eval`) in both SDKs. The next language increment is still the one
-section 3.7 lists — control flow, collections, and user-defined functions.
+(`eval_str` / `eval`) in both SDKs. A sixth replaced the one-pass evaluator with
+an AST and a bytecode VM — still behind unchanged ABI 4 — and added `import`,
+the module sandbox, filesystem permissions, and scalar JSON. The next language
+increment is still the one section 3.7 lists — control flow, collections, and
+user-defined functions.
 
 Release-side, three things are deliberately unfinished rather than unknown:
 
@@ -1844,9 +2001,10 @@ What the same memory model is still waiting for, in rough order:
 1. **Booleans, `nil`, `undefined` as literals.** The tags and singletons already
    exist in `Value`; only the parser is missing. Booleans are values today — you
    can get one from `==` — but you cannot write one.
-2. **String operations.** `length`, indexing, slicing, comparison order, and a
-   way to get a number or a bool *into* a string. The box already stores the
-   length, so this is evaluator work, not layout work.
+2. **String operations.** `len`, `slice`, `contains`, and `replace` shipped,
+   but indexing, comparison order, and a way to get a number or a bool *into* a
+   string are still missing. The box already stores the length, so this is
+   evaluator work, not layout work.
 3. **A zero-copy result path for a host that wants one.** The harnesses in 4.9
    say the crossing is 36–240 ns and the wrapper is microseconds, and the
    wrapper's biggest single cost is copying string bytes out. A borrow API —
@@ -1854,26 +2012,23 @@ What the same memory model is still waiting for, in rough order:
    lives under — is the next performance increment, and the benches are the
    instrument it will be judged by. A batch already makes all N results live at
    once, so a borrow and a batch compose.
-4. **An AST.** Extracting one from the current one-pass evaluator, so functions
-   and control flow have something to be built from. A call node is the first
-   thing an AST would buy back: today `parse_call` evaluates its arguments as it
-   reads them, so a host function cannot see the source text of its own call, and
-   that is what macros, lazy arguments, and closures would need.
-5. **User-defined functions and control flow.** Host functions settled the call
-   *syntax*, the arity check, and the depth guard, so what remains is language-side
-   frames — which is where the arena's `reset`-per-exec model needs re-examining.
-6. **wasm for real.** `wasm-bindgen`, the `wasm32-unknown-unknown` target, and a
+4. **User-defined functions and control flow.** The AST and the VM are in place:
+   `Jump`, `JumpIfFalse`, and `Call` are defined, and the branch opcodes are
+   tested against hand-built chunks. What remains is a function value, a frame,
+   the syntax that emits branches, and a decision about whether the arena still
+   resets per execution once a frame can outlive a statement.
+5. **wasm for real.** `wasm-bindgen`, the `wasm32-unknown-unknown` target, and a
    browser example; the shape is already scaffolded and asserted to agree with
    the C statuses. A wasm string will need its own copy rule, since there is no
    shared address space to rewind inside, and a host callback needs a `JsFunction`
    rather than a function pointer.
-7. **Linguist tier 2.** The upstream PR from section 5.3, which would also make
+6. **Linguist tier 2.** The upstream PR from section 5.3, which would also make
    the new `examples/strings.omni` show up under its own language name.
 
 **One cosmetic defect, deliberately left for its own commit.** `display_kind`
 already quotes a symbol — `'='` — and two parse-error templates wrap it in quotes
-again, so `let = 1` reports `found ''=''`. It is in `crates/omni-core/src/engine.rs`
-at the `format!` calls in `expect_ident` and `parse_error_kind`, and no test
+again, so `let = 1` reports `found ''=''`. It is in `crates/omni-core/src/ast.rs`
+at the `format!` calls in `expect_ident` and its parser helper, and no test
 asserts the doubled form, so it is a safe first issue. It stayed out of this
 increment because the strings work changed the ABI and the memory model, and a
 commit that does both is a commit whose regressions cannot be attributed. The SDKs

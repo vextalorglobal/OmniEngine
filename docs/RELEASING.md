@@ -181,7 +181,7 @@ ls node_modules/omniengine/native/*/
 Then the update channel, from the same outside directory:
 
 ```bash
-omni --version            # omni 0.1.0 (language v1, ABI 4)
+omni --version            # omni 0.1.0 (language v2, ABI 4)
 omni check-update; echo $?  # 0 -- the release you just published is current
 omni update --dry-run; echo $?  # 10 only when a *later* release exists
 ```

@@ -1,10 +1,21 @@
-//! The engine: a fused parse-and-evaluate pass over the grammar.
+//! The engine: lex, lower to bytecode, execute on a stack VM.
 //!
-//! There is no AST type here. That is deliberate rather than an oversight: an
-//! AST invented now would be discarded when the bytecode VM lands, and inventing
-//! it would also freeze a node shape before the resolver knows what it needs. The
-//! parser evaluates while descending, which is enough for expressions, `let`,
-//! strings, and comparison, and nothing more.
+//! Phase 6 replaced the fused parse-and-evaluate pass with four stages:
+//!
+//! ```text
+//! source ──lex──▶ tokens ──parse──▶ flat AST ──lower──▶ Chunk ──execute──▶ value
+//! ```
+//!
+//! The tree and the chunk are owned by the engine and cleared rather than
+//! reallocated, so a warm program never asks the system allocator for them.
+//! `run` takes both out with `mem::take` for the duration of one execution and
+//! puts them back on every path, success or error.
+//!
+//! The VM is a stack machine whose instructions are defined in
+//! [`crate::bytecode`]. It calls the same arithmetic, equality, concatenation,
+//! and host-call helpers the fused evaluator used, so the string lifetime rules
+//! and the divide-by-zero rule stay stated once. `omni_exec` and
+//! `exec_many` call `run` exactly as before: the ABI did not change.
 //!
 //! ## Memory model in this file
 //!
@@ -29,11 +40,15 @@
 
 use std::borrow::Cow;
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::Value;
 use crate::arena::{Arena, Slot};
-use crate::lexer::{BinOp, LexError, Token, TokenKind, lex_into};
+use crate::ast::Ast;
+use crate::bytecode::{Callable, Chunk, Instr, OpCode};
+use crate::json;
+use crate::lexer::{BinOp, LexError, Token, lex_into};
 use crate::object::{self, MAX_STRING_LEN, StrRef};
 
 /// Longest identifier the arena binding cell can hold inline. A bump allocator
@@ -53,6 +68,11 @@ pub const MAX_ARGS: usize = 16;
 /// counted per engine and reset with each execution, because an aborted
 /// evaluation never runs its unwinding.
 pub const MAX_CALL_DEPTH: u32 = 64;
+
+/// How deep `import` may nest before the loader refuses. Modules on disk are
+/// bounded by the filesystem anyway; the limit turns a runaway chain of imports
+/// into a named error rather than a walk that never finishes.
+pub const MAX_MODULE_DEPTH: usize = 16;
 
 /// The category of a failure, which the FFI maps onto status codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,7 +105,7 @@ pub struct Pos {
 }
 
 impl Pos {
-    fn new(line: u32, column: u32) -> Pos {
+    pub(crate) fn new(line: u32, column: u32) -> Pos {
         Pos { line, column }
     }
 }
@@ -99,7 +119,7 @@ pub struct OmniError {
 }
 
 impl OmniError {
-    fn new(kind: ErrorKind, at: Pos, message: impl Into<String>) -> OmniError {
+    pub(crate) fn new(kind: ErrorKind, at: Pos, message: impl Into<String>) -> OmniError {
         OmniError {
             kind,
             line: at.line,
@@ -214,95 +234,12 @@ struct Global {
     owned: Option<Box<[u8]>>,
 }
 
-/// A source buffer and the tokens lexed from it, borrowed together.
+/// One value on the VM stack.
 ///
-/// Not an AST — the parser still evaluates while descending, and there is still
-/// no node type. This pairs the two things every parse step needs so the token
-/// vector can be *owned by the engine* and refilled per execution. A token that
-/// borrowed the source would have made that vector self-referential, which is
-/// the whole reason [`Token`] carries offsets instead.
-struct Tokens<'a> {
-    source: &'a str,
-    tokens: &'a [Token],
-}
-
-impl<'a> Tokens<'a> {
-    /// Resolve one token's text against the source it was lexed from.
-    fn text(&self, token: Token) -> &'a str {
-        token.text(self.source)
-    }
-
-    /// Where a token starts, as a line and byte column.
-    fn pos(&self, token: Token) -> Pos {
-        Pos::new(token.line, column_at(self.source, token.start as usize))
-    }
-
-    /// Where the token at `index` starts; the end of input for an index past it,
-    /// which is what an "unexpected end" error has to point at.
-    fn pos_at(&self, index: usize) -> Pos {
-        match self.tokens.get(index) {
-            Some(token) => self.pos(*token),
-            None => self.end_pos(),
-        }
-    }
-
-    fn end_pos(&self) -> Pos {
-        let line = self.tokens.last().map_or(1, |token| token.line);
-        let column = self
-            .source
-            .rsplit('\n')
-            .next()
-            .map_or(1, |tail| tail.len() as u32 + 1);
-        Pos::new(line, column)
-    }
-}
-
-/// One-based byte column of `offset` in `source`.
-///
-/// `offset` is always a token boundary the lexer produced, and every such
-/// boundary is a `char` boundary, so slicing is safe; a caller that pairs an
-/// offset with the wrong source gets column 1 rather than a panic.
-fn column_at(source: &str, offset: usize) -> u32 {
-    let Some(before) = source.get(..offset) else {
-        return 1;
-    };
-    let line_start = before.rfind('\n').map_or(0, |newline| newline + 1);
-    (offset - line_start + 1) as u32
-}
-
-/// The arguments of one call, held on the stack.
-///
-/// `MAX_ARGS + 1` slots so the argument that breaks the limit has somewhere to
-/// land before the overflow is reported — the same shape the allocating version
-/// had, minus one heap allocation per call site. [`MAX_CALL_DEPTH`] bounds how
-/// many of these can be live at once, which is what makes the stack cost a
-/// stated number rather than an open question.
-struct Args {
-    buf: [Value; MAX_ARGS + 1],
-    len: usize,
-}
-
-impl Args {
-    fn new() -> Args {
-        Args {
-            buf: [Value::UNDEF; MAX_ARGS + 1],
-            len: 0,
-        }
-    }
-
-    fn push(&mut self, value: Value) {
-        self.buf[self.len] = value;
-        self.len += 1;
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn as_slice(&self) -> &[Value] {
-        &self.buf[..self.len]
-    }
-}
+/// The stack is a `Vec<Value>` owned by the engine. Clearing it per execution
+/// keeps its capacity, and a value is eight bytes with nothing to drop, so the
+/// push/pop traffic of a warm program never reaches the allocator.
+type Stack = Vec<Value>;
 
 /// What a host callback gives back.
 ///
@@ -405,11 +342,22 @@ pub struct Engine {
     /// this engine has run, which is the same bounded-reuse story the egress
     /// block tells: a warm engine lexes without touching the system allocator.
     tokens: Vec<Token>,
-    /// Gathering space for one concatenation, reused like the token buffer.
-    /// `string_of` borrows the engine and `new_string` needs it mutably, so the
-    /// two slices have to be gathered somewhere before the arena is touched;
-    /// this is that somewhere, and keeping it means a warm engine concatenates
-    /// without asking the system allocator for a buffer per `+`.
+    /// The flat tree, cleared and refilled per execution. Its node capacity is
+    /// the high-water mark of the largest program this engine has compiled.
+    ast: Ast,
+    /// The lowered instructions and identifier bytes, reused the same way.
+    chunk: Chunk,
+    /// Operand stack for the VM, cleared per execution.
+    stack: Stack,
+    /// Lowering work stack. The compiler walks this instead of the native call
+    /// stack, so a program whose expression spine is thousands deep cannot
+    /// overflow the thread it runs on. Reused like the other buffers.
+    tasks: Vec<crate::bytecode::Task>,
+    /// Gathering space for one concatenation or JSON string, reused like the
+    /// token buffer. `string_of` borrows the engine and `new_string` needs it
+    /// mutably, so the two slices have to be gathered somewhere before the
+    /// arena is touched; keeping it means a warm engine concatenates without
+    /// asking the system allocator for a buffer per `+`.
     scratch: Vec<u8>,
     /// Arena-resident `let` bindings for the current execution.
     bindings: Vec<Slot<Binding>>,
@@ -422,8 +370,29 @@ pub struct Engine {
     /// what makes `arena.reset()` safe to run while a call is on the stack — the
     /// callback's own identity is not in the arena.
     host_fns: Vec<HostFunction>,
-    /// Live `parse_call` frames, guarded against [`MAX_CALL_DEPTH`].
+    /// Live `parse_call` frames, guarded against [`MAX_CALL_DEPTH`]. Kept as
+    /// engine state because the fused parser owned it here; the AST parser uses
+    /// its own counter, so this is always zero between executions.
     call_depth: u32,
+    /// The directory `import` may read from. `None` means imports are disabled.
+    module_root: Option<PathBuf>,
+    /// Canonical paths of modules currently loading, innermost last. Cycles are
+    /// detected against this stack; it is empty between top-level executions.
+    loading_modules: Vec<PathBuf>,
+    /// Namespaces imported during the current execution, for a diagnostic that
+    /// names the module rather than the flattened `ns.name`.
+    namespaces: Vec<String>,
+    /// Exports of the modules imported this execution, keyed by `ns.name`.
+    ///
+    /// These do not live in [`Binding`] cells because a flattened name can be
+    /// twice [`MAX_IDENTIFIER_LEN`] plus a dot, and widening every `let` cell for
+    /// a case only imports create would trade the common path's memory for the
+    /// rare one. The table is cleared with the bindings it shadows.
+    module_bindings: Vec<(String, Value)>,
+    /// Directories `fs.read_text` may read. Empty means everything is denied.
+    fs_read_roots: Vec<PathBuf>,
+    /// Directories `fs.write_text` may write. Empty means everything is denied.
+    fs_write_roots: Vec<PathBuf>,
     last_value: Value,
     last_error: Option<OmniError>,
     execs: u64,
@@ -437,11 +406,21 @@ impl Engine {
             arena: Arena::new(),
             egress: Arena::new(),
             tokens: Vec::new(),
+            ast: Ast::new(),
+            chunk: Chunk::new(),
+            stack: Vec::new(),
+            tasks: Vec::new(),
             scratch: Vec::new(),
             bindings: Vec::new(),
             globals: Vec::new(),
             host_fns: Vec::new(),
             call_depth: 0,
+            module_root: None,
+            loading_modules: Vec::new(),
+            namespaces: Vec::new(),
+            module_bindings: Vec::new(),
+            fs_read_roots: Vec::new(),
+            fs_write_roots: Vec::new(),
             last_value: Value::UNDEF,
             last_error: None,
             execs: 0,
@@ -508,6 +487,8 @@ impl Engine {
         for source in sources {
             self.arena.reset_to(mark);
             self.bindings.clear();
+            self.module_bindings.clear();
+            self.namespaces.clear();
             self.call_depth = 0;
             self.execs += 1;
             let started = Instant::now();
@@ -548,6 +529,8 @@ impl Engine {
         self.arena.reset();
         self.bindings.clear();
         self.egress.rewind();
+        self.namespaces.clear();
+        self.module_bindings.clear();
         // An error mid-call returns through `?` and skips the decrement, so the
         // count is re-zeroed here rather than trusted to unwind cleanly.
         self.call_depth = 0;
@@ -780,45 +763,216 @@ impl Engine {
         }
     }
 
-    /// Lex into the engine's own buffer, evaluate, and hand the buffer back.
+    /// Lex, parse, lower, and run, handing every owned buffer back afterwards.
     ///
-    /// The take-and-restore is what lets a `Vec` owned by `self` be parsed by
-    /// methods that need `&mut self`: the buffer is a local for the duration of
-    /// the evaluation, so no borrow of `self` overlaps it. It goes back on the
-    /// error path too — a bad program must not cost the next good one a
-    /// reallocation.
+    /// The five buffers are taken out of `self` so the parser and the lowering
+    /// pass can borrow the engine immutably — they need to know which call
+    /// names resolve — while `&mut self` runs the VM. They go back on the error
+    /// path too: a bad program must not cost the next good one a reallocation.
     fn run(&mut self, source: &str) -> Result<Value, OmniError> {
         let mut tokens = std::mem::take(&mut self.tokens);
-        let result = self.run_tokens(source, &mut tokens);
+        let mut ast = std::mem::take(&mut self.ast);
+        let mut chunk = std::mem::take(&mut self.chunk);
+        let mut stack = std::mem::take(&mut self.stack);
+        let mut tasks = std::mem::take(&mut self.tasks);
+
+        let result = (|| -> Result<Value, OmniError> {
+            lex_into(source, &mut tokens)?;
+            ast.parse_into(source, &tokens)?;
+            crate::bytecode::compile(&ast, source, &*self, &mut chunk, &mut tasks)?;
+            self.run_chunk(&chunk, source, &mut stack)
+        })();
+
         self.tokens = tokens;
+        self.ast = ast;
+        self.chunk = chunk;
+        self.stack = stack;
+        self.tasks = tasks;
         result
     }
 
-    fn run_tokens(&mut self, source: &str, tokens: &mut Vec<Token>) -> Result<Value, OmniError> {
-        lex_into(source, tokens)?;
-        let t = Tokens { source, tokens };
-        let mut index = 0usize;
-        let mut last = Value::UNDEF;
-        loop {
-            // Statement separators are optional and non-significant.
-            while self.peek_kind(&t, index) == Some(TokenKind::Semi) {
-                self.advance(&mut index);
-            }
-            match self.peek_kind(&t, index) {
-                None | Some(TokenKind::Eof) => break,
-                Some(TokenKind::Let) => {
-                    self.advance(&mut index);
-                    let name_pos = t.pos_at(index);
-                    let name = self.expect_ident(&t, &mut index)?;
-                    self.expect(&t, &mut index, TokenKind::Eq)?;
-                    let value = self.parse_expr(&t, &mut index)?;
-                    self.bind(name, value, name_pos)?;
-                    last = value;
+    /// Execute one chunk. The stack is the engine's, cleared but not freed.
+    fn run_chunk(
+        &mut self,
+        chunk: &Chunk,
+        source: &str,
+        stack: &mut Stack,
+    ) -> Result<Value, OmniError> {
+        stack.clear();
+        let mut ip = 0usize;
+        while ip < chunk.code.len() {
+            let instr = chunk.code[ip];
+            let at = instr.pos();
+            ip += 1;
+            match instr.op {
+                OpCode::PushNumber => {
+                    let text = literal_span(source, instr);
+                    let number = text.parse::<f64>().map_err(|_| {
+                        OmniError::new(
+                            ErrorKind::Parse,
+                            at,
+                            format!("'{text}' is not a valid number"),
+                        )
+                    })?;
+                    stack.push(Value::from_f64(number));
                 }
-                _ => last = self.parse_expr(&t, &mut index)?,
+                OpCode::PushStr => {
+                    let bytes = decode_literal(literal_span(source, instr), at)?;
+                    let value = self.new_string(&bytes, at, ErrorKind::Runtime)?;
+                    stack.push(value);
+                }
+                OpCode::PushNil => stack.push(Value::NIL),
+                OpCode::PushUndef => stack.push(Value::UNDEF),
+                OpCode::Load => {
+                    let name = chunk.name(instr);
+                    match self.lookup(name) {
+                        Some(value) => stack.push(value),
+                        None => return Err(self.undefined_name(name, at)),
+                    }
+                }
+                OpCode::Store => {
+                    let value = top(stack, at)?;
+                    let name = chunk.name(instr);
+                    self.bind(name, value, at)?;
+                }
+                OpCode::Pop => {
+                    pop(stack, at)?;
+                }
+                OpCode::Add => self.binary(stack, BinOp::Add, at)?,
+                OpCode::Sub => self.binary(stack, BinOp::Sub, at)?,
+                OpCode::Mul => self.binary(stack, BinOp::Mul, at)?,
+                OpCode::Div => self.binary(stack, BinOp::Div, at)?,
+                OpCode::Mod => self.binary(stack, BinOp::Mod, at)?,
+                OpCode::Eq => {
+                    let rhs = pop(stack, at)?;
+                    let lhs = pop(stack, at)?;
+                    stack.push(Value::bool(self.eq_values(lhs, rhs)));
+                }
+                OpCode::Ne => {
+                    let rhs = pop(stack, at)?;
+                    let lhs = pop(stack, at)?;
+                    stack.push(Value::bool(!self.eq_values(lhs, rhs)));
+                }
+                OpCode::Neg => {
+                    let value = pop(stack, at)?;
+                    let number = value.as_f64().ok_or_else(|| {
+                        OmniError::new(
+                            ErrorKind::Runtime,
+                            at,
+                            format!(
+                                "type mismatch: cannot apply unary '-' to {}: {}",
+                                kind_of(value),
+                                self.show(value)
+                            ),
+                        )
+                    })?;
+                    stack.push(Value::from_f64(-number));
+                }
+                OpCode::Jump => {
+                    ip = instr.a as usize;
+                }
+                OpCode::JumpIfFalse => {
+                    let value = pop(stack, at)?;
+                    if !self.truthy(value) {
+                        ip = instr.a as usize;
+                    }
+                }
+                OpCode::Call => {
+                    let name = chunk.name(instr);
+                    let count = instr.c as usize;
+                    let start = stack.len().checked_sub(count).ok_or_else(|| {
+                        OmniError::new(ErrorKind::Panic, at, "the VM stack underflowed in a call")
+                    })?;
+                    let Some((callable, arity)) = self.resolve_call(name) else {
+                        return Err(OmniError::new(
+                            ErrorKind::Runtime,
+                            at,
+                            format!(
+                                "unknown function '{name}' \
+                                 (no host function or builtin has that name)"
+                            ),
+                        ));
+                    };
+                    if count != arity {
+                        return Err(OmniError::new(
+                            ErrorKind::Runtime,
+                            at,
+                            format!(
+                                "Mismatched arity in call '{name}': takes {arity} argument{}, got {count}",
+                                if arity == 1 { "" } else { "s" }
+                            ),
+                        ));
+                    }
+                    let result = match callable {
+                        Callable::Host(index) => self.invoke_host(index, name, &stack[start..], at),
+                        Callable::Builtin(which) => {
+                            self.invoke_builtin(which, name, &stack[start..], at)
+                        }
+                    };
+                    let value = result?;
+                    stack.truncate(start);
+                    stack.push(value);
+                }
+                OpCode::Ret => return Ok(pop(stack, at).unwrap_or(Value::UNDEF)),
+                OpCode::Import => {
+                    let bytes = decode_literal(literal_span(source, instr), at)?;
+                    let request = std::str::from_utf8(&bytes).map_err(|_| {
+                        OmniError::new(ErrorKind::Runtime, at, "import needs a UTF-8 module name")
+                    })?;
+                    self.import_module(request, at)?;
+                    stack.push(Value::UNDEF);
+                }
             }
         }
-        Ok(last)
+        // A chunk with no `Ret` — hand-built by a test or a future tool — ends
+        // with its top of stack as the result.
+        Ok(stack.pop().unwrap_or(Value::UNDEF))
+    }
+
+    fn binary(&mut self, stack: &mut Stack, op: BinOp, at: Pos) -> Result<(), OmniError> {
+        let rhs = pop(stack, at)?;
+        let lhs = pop(stack, at)?;
+        let value = self.arith(lhs, op, rhs, at)?;
+        stack.push(value);
+        Ok(())
+    }
+
+    /// The error for a name the VM could not load.
+    ///
+    /// A dotted name whose prefix is a namespace imported this execution gets a
+    /// message about visibility rather than a flattened variable name, because
+    /// that is the mistake the reader made: the module exists, the export does
+    /// not.
+    fn undefined_name(&self, name: &str, at: Pos) -> OmniError {
+        if let Some(dot) = name.find('.') {
+            let base = &name[..dot];
+            let member = &name[dot + 1..];
+            if self.namespaces.iter().any(|namespace| namespace == base) {
+                return OmniError::new(
+                    ErrorKind::Runtime,
+                    at,
+                    format!("module '{base}' has no public export '{member}'"),
+                );
+            }
+        }
+        OmniError::new(
+            ErrorKind::Runtime,
+            at,
+            format!("undefined variable '{name}'"),
+        )
+    }
+
+    fn resolve_call(&self, name: &str) -> Option<(Callable, usize)> {
+        if let Some(index) = self.find_host_fn(name) {
+            return Some((Callable::Host(index), self.host_fns[index].arity as usize));
+        }
+        builtin_for(name).map(|(which, arity)| (Callable::Builtin(which), arity))
+    }
+
+    /// Does a call name resolve? The lowering pass asks before it walks the
+    /// arguments, matching the fused parser's error order.
+    pub(crate) fn is_callable(&self, name: &str) -> bool {
+        self.find_host_fn(name).is_some() || builtin_for(name).is_some()
     }
 
     /// Allocate the binding's cell in the arena. A name longer than the fixed
@@ -841,13 +995,21 @@ impl Engine {
     }
 
     fn lookup(&self, name: &str) -> Option<Value> {
-        // Later bindings shadow earlier ones, and script bindings shadow host ones.
+        // Later bindings shadow earlier ones, and script bindings shadow both
+        // module exports and host ones.
         self.bindings
             .iter()
             .rev()
             .map(|s| s.get())
             .find(|b| b.name() == name)
             .map(|b| b.value())
+            .or_else(|| {
+                self.module_bindings
+                    .iter()
+                    .rev()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| *value)
+            })
             .or_else(|| {
                 self.globals
                     .iter()
@@ -857,258 +1019,371 @@ impl Engine {
             })
     }
 
-    /// Comparison sits one level below `+`, so `"a" + "b" == "ab"` parses as
-    /// `("a" + "b") == "ab"` and not as the nonsense the old two-level grammar
-    /// would have made of it.
-    fn parse_expr(&mut self, t: &Tokens<'_>, i: &mut usize) -> Result<Value, OmniError> {
-        let mut acc = self.parse_additive(t, i)?;
-        loop {
-            let want_equal = match self.peek_kind(t, *i) {
-                Some(TokenKind::EqEq) => true,
-                Some(TokenKind::NotEq) => false,
-                _ => break,
-            };
-            self.advance(i);
-            let rhs = self.parse_additive(t, i)?;
-            let same = self.eq_values(acc, rhs);
-            acc = Value::bool(if want_equal { same } else { !same });
-        }
-        Ok(acc)
+    // -- modules --------------------------------------------------------------
+
+    /// Allow `import` to resolve modules under `root`.
+    ///
+    /// The root is canonicalized once, here, so every later containment check
+    /// compares a canonical path to a canonical root. A host that passes a
+    /// relative path and one that passes an absolute path to the same directory
+    /// get the same permission.
+    pub fn set_module_root(&mut self, root: impl AsRef<Path>) -> std::io::Result<()> {
+        self.module_root = Some(root.as_ref().canonicalize()?);
+        Ok(())
     }
 
-    fn parse_additive(&mut self, t: &Tokens<'_>, i: &mut usize) -> Result<Value, OmniError> {
-        let mut acc = self.parse_term(t, i)?;
-        loop {
-            let op = match self.peek_kind(t, *i) {
-                Some(TokenKind::BinOp(BinOp::Add)) => BinOp::Add,
-                Some(TokenKind::BinOp(BinOp::Sub)) => BinOp::Sub,
-                _ => break,
-            };
-            let at = t.pos_at(*i);
-            self.advance(i);
-            let rhs = self.parse_term(t, i)?;
-            acc = self.arith(acc, op, rhs, at)?;
-        }
-        Ok(acc)
+    /// Turn imports off. The loader fails closed, so this restores the default.
+    pub fn clear_module_root(&mut self) {
+        self.module_root = None;
     }
 
-    fn parse_term(&mut self, t: &Tokens<'_>, i: &mut usize) -> Result<Value, OmniError> {
-        let mut acc = self.parse_factor(t, i)?;
-        loop {
-            let op = match self.peek_kind(t, *i) {
-                Some(TokenKind::BinOp(BinOp::Mul)) => BinOp::Mul,
-                Some(TokenKind::BinOp(BinOp::Div)) => BinOp::Div,
-                Some(TokenKind::BinOp(BinOp::Mod)) => BinOp::Mod,
-                _ => break,
-            };
-            let at = t.pos_at(*i);
-            self.advance(i);
-            let rhs = self.parse_factor(t, i)?;
-            acc = self.arith(acc, op, rhs, at)?;
+    /// Load one module and bind its public exports as `namespace.name`.
+    ///
+    /// The module runs in a fresh child engine. That is the isolation rule: a
+    /// module gets the builtins and the parent's filesystem permissions, but not
+    /// the parent's host globals or callbacks, and its bindings reach the parent
+    /// only through the export copy below.
+    fn import_module(&mut self, request: &str, at: Pos) -> Result<(), OmniError> {
+        if request.is_empty() {
+            return Err(OmniError::new(
+                ErrorKind::Runtime,
+                at,
+                "import needs a module name",
+            ));
         }
-        Ok(acc)
+        let Some(root) = self.module_root.clone() else {
+            return Err(OmniError::new(
+                ErrorKind::Runtime,
+                at,
+                "import is disabled: this engine has no module root",
+            ));
+        };
+        if self.loading_modules.len() >= MAX_MODULE_DEPTH {
+            return Err(OmniError::new(
+                ErrorKind::Runtime,
+                at,
+                format!("imports are nested {MAX_MODULE_DEPTH} deep, the limit"),
+            ));
+        }
+        let mut relative = PathBuf::from(request);
+        if relative.extension().is_none() {
+            relative.set_extension("omni");
+        }
+        let path = root.join(&relative).canonicalize().map_err(|_| {
+            OmniError::new(
+                ErrorKind::Runtime,
+                at,
+                format!("cannot import '{request}': no such module under the module root"),
+            )
+        })?;
+        // One containment check covers absolute requests, `..` escapes, and
+        // symlinks that point out of the tree, because the target is canonical.
+        if !path.starts_with(&root) {
+            return Err(OmniError::new(
+                ErrorKind::Runtime,
+                at,
+                format!("import '{request}' escapes the module root"),
+            ));
+        }
+        if !path.is_file() {
+            return Err(OmniError::new(
+                ErrorKind::Runtime,
+                at,
+                format!("cannot import '{request}': not a file"),
+            ));
+        }
+        if let Some(start) = self.loading_modules.iter().position(|p| p == &path) {
+            let mut chain: Vec<String> = self.loading_modules[start..]
+                .iter()
+                .filter_map(|p| module_stem(p))
+                .collect();
+            chain.push(module_stem(&path).unwrap_or_else(|| request.to_string()));
+            return Err(OmniError::new(
+                ErrorKind::Runtime,
+                at,
+                format!("circular import: {}", chain.join(" -> ")),
+            ));
+        }
+        let Some(namespace) = module_stem(&path) else {
+            return Err(OmniError::new(
+                ErrorKind::Runtime,
+                at,
+                format!("import '{request}' has no module name"),
+            ));
+        };
+        if !is_identifier(&namespace) {
+            return Err(OmniError::new(
+                ErrorKind::Runtime,
+                at,
+                format!("module name '{namespace}' is not a valid identifier"),
+            ));
+        }
+        let length = std::fs::metadata(&path)
+            .map_err(|e| module_io_error(&namespace, &e, at))?
+            .len();
+        if length > MAX_STRING_LEN as u64 {
+            return Err(OmniError::new(
+                ErrorKind::Runtime,
+                at,
+                format!(
+                    "module '{namespace}' is {length} bytes, over the {} MiB limit",
+                    MAX_STRING_LEN / (1024 * 1024)
+                ),
+            ));
+        }
+        let bytes = std::fs::read(&path).map_err(|e| module_io_error(&namespace, &e, at))?;
+        let source = std::str::from_utf8(&bytes).map_err(|_| {
+            OmniError::new(
+                ErrorKind::Runtime,
+                at,
+                format!("module '{namespace}' is not UTF-8 text"),
+            )
+        })?;
+
+        let mut child = Engine::new();
+        child.module_root = Some(root);
+        child.fs_read_roots = self.fs_read_roots.clone();
+        child.fs_write_roots = self.fs_write_roots.clone();
+        child.loading_modules = self.loading_modules.clone();
+        child.loading_modules.push(path);
+        child.exec(source).map_err(|mut error| {
+            error.message = format!("in module '{namespace}': {}", error.message);
+            error
+        })?;
+
+        let exported: Vec<(String, Value)> = child
+            .bindings
+            .iter()
+            .map(|slot| slot.get())
+            .filter(|binding| !binding.name().starts_with('_') && !binding.name().contains('.'))
+            .map(|binding| (binding.name().to_string(), binding.value()))
+            .collect();
+        for (name, value) in exported {
+            let value = if value.is_string() {
+                // The child's arena dies with it, so bytes cross by copy. This is
+                // the one place a module can hand the parent memory, and it hands
+                // over a parent-owned copy rather than an address into the child.
+                let copied = match child.string_of(value) {
+                    Some(bytes) => bytes.to_vec(),
+                    None => return Err(unreadable_string(at, value)),
+                };
+                self.new_string(&copied, at, ErrorKind::Runtime)?
+            } else {
+                value
+            };
+            self.module_bindings
+                .push((format!("{namespace}.{name}"), value));
+        }
+        self.namespaces.push(namespace);
+        Ok(())
     }
 
-    fn parse_factor(&mut self, t: &Tokens<'_>, i: &mut usize) -> Result<Value, OmniError> {
-        let mut negate = false;
-        loop {
-            match self.peek_kind(t, *i) {
-                Some(TokenKind::BinOp(BinOp::Sub)) => {
-                    negate = !negate;
-                    self.advance(i);
-                }
-                Some(TokenKind::BinOp(BinOp::Add)) => {
-                    self.advance(i);
-                }
-                _ => break,
-            }
+    // -- sandboxed filesystem -------------------------------------------------
+
+    /// Allow `fs.read_text` to read files under `root`, canonicalized now.
+    pub fn allow_fs_read(&mut self, root: impl AsRef<Path>) -> std::io::Result<()> {
+        let root = root.as_ref().canonicalize()?;
+        if !self.fs_read_roots.contains(&root) {
+            self.fs_read_roots.push(root);
         }
-        let operand_pos = t.pos_at(*i);
-        let value = self.parse_primary(t, i)?;
-        if negate {
-            let n = value.as_f64().ok_or_else(|| {
+        Ok(())
+    }
+
+    /// Allow `fs.write_text` to write files under `root`, canonicalized now.
+    pub fn allow_fs_write(&mut self, root: impl AsRef<Path>) -> std::io::Result<()> {
+        let root = root.as_ref().canonicalize()?;
+        if !self.fs_write_roots.contains(&root) {
+            self.fs_write_roots.push(root);
+        }
+        Ok(())
+    }
+
+    fn read_allowed(&self, request: &str, at: Pos) -> Result<Vec<u8>, OmniError> {
+        if self.fs_read_roots.is_empty() {
+            return Err(OmniError::new(
+                ErrorKind::Runtime,
+                at,
+                "fs.read_text is disabled: this engine has no filesystem read permission",
+            ));
+        }
+        let target = Path::new(request).canonicalize().map_err(|e| {
+            OmniError::new(
+                ErrorKind::Runtime,
+                at,
+                format!("cannot read '{request}': {e}"),
+            )
+        })?;
+        if !self
+            .fs_read_roots
+            .iter()
+            .any(|root| target.starts_with(root))
+        {
+            return Err(OmniError::new(
+                ErrorKind::Runtime,
+                at,
+                format!("path '{request}' is outside the allowed read roots"),
+            ));
+        }
+        if !target.is_file() {
+            return Err(OmniError::new(
+                ErrorKind::Runtime,
+                at,
+                format!("cannot read '{request}': not a regular file"),
+            ));
+        }
+        let length = std::fs::metadata(&target)
+            .map_err(|e| {
                 OmniError::new(
                     ErrorKind::Runtime,
-                    operand_pos,
-                    format!(
-                        "type mismatch: cannot apply unary '-' to {}: {}",
-                        kind_of(value),
-                        self.show(value)
-                    ),
+                    at,
+                    format!("cannot read '{request}': {e}"),
+                )
+            })?
+            .len();
+        if length > MAX_STRING_LEN as u64 {
+            return Err(OmniError::new(
+                ErrorKind::Runtime,
+                at,
+                format!(
+                    "file '{request}' is {length} bytes, over the {} MiB limit",
+                    MAX_STRING_LEN / (1024 * 1024)
+                ),
+            ));
+        }
+        let bytes = std::fs::read(&target).map_err(|e| {
+            OmniError::new(
+                ErrorKind::Runtime,
+                at,
+                format!("cannot read '{request}': {e}"),
+            )
+        })?;
+        if std::str::from_utf8(&bytes).is_err() {
+            return Err(OmniError::new(
+                ErrorKind::Runtime,
+                at,
+                format!("file '{request}' is not UTF-8 text"),
+            ));
+        }
+        Ok(bytes)
+    }
+
+    fn write_allowed(&self, request: &str, text: &[u8], at: Pos) -> Result<(), OmniError> {
+        if self.fs_write_roots.is_empty() {
+            return Err(OmniError::new(
+                ErrorKind::Runtime,
+                at,
+                "fs.write_text is disabled: this engine has no filesystem write permission",
+            ));
+        }
+        let target = Path::new(request);
+        // A new file cannot be canonicalized, so its parent is the part that has
+        // to be proven inside a root. An existing target is checked whole, which
+        // also catches a symlinked file pointing out of the sandbox.
+        let checked = match target.canonicalize() {
+            Ok(existing) => existing,
+            Err(_) => {
+                let Some(name) = target.file_name() else {
+                    return Err(OmniError::new(
+                        ErrorKind::Runtime,
+                        at,
+                        format!("path '{request}' does not name a file"),
+                    ));
+                };
+                let parent = target.parent().unwrap_or(Path::new("."));
+                let parent = if parent.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    parent
+                };
+                parent
+                    .canonicalize()
+                    .map_err(|e| {
+                        OmniError::new(
+                            ErrorKind::Runtime,
+                            at,
+                            format!("cannot write '{request}': {e}"),
+                        )
+                    })?
+                    .join(name)
+            }
+        };
+        if !self
+            .fs_write_roots
+            .iter()
+            .any(|root| checked.starts_with(root))
+        {
+            return Err(OmniError::new(
+                ErrorKind::Runtime,
+                at,
+                format!("path '{request}' is outside the allowed write roots"),
+            ));
+        }
+        std::fs::write(&checked, text).map_err(|e| {
+            OmniError::new(
+                ErrorKind::Runtime,
+                at,
+                format!("cannot write '{request}': {e}"),
+            )
+        })
+    }
+
+    // -- JSON -----------------------------------------------------------------
+
+    fn json_parse(&mut self, name: &str, args: &[Value], at: Pos) -> Result<Value, OmniError> {
+        let scalar = {
+            let bytes = self.string_arg(name, args, 0, at)?;
+            let text = std::str::from_utf8(bytes).map_err(|_| {
+                OmniError::new(
+                    ErrorKind::Runtime,
+                    at,
+                    format!("type mismatch: {name}() needs a UTF-8 string"),
                 )
             })?;
-            return Ok(Value::from_f64(-n));
-        }
-        Ok(value)
-    }
-
-    fn parse_primary(&mut self, t: &Tokens<'_>, i: &mut usize) -> Result<Value, OmniError> {
-        let token = self.peek(t, *i).ok_or_else(|| {
-            OmniError::new(ErrorKind::Parse, t.pos_at(*i), "unexpected end of input")
-        })?;
-        match token.kind {
-            TokenKind::Number => {
-                self.advance(i);
-                t.text(token)
-                    .parse::<f64>()
-                    .map(Value::from_f64)
-                    .map_err(|_| {
-                        OmniError::new(
-                            ErrorKind::Parse,
-                            t.pos(token),
-                            format!("'{}' is not a valid number", t.text(token)),
-                        )
-                    })
-            }
-            TokenKind::Str => {
-                self.advance(i);
-                // Decoding happens here, not in the lexer, so a token stays a
-                // pair of offsets and lexing allocates nothing. The position
-                // survives the deferral because the token carries both numbers.
-                let at = t.pos(token);
-                let bytes = decode_literal(t.text(token), at)?;
-                self.new_string(&bytes, at, ErrorKind::Runtime)
-            }
-            TokenKind::Ident => {
-                let name = t.text(token);
-                self.advance(i);
-                // A name followed by '(' is a call and nothing else; the same name
-                // on its own is still a global or binding lookup. Position is the
-                // only disambiguation, which is what lets a host register `print`
-                // without reserving the identifier.
-                if self.peek_kind(t, *i) == Some(TokenKind::LParen) {
-                    return self.parse_call(t, i, name, t.pos(token));
-                }
-                self.lookup(name).ok_or_else(|| {
-                    OmniError::new(
-                        ErrorKind::Runtime,
-                        t.pos(token),
-                        format!("undefined variable '{name}'"),
-                    )
-                })
-            }
-            TokenKind::LParen => {
-                self.advance(i);
-                let inner = self.parse_expr(t, i)?;
-                self.expect(t, i, TokenKind::RParen)?;
-                Ok(inner)
-            }
-            TokenKind::Eof => Err(OmniError::new(
-                ErrorKind::Parse,
-                t.pos(token),
-                "unexpected end of input",
-            )),
-            other => Err(self.parse_error_kind(t, *i, other, "expected a value")),
-        }
-    }
-
-    /// `name(arg, …)` with the call already resolved to a host function or one
-    /// of the standard helpers.
-    ///
-    /// Arity is checked against the registration or the builtin's definition
-    /// rather than inferred from what arrived, so `len("a", "b")` names the
-    /// function and both counts. A host registration wins over a builtin of the
-    /// same name, which is what lets a host instrument `len` without the language
-    /// reserving it. The depth guard wraps argument evaluation too: `f(g(x))`
-    /// nests here, and the stack the recursion spends is the thing being limited.
-    fn parse_call(
-        &mut self,
-        t: &Tokens<'_>,
-        i: &mut usize,
-        name: &str,
-        at: Pos,
-    ) -> Result<Value, OmniError> {
-        if self.call_depth >= MAX_CALL_DEPTH {
-            return Err(OmniError::new(
-                ErrorKind::Runtime,
-                at,
-                format!(
-                    "calls are nested {MAX_CALL_DEPTH} deep, the limit; a host function \
-                     cannot call itself"
-                ),
-            ));
-        }
-        let host = self.find_host_fn(name);
-        let builtin = builtin_for(name);
-        if host.is_none() && builtin.is_none() {
-            return Err(OmniError::new(
-                ErrorKind::Runtime,
-                at,
-                format!("unknown function '{name}' (no host function or builtin has that name)"),
-            ));
-        }
-        let arity = match host {
-            Some(index) => self.host_fns[index].arity as usize,
-            None => builtin.expect("checked above").1,
+            json::parse(text).map_err(|message| {
+                OmniError::new(ErrorKind::Runtime, at, format!("{name}: {message}"))
+            })?
         };
-        self.advance(i); // the '(' that made this a call
-
-        self.call_depth += 1;
-        let outcome = self.read_args(t, i, name);
-        self.call_depth -= 1;
-        let args = outcome?;
-        if args.len() != arity {
-            return Err(OmniError::new(
-                ErrorKind::Runtime,
-                at,
-                format!(
-                    "Mismatched arity in call '{name}': takes {arity} argument{}, got {}",
-                    if arity == 1 { "" } else { "s" },
-                    args.len()
-                ),
-            ));
-        }
-        match host {
-            Some(index) => self.invoke_host(index, name, args.as_slice(), at),
-            None => {
-                let (which, _) = builtin.expect("checked above");
-                self.invoke_builtin(which, name, args.as_slice(), at)
-            }
+        match scalar {
+            json::Scalar::Number(number) => Ok(Value::from_f64(number)),
+            json::Scalar::Str(bytes) => self.new_string(&bytes, at, ErrorKind::Runtime),
+            json::Scalar::Bool(flag) => Ok(Value::bool(flag)),
+            json::Scalar::Null => Ok(Value::NIL),
         }
     }
 
-    /// Read `arg, arg, …` up to and including the closing paren.
-    ///
-    /// Split out of [`Engine::parse_call`] so the depth counter has exactly one
-    /// increment and one decrement between them, with a `Result` in the middle —
-    /// the shape that makes an early `?` unable to strand the count.
-    ///
-    /// The arity is not a parameter: the buffer is sized by [`MAX_ARGS`] alone,
-    /// so a call costs the same stack whether the host takes one argument or
-    /// sixteen, and nothing is allocated to find out which.
-    fn read_args(&mut self, t: &Tokens<'_>, i: &mut usize, name: &str) -> Result<Args, OmniError> {
-        let mut args = Args::new();
-        if self.peek_kind(t, *i) != Some(TokenKind::RParen) {
-            loop {
-                // The last argument's expression is where an error most often
-                // lives, so the position moves with the cursor instead of
-                // staying on the function name.
-                let arg_pos = t.pos_at(*i);
-                args.push(self.parse_expr(t, i)?);
-                if args.len() > MAX_ARGS {
+    fn json_stringify(&mut self, name: &str, args: &[Value], at: Pos) -> Result<Value, OmniError> {
+        let value = args[0];
+        let mut buf = std::mem::take(&mut self.scratch);
+        let result = (|| {
+            buf.clear();
+            if let Some(bytes) = self.string_of(value) {
+                json::write_string(bytes, &mut buf);
+            } else if let Some(flag) = value.as_bool() {
+                buf.extend_from_slice(if flag { b"true" } else { b"false" });
+            } else if let Some(number) = value.as_f64() {
+                if !json::write_number(number, &mut buf) {
                     return Err(OmniError::new(
-                        ErrorKind::Parse,
-                        arg_pos,
-                        format!("a call takes at most {MAX_ARGS} arguments"),
+                        ErrorKind::Runtime,
+                        at,
+                        format!("{name}: {number} is not a finite JSON number"),
                     ));
                 }
-                match self.peek_kind(t, *i) {
-                    Some(TokenKind::Comma) => self.advance(i),
-                    Some(TokenKind::RParen) | None => break,
-                    Some(kind) => {
-                        return Err(self.parse_error_kind(
-                            t,
-                            *i,
-                            kind,
-                            &format!("expected ',' or ')' in the call to '{name}'"),
-                        ));
-                    }
-                }
+            } else if value == Value::NIL {
+                buf.extend_from_slice(b"null");
+            } else {
+                return Err(OmniError::new(
+                    ErrorKind::Runtime,
+                    at,
+                    format!("{name}: undefined is not a JSON value"),
+                ));
             }
-        }
-        self.expect(t, i, TokenKind::RParen)?;
-        Ok(args)
+            self.new_string(&buf, at, ErrorKind::Runtime)
+        })();
+        self.scratch = buf;
+        result
     }
+
+    // -- call helpers ---------------------------------------------------------
 
     /// Run one host callback and box its answer.
     ///
@@ -1309,6 +1584,25 @@ impl Engine {
             Builtin::TypeOf => {
                 Ok(self.new_string(kind_of(args[0]).as_bytes(), at, ErrorKind::Runtime)?)
             }
+            Builtin::FsReadText => {
+                let path = {
+                    let bytes = self.string_arg(name, args, 0, at)?;
+                    utf8_path(name, bytes, at)?
+                };
+                let bytes = self.read_allowed(&path, at)?;
+                self.new_string(&bytes, at, ErrorKind::Runtime)
+            }
+            Builtin::FsWriteText => {
+                let path = {
+                    let bytes = self.string_arg(name, args, 0, at)?;
+                    utf8_path(name, bytes, at)?
+                };
+                let text = self.string_arg(name, args, 1, at)?;
+                self.write_allowed(&path, text, at)?;
+                Ok(Value::NIL)
+            }
+            Builtin::JsonParse => self.json_parse(name, args, at),
+            Builtin::JsonStringify => self.json_stringify(name, args, at),
         }
     }
 
@@ -1546,71 +1840,68 @@ impl Engine {
         };
         Ok(Value::from_f64(n))
     }
+}
 
-    // -- token cursor helpers -------------------------------------------------
+/// The literal text an instruction's span addresses.
+fn literal_span(source: &str, instr: Instr) -> &str {
+    let start = instr.a as usize;
+    source
+        .get(start..start.saturating_add(instr.b as usize))
+        .unwrap_or("")
+}
 
-    fn peek(&self, t: &Tokens<'_>, i: usize) -> Option<Token> {
-        // Token is Copy and carries no lifetime, so the cursor hands back a
-        // value: sixteen bytes the caller may keep past the next peek.
-        t.tokens.get(i).copied()
-    }
+/// Pop one value, reporting a compiler invariant break rather than panicking.
+fn pop(stack: &mut Stack, at: Pos) -> Result<Value, OmniError> {
+    stack
+        .pop()
+        .ok_or_else(|| OmniError::new(ErrorKind::Panic, at, "the VM stack underflowed"))
+}
 
-    fn peek_kind(&self, t: &Tokens<'_>, i: usize) -> Option<TokenKind> {
-        t.tokens.get(i).map(|tok| tok.kind)
-    }
+/// The value a `Store` keeps: `let x = 1 + 2` evaluates to three.
+fn top(stack: &Stack, at: Pos) -> Result<Value, OmniError> {
+    stack
+        .last()
+        .copied()
+        .ok_or_else(|| OmniError::new(ErrorKind::Panic, at, "the VM stack underflowed"))
+}
 
-    fn advance(&self, i: &mut usize) {
-        *i += 1;
-    }
+/// The module's namespace: its file stem without the extension.
+fn module_stem(path: &Path) -> Option<String> {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(str::to_owned)
+}
 
-    fn expect(&self, t: &Tokens<'_>, i: &mut usize, want: TokenKind) -> Result<(), OmniError> {
-        match t.tokens.get(*i) {
-            Some(tok) if tok.kind == want => {
-                self.advance(i);
-                Ok(())
-            }
-            Some(tok) => Err(self.parse_error_kind(t, *i, tok.kind, "unexpected token")),
-            None => Err(OmniError::new(
-                ErrorKind::Parse,
-                t.end_pos(),
-                "unexpected end of input",
-            )),
-        }
-    }
+/// Whether a module stem can be written as an identifier, and therefore read as
+/// `stem.export`. The check mirrors the lexer's ASCII identifier rule rather than
+/// duplicating `MAX_IDENTIFIER_LEN`, because the binding table is keyed by string.
+fn is_identifier(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && (bytes[0].is_ascii_alphabetic() || bytes[0] == b'_')
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+}
 
-    fn expect_ident<'s>(&self, t: &Tokens<'s>, i: &mut usize) -> Result<&'s str, OmniError> {
-        match t.tokens.get(*i) {
-            Some(tok) if tok.kind == TokenKind::Ident => {
-                let text = t.text(*tok);
-                self.advance(i);
-                Ok(text)
-            }
-            Some(tok) => Err(OmniError::new(
-                ErrorKind::Parse,
-                t.pos(*tok),
-                format!("expected a name, found '{}'", display_kind(tok.kind)),
-            )),
-            None => Err(OmniError::new(
-                ErrorKind::Parse,
-                t.end_pos(),
-                "expected a name",
-            )),
-        }
-    }
-
-    fn parse_error_kind(
-        &self,
-        t: &Tokens<'_>,
-        i: usize,
-        kind: TokenKind,
-        context: &str,
-    ) -> OmniError {
+/// A path argument as UTF-8 text. Filesystem APIs take `&str` here because the
+/// language's strings are UTF-8 and a non-UTF-8 path would have no spelling.
+fn utf8_path(name: &str, bytes: &[u8], at: Pos) -> Result<String, OmniError> {
+    std::str::from_utf8(bytes).map(str::to_owned).map_err(|_| {
         OmniError::new(
-            ErrorKind::Parse,
-            t.pos_at(i),
-            format!("{context} (found '{}')", display_kind(kind)),
+            ErrorKind::Runtime,
+            at,
+            format!("type mismatch: {name}() needs a UTF-8 path"),
         )
-    }
+    })
+}
+
+fn module_io_error(module: &str, error: &std::io::Error, at: Pos) -> OmniError {
+    OmniError::new(
+        ErrorKind::Runtime,
+        at,
+        format!("cannot read module '{module}': {error}"),
+    )
 }
 
 impl Default for Engine {
@@ -1634,7 +1925,7 @@ fn elapsed_micros(elapsed: Duration) -> u32 {
 /// reserved namespace: an embedder that wants `len` to count characters instead
 /// of bytes registers its own and gets it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Builtin {
+pub(crate) enum Builtin {
     Abs,
     Min,
     Max,
@@ -1652,6 +1943,10 @@ enum Builtin {
     Replace,
     Slice,
     TypeOf,
+    FsReadText,
+    FsWriteText,
+    JsonParse,
+    JsonStringify,
 }
 
 /// The builtin a call name means, and how many arguments it takes.
@@ -1678,6 +1973,10 @@ fn builtin_for(name: &str) -> Option<(Builtin, usize)> {
         "replace" => (Builtin::Replace, 3),
         "slice" => (Builtin::Slice, 3),
         "type_of" => (Builtin::TypeOf, 1),
+        "fs.read_text" => (Builtin::FsReadText, 1),
+        "fs.write_text" => (Builtin::FsWriteText, 2),
+        "json.parse" => (Builtin::JsonParse, 1),
+        "json.stringify" => (Builtin::JsonStringify, 1),
         _ => return None,
     })
 }
@@ -1856,24 +2155,6 @@ fn decode_unicode_escape(bytes: &[u8], pos: usize, at: Pos) -> Result<(usize, ch
         })
     })?;
     Ok((end, ch))
-}
-
-fn display_kind(kind: TokenKind) -> &'static str {
-    match kind {
-        TokenKind::Let => "'let'",
-        TokenKind::Ident => "a name",
-        TokenKind::Number => "a number",
-        TokenKind::Str => "a string",
-        TokenKind::Eq => "'='",
-        TokenKind::EqEq => "'=='",
-        TokenKind::NotEq => "'!='",
-        TokenKind::LParen => "'('",
-        TokenKind::RParen => "')'",
-        TokenKind::Comma => "','",
-        TokenKind::Semi => "';'",
-        TokenKind::Eof => "end of input",
-        TokenKind::BinOp(op) => op.symbol(),
-    }
 }
 
 #[cfg(test)]
@@ -2997,6 +3278,16 @@ mod tests {
     }
 
     #[test]
+    fn a_left_deep_spine_lowers_without_growing_the_native_stack() {
+        let mut e = Engine::new();
+        // The same shape as the Python SDK's long-source row, two orders of
+        // magnitude larger: a left-deep `+` spine. The parser builds it in a
+        // loop, and lowering walks a work stack, so the only limit is memory.
+        let source = format!("1{}", " + 1".repeat(100_000));
+        assert_eq!(e.exec(&source), Ok(num(100_001.0)));
+    }
+
+    #[test]
     fn more_arguments_than_the_ceiling_is_a_parse_error() {
         let mut e = Engine::new();
         add_square(&mut e);
@@ -3276,5 +3567,361 @@ mod tests {
         let micros = e.stats().last_exec_micros;
         assert!(micros > 0, "a 200 KB program takes measurable time");
         assert_eq!(micros, e.last_exec_micros);
+    }
+
+    // -- VM control flow ------------------------------------------------------
+
+    fn run_chunk(e: &mut Engine, code: Vec<Instr>, names: &[u8]) -> Result<Value, OmniError> {
+        let chunk = Chunk {
+            code,
+            names: names.to_vec(),
+        };
+        let mut stack: Stack = Vec::new();
+        e.run_chunk(&chunk, "", &mut stack)
+    }
+
+    #[test]
+    fn jump_skips_the_instructions_it_bounds() {
+        let at = Pos::new(1, 1);
+        let code = vec![
+            Instr::new(OpCode::Jump, 2, 0, 0, at),
+            Instr::new(OpCode::PushUndef, 0, 0, 0, at),
+            Instr::new(OpCode::PushNil, 0, 0, 0, at),
+            Instr::new(OpCode::Ret, 0, 0, 0, at),
+        ];
+        assert_eq!(
+            run_chunk(&mut Engine::new(), code, b"").unwrap(),
+            Value::NIL
+        );
+    }
+
+    #[test]
+    fn jump_if_false_takes_the_else_branch_and_falls_through_otherwise() {
+        let at = Pos::new(1, 1);
+        // if false: push nil; jump-if-false to the else arm.
+        let false_code = vec![
+            Instr::new(OpCode::PushNil, 0, 0, 0, at),
+            Instr::new(OpCode::JumpIfFalse, 4, 0, 0, at),
+            Instr::new(OpCode::PushUndef, 0, 0, 0, at),
+            Instr::new(OpCode::Jump, 5, 0, 0, at),
+            Instr::new(OpCode::PushNil, 0, 0, 0, at),
+            Instr::new(OpCode::Ret, 0, 0, 0, at),
+        ];
+        assert_eq!(
+            run_chunk(&mut Engine::new(), false_code, b"").unwrap(),
+            Value::NIL
+        );
+
+        // if true: the same shape, but the condition loads a host boolean.
+        let true_code = vec![
+            Instr::new(OpCode::Load, 0, 3, 0, at),
+            Instr::new(OpCode::JumpIfFalse, 4, 0, 0, at),
+            Instr::new(OpCode::PushUndef, 0, 0, 0, at),
+            Instr::new(OpCode::Jump, 5, 0, 0, at),
+            Instr::new(OpCode::PushNil, 0, 0, 0, at),
+            Instr::new(OpCode::Ret, 0, 0, 0, at),
+        ];
+        let mut e = Engine::new();
+        e.define("yes", Value::bool(true));
+        assert_eq!(run_chunk(&mut e, true_code, b"yes").unwrap(), Value::UNDEF);
+    }
+
+    #[test]
+    fn ret_returns_the_top_of_stack_and_stops() {
+        let at = Pos::new(1, 1);
+        let code = vec![
+            Instr::new(OpCode::PushNil, 0, 0, 0, at),
+            Instr::new(OpCode::Ret, 0, 0, 0, at),
+            Instr::new(OpCode::PushUndef, 0, 0, 0, at),
+            Instr::new(OpCode::Ret, 0, 0, 0, at),
+        ];
+        assert_eq!(
+            run_chunk(&mut Engine::new(), code, b"").unwrap(),
+            Value::NIL
+        );
+    }
+
+    #[test]
+    fn an_unbalanced_chunk_reports_a_vm_fault_instead_of_panicking() {
+        let at = Pos::new(1, 1);
+        let code = vec![
+            Instr::new(OpCode::Add, 0, 0, 0, at),
+            Instr::new(OpCode::Ret, 0, 0, 0, at),
+        ];
+        let error = run_chunk(&mut Engine::new(), code, b"").unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Panic);
+    }
+
+    // -- modules --------------------------------------------------------------
+
+    /// A fresh, empty directory under the system temp dir. The label keeps
+    /// concurrently running tests from sharing one root.
+    fn temp_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("omni-phase6-{}-{label}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn write_module(root: &Path, name: &str, source: &str) {
+        std::fs::write(root.join(format!("{name}.omni")), source).unwrap();
+    }
+
+    #[test]
+    fn imports_bind_public_exports_and_hide_underscore_names() {
+        let root = temp_root("exports");
+        write_module(
+            &root,
+            "math",
+            "let answer = 40 + 2\nlet name = \"omni\"\nlet _hidden = 9",
+        );
+        let mut e = Engine::new();
+        e.set_module_root(&root).unwrap();
+
+        let value = e
+            .exec("import \"math\"\nmath.answer + len(math.name)")
+            .unwrap();
+        assert_eq!(value.as_f64(), Some(46.0));
+        // The visibility message is available in the execution that imported the
+        // module, because that is the execution whose namespace table knows it.
+        let error = e.exec("import \"math\"\nmath._hidden").unwrap_err();
+        assert_eq!(
+            error.message,
+            "module 'math' has no public export '_hidden'"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn imports_are_disabled_without_a_module_root() {
+        let error = Engine::new().exec("import \"math\"").unwrap_err();
+        assert_eq!(
+            error.message,
+            "import is disabled: this engine has no module root"
+        );
+    }
+
+    #[test]
+    fn a_missing_module_names_the_request() {
+        let root = temp_root("missing");
+        let mut e = Engine::new();
+        e.set_module_root(&root).unwrap();
+        let error = e.exec("import \"nope\"").unwrap_err();
+        assert_eq!(
+            error.message,
+            "cannot import 'nope': no such module under the module root"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_import_cannot_escape_the_root() {
+        let root = temp_root("escape");
+        let inner = root.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(root.join("outside.omni"), "let x = 1").unwrap();
+        let mut e = Engine::new();
+        e.set_module_root(&inner).unwrap();
+        let error = e.exec("import \"../outside\"").unwrap_err();
+        assert_eq!(error.message, "import '../outside' escapes the module root");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_module_cannot_see_the_parents_globals_or_callbacks() {
+        let root = temp_root("isolation");
+        write_module(&root, "probe", "let x = secret");
+        write_module(&root, "call", "secret()");
+        let mut e = Engine::new();
+        e.define("secret", num(7.0));
+        e.register_host_fn("secret", 0, nil_call).unwrap();
+        e.set_module_root(&root).unwrap();
+
+        let error = e.exec("import \"probe\"").unwrap_err();
+        assert_eq!(
+            error.message,
+            "in module 'probe': undefined variable 'secret'"
+        );
+        let error = e.exec("import \"call\"").unwrap_err();
+        assert_eq!(
+            error.message,
+            "in module 'call': unknown function 'secret' (no host function or builtin has that name)"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_module_error_keeps_its_prefix_and_position() {
+        let root = temp_root("error-prefix");
+        write_module(&root, "bad", "let x = 1\nlet y = 1 / 0");
+        let mut e = Engine::new();
+        e.set_module_root(&root).unwrap();
+        let error = e.exec("import \"bad\"").unwrap_err();
+        assert_eq!(error.message, "in module 'bad': division by zero");
+        assert_eq!(error.line, 2, "the module's own line survives");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_circular_import_names_the_whole_chain() {
+        let root = temp_root("cycle");
+        write_module(&root, "a", "import \"b\"\nlet x = 1");
+        write_module(&root, "b", "import \"a\"\nlet y = 2");
+        let mut e = Engine::new();
+        e.set_module_root(&root).unwrap();
+        let error = e.exec("import \"a\"").unwrap_err();
+        // Each enclosing module adds its own prefix on the way out; the cycle
+        // itself is named once, with every module on it.
+        assert!(
+            error.message.ends_with("circular import: a -> b -> a"),
+            "{error}"
+        );
+        assert_eq!(error.line, 1);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn import_depth_is_bounded_at_sixteen() {
+        let root = temp_root("depth");
+        for index in 0..MAX_MODULE_DEPTH {
+            write_module(
+                &root,
+                &format!("m{index}"),
+                &format!("import \"m{}\"", index + 1),
+            );
+        }
+        write_module(&root, &format!("m{MAX_MODULE_DEPTH}"), "let end = 1");
+        let mut e = Engine::new();
+        e.set_module_root(&root).unwrap();
+        let error = e.exec("import \"m0\"").unwrap_err();
+        assert!(
+            error.message.contains(&format!(
+                "imports are nested {MAX_MODULE_DEPTH} deep, the limit"
+            )),
+            "{error}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn module_exports_do_not_leak_between_batch_items() {
+        let root = temp_root("batch");
+        write_module(&root, "math", "let answer = 42");
+        let mut e = Engine::new();
+        e.set_module_root(&root).unwrap();
+        let items = e.exec_many(&["import \"math\"\nmath.answer", "math.answer"]);
+        assert!(items[0].is_ok(), "{:?}", items[0].error);
+        let error = items[1].error.as_ref().expect("the second item must fail");
+        assert_eq!(error.message, "undefined variable 'math.answer'");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // -- sandboxed filesystem -------------------------------------------------
+
+    #[test]
+    fn the_filesystem_fails_closed_until_a_root_is_allowed() {
+        let mut e = Engine::new();
+        assert_eq!(
+            e.exec("fs.read_text(\"x\")").unwrap_err().message,
+            "fs.read_text is disabled: this engine has no filesystem read permission"
+        );
+        assert_eq!(
+            e.exec("fs.write_text(\"x\", \"y\")").unwrap_err().message,
+            "fs.write_text is disabled: this engine has no filesystem write permission"
+        );
+    }
+
+    #[test]
+    fn an_allowed_root_reads_and_writes_utf8_text() {
+        let root = temp_root("fs-ok");
+        std::fs::write(root.join("in.txt"), "hello").unwrap();
+        let mut e = Engine::new();
+        e.allow_fs_read(&root).unwrap();
+        e.allow_fs_write(&root).unwrap();
+        e.define_string("input", root.join("in.txt").to_str().unwrap().as_bytes())
+            .unwrap();
+        e.define_string("output", root.join("out.txt").to_str().unwrap().as_bytes())
+            .unwrap();
+
+        let read = e.exec("fs.read_text(input)").unwrap();
+        assert_eq!(e.render(read), "hello");
+        assert_eq!(
+            e.exec("fs.write_text(output, \"written\")").unwrap(),
+            Value::NIL
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("out.txt")).unwrap(),
+            "written"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_path_outside_every_root_is_refused_before_io() {
+        let root = temp_root("fs-escape");
+        let outside = std::env::temp_dir().join(format!(
+            "omni-phase6-{}-fs-escape-outside.txt",
+            std::process::id()
+        ));
+        std::fs::write(&outside, "secret").unwrap();
+        let mut e = Engine::new();
+        e.allow_fs_read(&root).unwrap();
+        e.define_string("target", outside.to_str().unwrap().as_bytes())
+            .unwrap();
+        let error = e.exec("fs.read_text(target)").unwrap_err();
+        assert!(
+            error.message.ends_with("is outside the allowed read roots"),
+            "{error}"
+        );
+        std::fs::remove_file(&outside).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_non_utf8_file_is_refused_because_language_strings_are_utf8() {
+        let root = temp_root("fs-binary");
+        std::fs::write(root.join("bin"), [0xff, 0xfe]).unwrap();
+        let mut e = Engine::new();
+        e.allow_fs_read(&root).unwrap();
+        e.define_string("target", root.join("bin").to_str().unwrap().as_bytes())
+            .unwrap();
+        let error = e.exec("fs.read_text(target)").unwrap_err();
+        assert!(error.message.ends_with("is not UTF-8 text"), "{error}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // -- JSON -----------------------------------------------------------------
+
+    #[test]
+    fn json_parses_the_four_scalar_kinds() {
+        let mut e = Engine::new();
+        assert_eq!(e.exec("json.parse(\"42\")").unwrap().as_f64(), Some(42.0));
+        let value = e.exec("json.parse(\"\\\"hi\\\"\")").unwrap();
+        assert_eq!(e.render(value), "hi");
+        assert_eq!(e.exec("json.parse(\"true\")").unwrap(), Value::bool(true));
+        assert_eq!(e.exec("json.parse(\"null\")").unwrap(), Value::NIL);
+    }
+
+    #[test]
+    fn json_collections_are_refused_with_the_abi_reason() {
+        let mut e = Engine::new();
+        let error = e.exec("json.parse(\"[1, 2]\")").unwrap_err();
+        assert_eq!(error.message, format!("json.parse: {}", json::COLLECTION));
+        let error = e.exec("json.parse(\"{\\\"a\\\": 1}\")").unwrap_err();
+        assert!(error.message.starts_with("json.parse: "), "{error}");
+        assert!(error.message.ends_with(json::COLLECTION), "{error}");
+    }
+
+    #[test]
+    fn json_stringifies_scalars_with_the_required_escapes() {
+        assert_eq!(text("json.stringify(42)"), "42");
+        assert_eq!(text("json.stringify(1 == 1)"), "true");
+        assert_eq!(text("json.stringify(\"a\\nb\")"), "\"a\\nb\"");
+        let mut e = Engine::new();
+        e.define("nothing", Value::UNDEF);
+        assert_eq!(
+            e.exec("json.stringify(nothing)").unwrap_err().message,
+            "json.stringify: undefined is not a JSON value"
+        );
     }
 }

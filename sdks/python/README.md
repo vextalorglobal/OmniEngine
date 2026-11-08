@@ -82,11 +82,18 @@ A `Result` carries `tag`, `number`, `text` and `value`. `eval_str` skips the
 wrapper and returns the language value as a native Python object: `int` for an
 integral finite number, otherwise `float`, `str`, `bool`, or `None`. `eval` is
 the same unwrapping under the name the Node SDK uses. Neither produces a `list`
-or `dict`: ABI 4 has no collection type for a program to return. Seventeen
+or `dict`: ABI 4 has no collection type for a program to return. Twenty-one
 builtins — `abs`, `min`, `max`, `clamp`, `floor`, `ceil`, `round`, `pow`,
 `sqrt`, `len`, `trim`, `upper`, `lower`, `contains`, `replace`, `slice`,
-`type_of` — need no registration, and
-`stats().last_exec_micros` reports the most recent execution in microseconds. `text` is the exact bytes
+`type_of`, `fs.read_text`, `fs.write_text`, `json.parse`, `json.stringify` —
+need no registration, and
+`stats().last_exec_micros` reports the most recent execution in microseconds.
+`json.parse` and `json.stringify` cover the scalar kinds ABI 4 can carry and
+refuse arrays and objects. The two `fs` builtins fail closed through this SDK:
+permission roots are granted by a Rust embedder, and ABI 4 has no export that
+adds one, so a script gets
+`fs.read_text is disabled: this engine has no filesystem read permission` rather
+than disk access. `text` is the exact bytes
 of a string result — NUL bytes included, because OmniEngine strings are
 length-delimited rather than C strings — and `value` is the same bytes decoded as
 UTF-8. `number` is `0.0` for a string, on purpose: those eight payload bytes are

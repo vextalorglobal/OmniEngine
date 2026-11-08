@@ -49,6 +49,8 @@ impl BinOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenKind {
     Let,
+    /// `import`, a statement keyword at language version 2.
+    Import,
     Ident,
     Number,
     /// A string literal's *contents*, quotes removed, escapes not yet decoded.
@@ -73,6 +75,8 @@ pub enum TokenKind {
     /// punctuation-free hack because the parser reports what it expected, and
     /// `f(1 2)` is only a useful message if the comma is a thing.
     Comma,
+    /// `.` — the one qualifier mark the grammar has: `namespace.export`.
+    Dot,
     /// Accepted and ignored. Optional in OmniEngine, present so a C-style
     /// semicolon is not an error.
     Semi,
@@ -335,6 +339,12 @@ fn scan(source: &str, tokens: &mut Vec<Token>) -> Result<(), LexError> {
                 emit(tokens, TokenKind::Comma, pos, 1, line);
                 pos += 1;
             }
+            // Only reached when a digit has not just claimed the dot as part of
+            // a fraction, because the number arm consumes `1.5` whole.
+            b'.' => {
+                emit(tokens, TokenKind::Dot, pos, 1, line);
+                pos += 1;
+            }
             b';' => {
                 emit(tokens, TokenKind::Semi, pos, 1, line);
                 pos += 1;
@@ -396,11 +406,11 @@ fn scan(source: &str, tokens: &mut Vec<Token>) -> Result<(), LexError> {
                     }
                 }
                 // Compared as bytes: an identifier is ASCII by the scan above,
-                // so deciding `let` from any other name needs no UTF-8 walk.
-                let kind = if &bytes[start..pos] == b"let" {
-                    TokenKind::Let
-                } else {
-                    TokenKind::Ident
+                // so deciding a keyword from any other name needs no UTF-8 walk.
+                let kind = match &bytes[start..pos] {
+                    b"let" => TokenKind::Let,
+                    b"import" => TokenKind::Import,
+                    _ => TokenKind::Ident,
                 };
                 emit(tokens, kind, start, pos - start, line);
             }

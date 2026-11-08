@@ -58,7 +58,7 @@ cargo run -p omni-cli -- run examples/hello.omni    # -> 42
 cargo run -p omni-cli -- eval '"omni" + " " + "engine"'  # -> omni engine
 
 cargo install --path crates/omni-cli                # `omni` and `omniup` on PATH
-omni --version                                      # omni 0.1.0 (language v1, ABI 4)
+omni --version                                      # omni 0.1.0 (language v2, ABI 4)
 omni run examples/hello.omni                        # -> 42
 ```
 
@@ -72,7 +72,7 @@ omni run examples/hello.omni                        # -> 42
 
 | Path | What it is |
 | --- | --- |
-| `crates/omni-core` | NaN-boxed 8-byte scalars, length-delimited strings, a lexer, and a fused parse-and-evaluate engine. Zero dependencies. |
+| `crates/omni-core` | NaN-boxed 8-byte scalars, length-delimited strings, a lexer, an AST-to-bytecode compiler, and a stack virtual machine. Zero dependencies. |
 | `crates/omni-ffi` | The C ABI: `omni.dll` / `libomni.so`, `include/omni.h`, and contract tests written as an external caller. |
 | `crates/omni-cli` | `omni run <file>`, `omni eval <expr>`, `omni check-update`, `omni update`, and the standalone `omniup`. Hand-rolled args, no clap. |
 | `crates/omni-wasm` | Scaffolded wasm surface, mirroring the C ABI shape. Not built by default. |
@@ -91,7 +91,7 @@ omni run examples/hello.omni                        # -> 42
 
 ```bash
 # Rust
-cargo test --workspace                                  # 272 tests
+cargo test --workspace                                  # 322 tests
 cargo run -p omni-cli -- eval '"omni" + " " + "engine"'  # -> omni engine
 cargo run --release -p omni-core --example bench         # the engine, measured
 
@@ -131,9 +131,11 @@ the math, string and type builtins, a second-line error rendered as
 
 ## The standard toolkit
 
-Seventeen builtins need no host registration. Math: `abs`, `min`, `max`,
+Twenty-one builtins need no host registration. Math: `abs`, `min`, `max`,
 `clamp`, `floor`, `ceil`, `round`, `pow`, `sqrt`. Text: `len`, `trim`,
 `upper`, `lower`, `contains`, `replace`, `slice`. Inspection: `type_of`.
+Sandboxed I/O and data: `fs.read_text`, `fs.write_text`, `json.parse`,
+`json.stringify`.
 
 ```python
 from omni import Engine
@@ -175,6 +177,50 @@ than returning `NaN` or infinity. `type_of` answers `"number"`, `"string"`,
 `"boolean"`, or `"null"` — `null` is reachable through a host callback, since
 the grammar has no literal for it yet. Neither SDK unwraps into `list` or `dict`:
 ABI 4 has no collection type for a program to produce.
+
+`json.parse` and `json.stringify` cover exactly the four kinds that fit a
+16-byte `OmniValue` — number, string, boolean, `null`. An array or object is a
+deliberate error (`json.parse: arrays and objects are not supported at ABI 4`)
+rather than a string-shaped stand-in. `fs` fails closed: with no permission
+roots both builtins report that they are disabled. The CLI grants none, so a
+script cannot touch the disk by default; a Rust embedder opts in with
+`Engine::allow_fs_read(path)` and `Engine::allow_fs_write(path)`, and a target
+outside those roots is refused before the OS is asked.
+
+## How a program runs
+
+Source is lexed into a token buffer, parsed into a flat AST, lowered into
+bytecode, and executed by a stack VM. The FFI surface did not move for this:
+`omni_exec` and `omni_exec_many` still cross the same 16-byte value, because the
+VM replaced the fused evaluator *behind* them.
+
+The lowering pass emits one instruction per operator and never recurses, so a
+left-deep spine — `1 + 1 + … + 1` thousands of terms long — costs heap, not
+thread stack. `Chunk`, the AST, the VM stack, and the lowering work stack all
+live on the engine and are cleared rather than freed, so a warm program still
+allocates nothing. Operand ordering, positions, and error text are the fused
+evaluator's, which is what keeps ABI 4 byte-identical.
+
+## Modules
+
+Language version 2 adds one statement:
+
+```omni
+import "lib/math"
+math.answer
+```
+
+The operand resolves to `<module_root>/lib/math.omni`, is canonicalized, and
+must stay inside the module root; absolute paths, `..`, and symlink escapes are
+refused by that one check. The namespace is the file stem, and the module runs
+in a fresh child engine: it sees builtins, not the embedder's globals or host
+functions, so an import cannot call a callback it was not given. Top-level
+`let` names export unless they start with `_`; imported names are dotted and are
+not re-exported. Strings are copied into the importing execution's arena before
+the child engine is reclaimed. Cycles, a 16-deep import limit, and a missing
+module root all fail with positioned errors that name the module. Importing is
+opt-in from Rust via `Engine::set_module_root`, and there is no cache: a second
+import executes the module again.
 
 ## Calling back into the host
 
@@ -234,7 +280,7 @@ in allocations: 0.00 per execution, 0.004 per *item* inside a 256-batch. Run
 SHA-256, and replaces the binary only if the bytes match:
 
 ```bash
-omni --version                    # omni 0.1.0 (language v1, ABI 4)
+omni --version                    # omni 0.1.0 (language v2, ABI 4)
 omni check-update                 # 0 current, 10 newer, 11 different ABI
 omni update --dry-run             # 10: an update would apply; nothing fetched
 omni update --yes                 # download, verify, install
@@ -274,6 +320,10 @@ zero dependencies. See
 - **A warm engine lexes without allocating.** The token vector is reused across
   executions — measured, 0.00 allocations per execution in every benchmark
   scenario, and 0.004 per item inside a 256-batch.
+- **The compiler does not recurse.** Post-order lowering walks an explicit work
+  stack owned by the engine, so the depth of an expression is bounded by memory
+  rather than by the host thread's stack; 100,000 chained `+` operators lower
+  and run in a test.
 - **Reservations are flat by construction.** The arena cursor walks chunks it
   already mapped instead of asking the system for new ones, so 100,000
   executions reserve exactly what the first one did — checked by the harness,
@@ -306,13 +356,15 @@ zero dependencies. See
 ## Language status
 
 The engine understands numbers, arithmetic with precedence, parentheses,
-`let` bindings scoped to one execution, line comments, and seventeen builtins
-(`abs`, `min`, `max`, `clamp`, `floor`, `ceil`, `round`, `len`, `trim`, `upper`,
-`lower`). Strings are length-delimited: literals with `\n`, `\r`, `\t`, `\"`,
-`\\` and `\u{…}` escapes, `+` concatenation that refuses a mixed-type program by
-naming both operands, and `==` / `!=` by content. A host can define a string
-global from outside the language, and can bind functions a script calls by name —
-up to 16 arguments, up to 64 calls deep.
+`let` bindings scoped to one execution, `import` of a local module with a
+namespace, line comments, and twenty-one builtins (`abs`, `min`, `max`, `clamp`,
+`floor`, `ceil`, `round`, `pow`, `sqrt`, `len`, `trim`, `upper`, `lower`,
+`contains`, `replace`, `slice`, `type_of`, `fs.read_text`, `fs.write_text`,
+`json.parse`, `json.stringify`). Strings are length-delimited: literals with
+`\n`, `\r`, `\t`, `\"`, `\\` and `\u{…}` escapes, `+` concatenation that refuses
+a mixed-type program by naming both operands, and `==` / `!=` by content. A host
+can define a string global from outside the language, and can bind functions a
+script calls by name — up to 16 arguments, up to 64 calls deep.
 
 Errors report a 1-based line and byte column — `[Line 2, Col 13]: …` — and that
 position survives the FFI boundary into C, Python, and Node. `stats()` reports
@@ -320,9 +372,9 @@ the last execution's wall-clock time in microseconds.
 
 What is still missing: indexing, slicing, string methods and interpolation;
 ordering comparisons on strings; boolean, `nil`, and `undefined` literals;
-user-defined functions, control flow, and collections. The memory model and the
-call machinery that make those cheap are already in place — the syntax is the
-next increment.
+user-defined functions, control flow, and collections. The module loader, the
+bytecode compiler, and the call machinery that make those cheap are already in
+place — the syntax is the next increment.
 
 ## File extensions
 
