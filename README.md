@@ -73,6 +73,7 @@ omni run examples/hello.omni                        # -> 42
 | Path | What it is |
 | --- | --- |
 | `crates/omni-core` | NaN-boxed 8-byte scalars, length-delimited strings, a lexer, an AST-to-bytecode compiler, and a stack virtual machine. Zero dependencies. |
+| `crates/omni-core/fuzz` | Four cargo-fuzz targets (lexer, parser, lowering, VM decoder) and a seed corpus. Separate workspace; nightly only. |
 | `crates/omni-ffi` | The C ABI: `omni.dll` / `libomni.so`, `include/omni.h`, and contract tests written as an external caller. |
 | `crates/omni-cli` | `omni run <file>`, `omni eval <expr>`, `omni check-update`, `omni update`, and the standalone `omniup`. Hand-rolled args, no clap. |
 | `crates/omni-wasm` | Scaffolded wasm surface, mirroring the C ABI shape. Not built by default. |
@@ -91,7 +92,7 @@ omni run examples/hello.omni                        # -> 42
 
 ```bash
 # Rust
-cargo test --workspace                                  # 322 tests
+cargo test --workspace                                  # 329 tests
 cargo run -p omni-cli -- eval '"omni" + " " + "engine"'  # -> omni engine
 cargo run --release -p omni-core --example bench         # the engine, measured
 
@@ -112,7 +113,8 @@ cd sdks/nodejs && npm install koffi && node -e \
 Or run everything at once:
 
 ```bash
-./scripts/verify-all.sh   # the same bytes from every host, ABI, memory, batch, updates
+./scripts/verify-all.sh   # the same bytes from every host, ABI, memory, batch, updates, fuzzing
+./scripts/fuzz.sh         # libFuzzer when nightly is present, deterministic harness otherwise
 ./scripts/bench.sh        # ns/exec, crossing cost, batch speed-up -- measured
 python scripts/check-versions.py   # one version, one ABI across every surface
 python scripts/package.py          # a clean native archive for this platform
@@ -127,7 +129,11 @@ does not fetch during a dry run, and replaces a binary only with verified bytes.
 It also checks the DevPack surface across hosts:
 the math, string and type builtins, a second-line error rendered as
 `[Line 2, Col 13]`, `eval_str` / `eval` returning native values, and a non-zero
-`last_exec_micros`. Tools that are missing are reported as `SKIP`, not as a pass.
+`last_exec_micros`. The second row runs the deterministic fuzz harness:
+1,200 mutated inputs through the lexer, parser, lowering pass, VM, and raw
+instruction decoder, requiring zero panics, identical results across two runs,
+and a valid position on every error. Tools that are missing are reported as
+`SKIP`, not as a pass.
 
 ## The standard toolkit
 
@@ -200,6 +206,39 @@ thread stack. `Chunk`, the AST, the VM stack, and the lowering work stack all
 live on the engine and are cleared rather than freed, so a warm program still
 allocates nothing. Operand ordering, positions, and error text are the fused
 evaluator's, which is what keeps ABI 4 byte-identical.
+
+## Staying safe by default
+
+The engine assumes a program may be hostile. Every bound is a positioned error,
+never a panic, an abort, or a hang:
+
+| Bound | Limit |
+| --- | --- |
+| VM instructions per top-level execution | 16,777,216, shared with every module imported |
+| VM stack values | 65,536 (512 KiB) |
+| Parser expression nesting | 128 |
+| Call nesting | 64 |
+| Module import depth | 16 |
+
+A backward jump or runaway recursion fails with
+`execution exceeded the step limit of N instructions` at the instruction that
+would have run. `0` disables the check for a trusted batch. The budget is a Rust
+policy (`Engine::set_step_limit`) rather than an ABI field, so every SDK runs
+under the same default and ABI 4 did not move.
+
+`fs` writes fail closed: a missing path is resolved through its parent, an
+existing entry must canonicalize inside a granted root, and a dangling symlink is
+refused rather than followed. With no roots granted — the CLI's default — both
+`fs` builtins report that they are disabled.
+
+Fuzzing has two drivers. `crates/omni-core/fuzz` holds four cargo-fuzz targets
+for the lexer, parser, lowering pass, and instruction decoder; they need a
+nightly toolchain and `cargo-fuzz`, and are deliberately a separate workspace so
+neither becomes a dependency of the engine. `scripts/fuzz.sh` uses them when
+available and otherwise runs the deterministic harness that `verify-all.sh`
+runs: a fixed corpus mutated 1,200 ways, each input through all four stages and
+the raw decoder, twice, asserting no panic, identical results, and a real
+`Line`/`Col` on every error.
 
 ## Modules
 

@@ -84,6 +84,15 @@ else
   tail -20 "$OUT/rust.log"
 fi
 
+printf 'Deterministic fuzz harness... '
+if bash scripts/fuzz.sh --deterministic >"$OUT/fuzz.log" 2>&1; then
+  summary=$(grep -oE 'fuzz harness:.*' "$OUT/fuzz.log" | tail -1 | tr -d '\r')
+  pass "${summary:-deterministic fuzz harness passed}"
+else
+  fail "deterministic fuzz harness"
+  tail -20 "$OUT/fuzz.log"
+fi
+
 printf 'Shared library... '
 if cargo build -p omni-ffi >"$OUT/build.log" 2>&1; then
   lib="$ROOT/target/debug/$(case "$OSTYPE" in

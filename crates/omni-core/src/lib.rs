@@ -21,6 +21,9 @@ pub mod arena;
 pub mod ast;
 pub mod bytecode;
 pub mod engine;
+/// Hidden entry points for fuzz binaries. Not part of the supported API.
+#[doc(hidden)]
+pub mod fuzz_api;
 pub mod json;
 pub mod lexer;
 pub mod object;
@@ -38,8 +41,9 @@ static COUNTED: counted::Counting = counted::Counting;
 
 pub use arena::{Arena, Mark};
 pub use engine::{
-    BatchItem, Engine, ErrorKind, HostCall, HostError, HostOutcome, MAX_ARGS, MAX_CALL_DEPTH,
-    MAX_IDENTIFIER_LEN, MAX_MODULE_DEPTH, OmniError, Stats,
+    BatchItem, DEFAULT_STEP_LIMIT, Engine, ErrorKind, HostCall, HostError, HostOutcome, MAX_ARGS,
+    MAX_CALL_DEPTH, MAX_IDENTIFIER_LEN, MAX_MODULE_DEPTH, MAX_NESTING, MAX_STACK_DEPTH, OmniError,
+    Stats,
 };
 pub use lexer::{BinOp, LexError, MAX_SOURCE_LEN, Token, TokenKind, lex, lex_into};
 pub use object::{MAX_STRING_LEN, StrRef};

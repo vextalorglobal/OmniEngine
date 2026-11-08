@@ -15,7 +15,7 @@
 //! is unescaped when its instruction executes, which is exactly when the fused
 //! evaluator did it — so error order relative to arithmetic is unchanged.
 
-use crate::engine::{ErrorKind, MAX_ARGS, MAX_CALL_DEPTH, OmniError, Pos};
+use crate::engine::{ErrorKind, MAX_ARGS, MAX_CALL_DEPTH, MAX_NESTING, OmniError, Pos};
 use crate::lexer::{BinOp, Token, TokenKind};
 
 /// "No node" in an index field.
@@ -108,6 +108,7 @@ impl Ast {
             tokens,
             index: 0,
             call_depth: 0,
+            nesting: 0,
             ast: self,
         };
         parser.program()
@@ -126,6 +127,10 @@ struct Parser<'s, 'a> {
     index: usize,
     /// Syntactic call nesting, checked the way the recursive parser checked it.
     call_depth: u32,
+    /// Live `expr` frames. Grouping recurses through `primary` back into
+    /// `expr`, so this is the counter that keeps crafted parentheses from
+    /// exhausting the native stack.
+    nesting: u32,
     ast: &'a mut Ast,
 }
 
@@ -191,8 +196,27 @@ impl Parser<'_, '_> {
         Ok(())
     }
 
-    /// `==` and `!=`, one level below `+`, exactly as the fused parser had them.
+    /// Enter one expression, counting the live nesting first.
+    ///
+    /// `primary` calls back into `expr` for a parenthesized group, so this
+    /// counter is the parser's native-stack guard. It is decremented on the
+    /// error path too, which keeps the counter honest for the next statement.
     fn expr(&mut self) -> Result<u32, OmniError> {
+        if self.nesting >= MAX_NESTING {
+            return Err(OmniError::new(
+                ErrorKind::Parse,
+                self.pos_at(self.index),
+                format!("expressions are nested {MAX_NESTING} deep, the limit"),
+            ));
+        }
+        self.nesting += 1;
+        let result = self.expr_inner();
+        self.nesting -= 1;
+        result
+    }
+
+    /// `==` and `!=`, one level below `+`, exactly as the fused parser had them.
+    fn expr_inner(&mut self) -> Result<u32, OmniError> {
         let mut acc = self.additive()?;
         loop {
             let kind = match self.kind(self.index) {

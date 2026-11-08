@@ -9,7 +9,8 @@ it. The short version:
 
 ```bash
 python scripts/check-versions.py          # one version, one ABI
-./scripts/verify-all.sh                   # 272 Rust, 122 Python, 116 Node checks
+./scripts/verify-all.sh                   # 329 Rust, 122 Python, 116 Node checks
+./scripts/fuzz.sh                         # libFuzzer if nightly, else the harness
 ./scripts/bench.sh                        # measured numbers, not regressions
 git tag v0.1.0 && git push origin v0.1.0  # the only release action
 ```
@@ -90,9 +91,18 @@ cargo build -p omni-ffi
 python sdks/python/tests/test_ffi.py
 (cd sdks/nodejs && npm install koffi && npm test)
 ./scripts/verify-all.sh
+./scripts/fuzz.sh
 python scripts/check-versions.py --tag v0.1.0
 python -m twine check dist/*.whl          # after building the wheel
 ```
+
+`verify-all.sh` includes the deterministic fuzz harness, so it always runs
+something. `fuzz.sh` prefers real libFuzzer: with `cargo +nightly` and
+`cargo-fuzz` installed it runs each of the four targets for `FUZZ_SECONDS`
+(default 30) against its corpus, and it falls back to the same deterministic
+harness — with an install hint — when either is missing. The nightly toolchain
+and `libfuzzer-sys` are deliberately not part of the workspace build; nothing
+in the shipped engine links them.
 
 `check-versions.py` reads the workspace version from `Cargo.toml`, `[project]`
 from `pyproject.toml`, `version` from `package.json`, and the ABI from the C

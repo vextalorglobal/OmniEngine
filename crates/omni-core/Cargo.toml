@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 repository.workspace = true
+# The fuzz project is a separate workspace with its own nightly dependency; it
+# must not travel inside a published crate.
+exclude = ["fuzz"]
 
 # Zero dependencies is a load-bearing property, not minimalism for its own sake:
 # it keeps the audit surface empty, the compile graph small, and the disk

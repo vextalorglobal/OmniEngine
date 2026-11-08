@@ -74,6 +74,60 @@ pub const MAX_CALL_DEPTH: u32 = 64;
 /// into a named error rather than a walk that never finishes.
 pub const MAX_MODULE_DEPTH: usize = 16;
 
+/// Instructions one top-level execution may run before it is stopped.
+///
+/// The budget is deterministic — a counter, not a clock — so a given program
+/// fails at the same instruction everywhere. `import` shares the parent's
+/// budget, which is what stops a program from resetting the count by loading a
+/// module repeatedly. Sixteen million is generous for real source (a
+/// hundred-thousand-term expression compiles to roughly two hundred thousand
+/// instructions) and small enough that a runaway loop stops promptly.
+/// [`Engine::set_step_limit`] changes it; `0` disables the check.
+pub const DEFAULT_STEP_LIMIT: u64 = 1 << 24;
+
+/// Deepest operand stack the VM will grow. A value is eight bytes, so the cap
+/// costs at most 512 KiB. Compiled programs stay far below it — arguments are
+/// capped at [`MAX_ARGS`] and calls at [`MAX_CALL_DEPTH`] — and the limit exists
+/// for chunks built by tests, fuzzers, or a future tool.
+pub const MAX_STACK_DEPTH: usize = 65_536;
+
+/// How deeply expressions may nest before the parser refuses. Grouping recurses
+/// through `expr`, so this is what turns a crafted `((((…))))` into a parse
+/// error instead of a native stack overflow. It composes with
+/// [`MAX_CALL_DEPTH`], and the sum stays comfortably inside a thread stack.
+pub const MAX_NESTING: u32 = 128;
+
+/// The instruction budget one top-level execution shares with every module it
+/// imports. Created per `exec` (and per batch item), never per module.
+pub(crate) struct Budget {
+    limit: u64,
+    used: u64,
+}
+
+impl Budget {
+    pub(crate) fn new(limit: u64) -> Budget {
+        Budget { limit, used: 0 }
+    }
+
+    /// Charge one instruction, or report the limit at the instruction that
+    /// would have run next.
+    fn charge(&mut self, at: Pos) -> Result<(), OmniError> {
+        if self.limit != 0 && self.used >= self.limit {
+            return Err(OmniError::new(
+                ErrorKind::Runtime,
+                at,
+                format!(
+                    "execution exceeded the step limit of {} instruction{}",
+                    self.limit,
+                    if self.limit == 1 { "" } else { "s" }
+                ),
+            ));
+        }
+        self.used = self.used.saturating_add(1);
+        Ok(())
+    }
+}
+
 /// The category of a failure, which the FFI maps onto status codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
@@ -393,6 +447,8 @@ pub struct Engine {
     fs_read_roots: Vec<PathBuf>,
     /// Directories `fs.write_text` may write. Empty means everything is denied.
     fs_write_roots: Vec<PathBuf>,
+    /// Instructions one top-level execution may run. See [`DEFAULT_STEP_LIMIT`].
+    step_limit: u64,
     last_value: Value,
     last_error: Option<OmniError>,
     execs: u64,
@@ -421,6 +477,7 @@ impl Engine {
             module_bindings: Vec::new(),
             fs_read_roots: Vec::new(),
             fs_write_roots: Vec::new(),
+            step_limit: DEFAULT_STEP_LIMIT,
             last_value: Value::UNDEF,
             last_error: None,
             execs: 0,
@@ -436,10 +493,21 @@ impl Engine {
     /// rather than frees. Everything else this function hands back is eight bytes
     /// with no memory behind it.
     pub fn exec(&mut self, source: &str) -> Result<Value, OmniError> {
+        let mut budget = Budget::new(self.step_limit);
+        self.exec_with_budget(source, &mut budget)
+    }
+
+    /// [`Engine::exec`] with a budget the caller owns. `import` uses this so a
+    /// module spends from the parent's count instead of getting a fresh one.
+    pub(crate) fn exec_with_budget(
+        &mut self,
+        source: &str,
+        budget: &mut Budget,
+    ) -> Result<Value, OmniError> {
         self.reclaim();
         self.execs += 1;
         let started = Instant::now();
-        let result = self.run(source);
+        let result = self.run_with_budget(source, budget);
         self.last_exec_micros = elapsed_micros(started.elapsed());
         match result {
             Ok(v) => {
@@ -492,7 +560,10 @@ impl Engine {
             self.call_depth = 0;
             self.execs += 1;
             let started = Instant::now();
-            let result = self.run(source);
+            // Each item is an independent execution, so each gets the whole
+            // budget; modules still share it with the item that imported them.
+            let mut budget = Budget::new(self.step_limit);
+            let result = self.run_with_budget(source, &mut budget);
             self.last_exec_micros = elapsed_micros(started.elapsed());
             items.push(match result {
                 Ok(v) => {
@@ -763,13 +834,30 @@ impl Engine {
         }
     }
 
+    // -- execution policy -----------------------------------------------------
+
+    /// The instruction budget every top-level execution starts with.
+    pub fn step_limit(&self) -> u64 {
+        self.step_limit
+    }
+
+    /// Bound one top-level execution to `steps` instructions, shared with every
+    /// module it imports. `0` disables the check.
+    ///
+    /// The budget is deterministic: the same program stops at the same
+    /// instruction and reports the same position on every host. It is a Rust
+    /// policy, not part of ABI 4, so the SDKs cannot set it yet.
+    pub fn set_step_limit(&mut self, steps: u64) {
+        self.step_limit = steps;
+    }
+
     /// Lex, parse, lower, and run, handing every owned buffer back afterwards.
     ///
     /// The five buffers are taken out of `self` so the parser and the lowering
     /// pass can borrow the engine immutably — they need to know which call
     /// names resolve — while `&mut self` runs the VM. They go back on the error
     /// path too: a bad program must not cost the next good one a reallocation.
-    fn run(&mut self, source: &str) -> Result<Value, OmniError> {
+    fn run_with_budget(&mut self, source: &str, budget: &mut Budget) -> Result<Value, OmniError> {
         let mut tokens = std::mem::take(&mut self.tokens);
         let mut ast = std::mem::take(&mut self.ast);
         let mut chunk = std::mem::take(&mut self.chunk);
@@ -780,7 +868,7 @@ impl Engine {
             lex_into(source, &mut tokens)?;
             ast.parse_into(source, &tokens)?;
             crate::bytecode::compile(&ast, source, &*self, &mut chunk, &mut tasks)?;
-            self.run_chunk(&chunk, source, &mut stack)
+            self.run_chunk(&chunk, source, &mut stack, budget)
         })();
 
         self.tokens = tokens;
@@ -791,18 +879,34 @@ impl Engine {
         result
     }
 
+    /// Execute a chunk with a budget of its own. Used by [`crate::fuzz_api`],
+    /// which builds chunks by hand and has no source to parse.
+    pub(crate) fn run_chunk_for_fuzz(
+        &mut self,
+        chunk: &Chunk,
+        source: &str,
+    ) -> Result<Value, OmniError> {
+        let mut stack = std::mem::take(&mut self.stack);
+        let mut budget = Budget::new(self.step_limit);
+        let result = self.run_chunk(chunk, source, &mut stack, &mut budget);
+        self.stack = stack;
+        result
+    }
+
     /// Execute one chunk. The stack is the engine's, cleared but not freed.
     fn run_chunk(
         &mut self,
         chunk: &Chunk,
         source: &str,
         stack: &mut Stack,
+        budget: &mut Budget,
     ) -> Result<Value, OmniError> {
         stack.clear();
         let mut ip = 0usize;
         while ip < chunk.code.len() {
             let instr = chunk.code[ip];
             let at = instr.pos();
+            budget.charge(at)?;
             ip += 1;
             match instr.op {
                 OpCode::PushNumber => {
@@ -814,19 +918,19 @@ impl Engine {
                             format!("'{text}' is not a valid number"),
                         )
                     })?;
-                    stack.push(Value::from_f64(number));
+                    push(stack, Value::from_f64(number), at)?;
                 }
                 OpCode::PushStr => {
                     let bytes = decode_literal(literal_span(source, instr), at)?;
                     let value = self.new_string(&bytes, at, ErrorKind::Runtime)?;
-                    stack.push(value);
+                    push(stack, value, at)?;
                 }
-                OpCode::PushNil => stack.push(Value::NIL),
-                OpCode::PushUndef => stack.push(Value::UNDEF),
+                OpCode::PushNil => push(stack, Value::NIL, at)?,
+                OpCode::PushUndef => push(stack, Value::UNDEF, at)?,
                 OpCode::Load => {
                     let name = chunk.name(instr);
                     match self.lookup(name) {
-                        Some(value) => stack.push(value),
+                        Some(value) => push(stack, value, at)?,
                         None => return Err(self.undefined_name(name, at)),
                     }
                 }
@@ -846,12 +950,12 @@ impl Engine {
                 OpCode::Eq => {
                     let rhs = pop(stack, at)?;
                     let lhs = pop(stack, at)?;
-                    stack.push(Value::bool(self.eq_values(lhs, rhs)));
+                    push(stack, Value::bool(self.eq_values(lhs, rhs)), at)?;
                 }
                 OpCode::Ne => {
                     let rhs = pop(stack, at)?;
                     let lhs = pop(stack, at)?;
-                    stack.push(Value::bool(!self.eq_values(lhs, rhs)));
+                    push(stack, Value::bool(!self.eq_values(lhs, rhs)), at)?;
                 }
                 OpCode::Neg => {
                     let value = pop(stack, at)?;
@@ -866,7 +970,7 @@ impl Engine {
                             ),
                         )
                     })?;
-                    stack.push(Value::from_f64(-number));
+                    push(stack, Value::from_f64(-number), at)?;
                 }
                 OpCode::Jump => {
                     ip = instr.a as usize;
@@ -911,7 +1015,7 @@ impl Engine {
                     };
                     let value = result?;
                     stack.truncate(start);
-                    stack.push(value);
+                    push(stack, value, at)?;
                 }
                 OpCode::Ret => return Ok(pop(stack, at).unwrap_or(Value::UNDEF)),
                 OpCode::Import => {
@@ -919,8 +1023,8 @@ impl Engine {
                     let request = std::str::from_utf8(&bytes).map_err(|_| {
                         OmniError::new(ErrorKind::Runtime, at, "import needs a UTF-8 module name")
                     })?;
-                    self.import_module(request, at)?;
-                    stack.push(Value::UNDEF);
+                    self.import_module(request, at, budget)?;
+                    push(stack, Value::UNDEF, at)?;
                 }
             }
         }
@@ -933,7 +1037,7 @@ impl Engine {
         let rhs = pop(stack, at)?;
         let lhs = pop(stack, at)?;
         let value = self.arith(lhs, op, rhs, at)?;
-        stack.push(value);
+        push(stack, value, at)?;
         Ok(())
     }
 
@@ -1043,7 +1147,12 @@ impl Engine {
     /// module gets the builtins and the parent's filesystem permissions, but not
     /// the parent's host globals or callbacks, and its bindings reach the parent
     /// only through the export copy below.
-    fn import_module(&mut self, request: &str, at: Pos) -> Result<(), OmniError> {
+    fn import_module(
+        &mut self,
+        request: &str,
+        at: Pos,
+        budget: &mut Budget,
+    ) -> Result<(), OmniError> {
         if request.is_empty() {
             return Err(OmniError::new(
                 ErrorKind::Runtime,
@@ -1146,10 +1255,15 @@ impl Engine {
         child.fs_write_roots = self.fs_write_roots.clone();
         child.loading_modules = self.loading_modules.clone();
         child.loading_modules.push(path);
-        child.exec(source).map_err(|mut error| {
-            error.message = format!("in module '{namespace}': {}", error.message);
-            error
-        })?;
+        // The module spends from the parent's budget rather than a fresh one, so
+        // importing the same expensive module twice cannot double the allowed
+        // work. `exec_with_budget` still resets the child's arena and counters.
+        child
+            .exec_with_budget(source, budget)
+            .map_err(|mut error| {
+                error.message = format!("in module '{namespace}': {}", error.message);
+                error
+            })?;
 
         let exported: Vec<(String, Value)> = child
             .bindings
@@ -1276,12 +1390,21 @@ impl Engine {
             ));
         }
         let target = Path::new(request);
-        // A new file cannot be canonicalized, so its parent is the part that has
-        // to be proven inside a root. An existing target is checked whole, which
-        // also catches a symlinked file pointing out of the sandbox.
-        let checked = match target.canonicalize() {
-            Ok(existing) => existing,
-            Err(_) => {
+        // `symlink_metadata` does not follow the final component, so it tells
+        // "nothing exists" apart from "a symlink exists, possibly dangling".
+        // Only the first may fall back to checking the parent. A dangling link
+        // fails to canonicalize, and following it with `fs::write` would land
+        // outside the sandbox — so a failed canonicalization is the answer, not
+        // a reason to try the parent.
+        let checked = match std::fs::symlink_metadata(target) {
+            Ok(_) => target.canonicalize().map_err(|e| {
+                OmniError::new(
+                    ErrorKind::Runtime,
+                    at,
+                    format!("cannot write '{request}': {e}"),
+                )
+            })?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let Some(name) = target.file_name() else {
                     return Err(OmniError::new(
                         ErrorKind::Runtime,
@@ -1305,6 +1428,13 @@ impl Engine {
                         )
                     })?
                     .join(name)
+            }
+            Err(error) => {
+                return Err(OmniError::new(
+                    ErrorKind::Runtime,
+                    at,
+                    format!("cannot write '{request}': {error}"),
+                ));
             }
         };
         if !self
@@ -1855,6 +1985,23 @@ fn pop(stack: &mut Stack, at: Pos) -> Result<Value, OmniError> {
     stack
         .pop()
         .ok_or_else(|| OmniError::new(ErrorKind::Panic, at, "the VM stack underflowed"))
+}
+
+/// Push one value, refusing to grow past [`MAX_STACK_DEPTH`].
+///
+/// Compiled programs cannot reach the cap, so a value that would is evidence of
+/// a hand-built or corrupt chunk; a positioned error is still better than an
+/// allocation that ends the process.
+fn push(stack: &mut Stack, value: Value, at: Pos) -> Result<(), OmniError> {
+    if stack.len() >= MAX_STACK_DEPTH {
+        return Err(OmniError::new(
+            ErrorKind::Runtime,
+            at,
+            format!("the VM stack reached its {MAX_STACK_DEPTH}-value limit"),
+        ));
+    }
+    stack.push(value);
+    Ok(())
 }
 
 /// The value a `Store` keeps: `let x = 1 + 2` evaluates to three.
@@ -3576,8 +3723,7 @@ mod tests {
             code,
             names: names.to_vec(),
         };
-        let mut stack: Stack = Vec::new();
-        e.run_chunk(&chunk, "", &mut stack)
+        e.run_chunk_for_fuzz(&chunk, "")
     }
 
     #[test]
@@ -3650,6 +3796,67 @@ mod tests {
         ];
         let error = run_chunk(&mut Engine::new(), code, b"").unwrap_err();
         assert_eq!(error.kind, ErrorKind::Panic);
+    }
+
+    #[test]
+    fn a_backward_jump_is_stopped_by_the_step_limit() {
+        let at = Pos::new(3, 7);
+        let code = vec![Instr::new(OpCode::Jump, 0, 0, 0, at)];
+        let mut e = Engine::new();
+        e.set_step_limit(10);
+        let error = run_chunk(&mut e, code, b"").unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Runtime);
+        assert_eq!(
+            error.message,
+            "execution exceeded the step limit of 10 instructions"
+        );
+        assert_eq!(
+            (error.line, error.column),
+            (3, 7),
+            "the next instruction's position"
+        );
+        assert_eq!(e.step_limit(), 10);
+    }
+
+    #[test]
+    fn a_zero_step_limit_disables_the_check_and_the_default_is_finite() {
+        let mut e = Engine::new();
+        assert_eq!(e.step_limit(), DEFAULT_STEP_LIMIT);
+        e.set_step_limit(0);
+        assert_eq!(e.exec("1 + 1").unwrap().as_f64(), Some(2.0));
+        let error = e.exec("1 / 0").unwrap_err();
+        assert_eq!(error.message, "division by zero");
+    }
+
+    #[test]
+    fn a_push_storm_stops_at_the_stack_limit() {
+        let at = Pos::new(1, 1);
+        let code = vec![Instr::new(OpCode::PushNil, 0, 0, 0, at); MAX_STACK_DEPTH + 1];
+        let error = run_chunk(&mut Engine::new(), code, b"").unwrap_err();
+        assert_eq!(
+            error.message,
+            format!("the VM stack reached its {MAX_STACK_DEPTH}-value limit")
+        );
+        assert_eq!((error.line, error.column), (1, 1));
+    }
+
+    #[test]
+    fn deeply_nested_parentheses_are_a_parse_error_not_a_stack_overflow() {
+        let mut e = Engine::new();
+        let deep = format!(
+            "{}1{}",
+            "(".repeat(MAX_NESTING as usize + 64),
+            ")".repeat(MAX_NESTING as usize + 64)
+        );
+        let error = e.exec(&deep).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Parse);
+        assert_eq!(
+            error.message,
+            format!("expressions are nested {MAX_NESTING} deep, the limit")
+        );
+        assert!(error.line >= 1 && error.column >= 1, "{error}");
+        let shallow = format!("{}1{}", "(".repeat(100), ")".repeat(100));
+        assert_eq!(e.exec(&shallow).unwrap().as_f64(), Some(1.0));
     }
 
     // -- modules --------------------------------------------------------------
@@ -3804,6 +4011,31 @@ mod tests {
     }
 
     #[test]
+    fn imports_spend_the_parents_step_budget() {
+        let root = temp_root("budget");
+        // Each `let` statement lowers to a push and a store, with a pop between
+        // statements: the module runs 90 instructions and the parent 62.
+        let module = "let a = 1\n".repeat(30);
+        write_module(&root, "m", &module);
+        let parent = format!("import \"m\"\n{}", "let b = 2\n".repeat(20));
+        let mut e = Engine::new();
+        e.set_module_root(&root).unwrap();
+
+        // 100 is enough for either source alone but not for both, so a failure
+        // proves the child spent from the parent's budget rather than its own.
+        e.set_step_limit(100);
+        let error = e.exec(&parent).unwrap_err();
+        assert_eq!(
+            error.message,
+            "execution exceeded the step limit of 100 instructions"
+        );
+
+        e.set_step_limit(200);
+        assert_eq!(e.exec(&parent).unwrap().as_f64(), Some(2.0));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn module_exports_do_not_leak_between_batch_items() {
         let root = temp_root("batch");
         write_module(&root, "math", "let answer = 42");
@@ -3874,6 +4106,36 @@ mod tests {
             "{error}"
         );
         std::fs::remove_file(&outside).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_cannot_carry_a_write_outside_the_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root("fs-dangling");
+        let outside = std::env::temp_dir().join(format!(
+            "omni-phase7-{}-fs-dangling-outside.txt",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&outside);
+        let link = root.join("escape.txt");
+        symlink(&outside, &link).unwrap();
+
+        let mut e = Engine::new();
+        e.allow_fs_write(&root).unwrap();
+        e.define_string("target", link.to_str().unwrap().as_bytes())
+            .unwrap();
+        let error = e.exec("fs.write_text(target, \"owned\")").unwrap_err();
+        assert!(
+            error.message.starts_with("cannot write"),
+            "a link that resolves nowhere has to be refused: {error}"
+        );
+        assert!(
+            !outside.exists(),
+            "the write must not follow the link out of the sandbox"
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 

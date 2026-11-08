@@ -38,6 +38,21 @@ that do not start with `_`, and refuses escapes, cycles, and nesting past 16.
 The module root and filesystem roots are opt-in Rust APIs, so imports and reads
 fail closed by default.
 
+**Hardened execution.** A program cannot run forever or grow without bound. Each
+top-level execution carries a deterministic budget of 16,777,216 VM
+instructions, shared with every module it imports, and a backward jump or an
+infinite recursion fails with `execution exceeded the step limit of N
+instructions` at the offending instruction. The VM stack is capped at 65,536
+values, the parser refuses expressions nested past 128, and filesystem writes
+resolve symlinks before the containment check, so a link cannot carry a write
+outside a granted root. The limits are positioned errors, never panics, and they
+apply identically through Rust, C, Python, and Node because they live below the
+unchanged ABI. Fuzzing ships in two forms: four cargo-fuzz targets for the
+lexer, parser, lowering pass, and instruction decoder, and a deterministic
+harness that mutates a fixed corpus through all five paths on every
+`verify-all.sh` run — 1,200 inputs per path, with deterministic output and
+positioned errors asserted.
+
 **A standard toolkit.** Twenty-one builtins need no host registration. Math:
 `abs`, `min`, `max`, `clamp`, `floor`, `ceil`, `round`, `pow`, `sqrt`. Text:
 `len`, `trim`, `upper`, `lower`, `contains`, `replace`, `slice`. Inspection:
@@ -63,9 +78,9 @@ Both SDKs can report the same answer (`omni.check_updates()`,
 in the engine's `omni_check_update` export so every surface agrees on what
 "newer" means. Plain HTTP is refused by default.
 
-**Quality.** 34 of 34 cross-host verification rows pass on this machine: 322 Rust
-tests, 122 Python, 116 Node, plus the C embedding example. `cargo fmt --check` and
-`cargo clippy -- -D warnings` are clean.
+**Quality.** 35 of 35 cross-host verification rows pass on this machine: 329 Rust
+tests, 122 Python, 116 Node, plus the C embedding example and the deterministic
+fuzz harness. `cargo fmt --check` and `cargo clippy -- -D warnings` are clean.
 
 **Packaging.** A platform wheel carries the engine in `omni/_native/`; the npm
 tarball carries five engines under `native/<platform>-<arch>/`; each C target

@@ -10,7 +10,7 @@ JavaScript can call, a custom file extension that GitHub recognises, and
 SDKs that install through `pip` and `npm`.
 
 Two numbering systems are in use and both are kept, because the brief's five
-phases are how the work was asked for and how section 8 is scored. **"Phase 1–5"
+phases are how the work was asked for and how section 9 is scored. **"Phase 1–5"
 means the brief's deliverables** (workspace, core, bridge, Linguist, SDKs).
 **"The strings increment" or "ABI v2"** means the second round of work on the
 language and the bridge — strings, the egress memory model, and the four new
@@ -35,12 +35,14 @@ or Phase 3.
 | Packaging, distribution, release | done | platform wheels with the engine inside, an npm tarball with five engines, `scripts/package.py`, `scripts/check-versions.py`, `.github/workflows/release.yml` (§6.7, `docs/RELEASING.md`) |
 | DevPack: builtins, positions, timer, sugar | done | 17 builtins, `[Line N, Col M]` errors, `last_exec_micros` in ABI-4 padding, `eval_str` / `eval` (§3.5, §4.4, §6.1–6.2) |
 | Phase 6 — bytecode VM, modules, sandbox | done | AST lowering and a stack VM behind the unchanged ABI 4, `import` with namespace isolation, `fs` / `json` builtins (21 total), 226 `omni-core` tests (§7) |
+| Phase 7 — hardened security and fuzzing | done | shared execution gas, a 65,536-value VM stack cap, a 128-level parser nesting cap, symlink-safe writes, cargo-fuzz targets plus a deterministic in-repo harness, 233 `omni-core` tests (§8) |
 | Auto-updater and CLI manager | done | `omni_check_update` in the C ABI, `omni update` / `omni check-update` / `omniup`, `omni.check_updates()` and `checkUpdates()`, `scripts/cli-binaries.py` + `scripts/make-manifest.py` (§6.4–6.5) |
-| Same answer from four hosts | done | `scripts/verify-all.sh` — 34 rows, all passing |
+| Same answer from four hosts | done | `scripts/verify-all.sh` — 35 rows, all passing |
 
 ```
-cargo test --workspace          # 322 tests
+cargo test --workspace          # 329 tests
 ./scripts/verify-all.sh         # Rust, C, Python, Node: 42, "hello, world", ABI 4
+./scripts/fuzz.sh               # libFuzzer when nightly is present, harness otherwise
 ./scripts/bench.sh              # three hosts, one crossing each, measured
 python scripts/check-versions.py  # one version, one ABI across every surface
 python scripts/package.py         # a clean native archive for this platform
@@ -447,8 +449,10 @@ default, so both filesystem calls fail closed with
 Rust embedder opts in with `Engine::allow_fs_read(path)` or
 `Engine::allow_fs_write(path)`, which canonicalize the directory and return an
 `io::Result`. A read canonicalizes the target and requires it under a read
-root; a write canonicalizes the target's parent, so a new file is allowed and
-`..` is not. A target outside every root is the engine's
+root; a write canonicalizes an existing target (including a symlink) and
+refuses one that resolves nowhere, while a genuinely new path is checked
+through its canonical parent, so `..` cannot escape. A target outside every
+root is the engine's
 `path '…' is outside the allowed read roots`, not the platform's wording, so
 the same bytes reach every host. JSON covers the four scalar kinds a 16-byte
 value can carry; an array or object is a deliberate error rather than a
@@ -694,7 +698,7 @@ whole — `[Line 1, Col 5]: expected a name, found ''=''` — and the contract t
 asserts both the line and the column survive the boundary. Note the doubled
 quotes around `=`: that is the engine, not the SDK. `display_kind` renders a
 symbol as `'='` and the message template wraps it in quotes a second time. The
-hosts pass the text through untouched rather than prettifying it, and section 11
+hosts pass the text through untouched rather than prettifying it, and section 12
 records the one-character fix.
 
 **A zero-length program is legal even from a null pointer.** Node hands an empty
@@ -1696,7 +1700,138 @@ SDK constructors is a later increment, so a script run through `omni` can call
 
 ---
 
-## 8. Verification
+## 8. Phase 7 — Hardened security, fuzzing, and resource bounds
+
+Phase 7 adds no language feature and moves neither ABI 4 nor language version 2.
+It closes the ways a hostile program could make the engine run forever, grow
+without bound, or walk out of a granted directory, and it adds a fuzz surface
+that is exercised on every verification run.
+
+### 8.1 The bounds, in one table
+
+| Bound | Limit | Where it is enforced | Error |
+| --- | --- | --- | --- |
+| Instructions per top-level execution | 16,777,216 (`DEFAULT_STEP_LIMIT`, `0` disables) | `Budget::charge` at the top of every VM step | `execution exceeded the step limit of N instructions` |
+| VM stack values | 65,536 (512 KiB) | the single `push` helper in the VM loop | `the VM stack reached its 65536-value limit` |
+| Parser expression nesting | 128 | `Parser::expr` | `expressions are nested 128 deep, the limit` |
+| Call nesting | 64 | parser, unchanged from Phase 3 | `calls are nested 64 deep, the limit…` |
+| Module import depth | 16 | module loader, unchanged from Phase 6 | `modules are nested 16 deep…` |
+| Arguments per call | 16 | parser | `a call takes at most 16 arguments` |
+
+Every one of these is a positioned runtime or parse error, not a panic, an
+abort, or a silently truncated result. The gas error points at the instruction
+whose execution was refused; the stack error points at the instruction that
+tried to push. Neither depends on wall-clock time, so the same program fails at
+the same step on every machine.
+
+### 8.2 Execution gas
+
+`Engine::exec`, `Engine::exec_many`, and the FFI exports above them create one
+`Budget` per top-level execution. The budget is passed down through
+`run_chunk`, and an `import` hands the **same** budget to the child engine, so a
+module cannot reset the count or buy itself a second allowance. A parent whose
+own work costs 62 instructions and whose module costs 90 fails at a limit of
+100 no matter which side the 100th step lands on, and the failure is attributed
+to the module only when it happens inside one.
+
+The default is finite on purpose: an infinite loop is the cheapest denial of
+service a script can write, and a language that runs one until the host gives up
+has no answer to it. The knob is a Rust policy, not an ABI field:
+
+```rust
+let mut engine = Engine::new();
+assert_eq!(engine.step_limit(), DEFAULT_STEP_LIMIT);
+engine.set_step_limit(10_000);   // tighter allowance for untrusted input
+engine.set_step_limit(0);        // explicit opt-out, for a trusted batch
+```
+
+`set_step_limit` is Rust-only in Phase 7. The SDKs cannot change it yet, so they
+all run under the 2^24 default; adding it to the ABI would be an ABI 5
+conversation, and this increment deliberately did not open one.
+
+### 8.3 Failing closed on the filesystem
+
+The Phase 6 write check canonicalized the target and tested containment. That
+was correct for an existing file and wrong for a **dangling symlink**: the path
+does not exist, so `canonicalize` fails, and an implementation that treated a
+failure as "not there yet, use the parent" could create the target through the
+link. Phase 7 separates the two cases with `symlink_metadata`:
+
+| Target state | What happens |
+| --- | --- |
+| Nothing exists at the path | the parent directory is canonicalized and must be inside a granted root; the write is refused otherwise |
+| A regular file exists | the file is canonicalized and the result must be inside a granted root |
+| A symlink exists (dangling or not) | the link itself is resolved by `canonicalize`; if that fails, the write is refused |
+| Any other metadata error | the write is refused with the OS error in the message |
+
+There is no parent fallback for an entry that exists, so a link cannot carry a
+write out of the sandbox. Reads already went through canonicalization and are
+unchanged. With no roots granted — the CLI's default — both `fs` builtins fail
+closed at the first call.
+
+### 8.4 Fuzzing
+
+The fuzz surface is `crates/omni-core/src/fuzz_api.rs`, a `#[doc(hidden)]` module
+that exposes the four stages separately:
+
+| Entry point | Input | Invariant |
+| --- | --- | --- |
+| `lex_only` | arbitrary UTF-8 | returns tokens or a positioned error; never panics |
+| `parse_only` | arbitrary UTF-8 | returns an AST or a positioned error; never panics |
+| `lower_only` | arbitrary UTF-8 | returns a chunk or a positioned error; never panics |
+| `execute` | arbitrary UTF-8 | runs source through the full pipeline under the step limit |
+| `execute_bytes` | arbitrary bytes | decodes 8 bytes per instruction and runs the VM directly |
+
+`execute_bytes` is the decoder fuzzer. Each 8-byte word becomes
+`(opcode, a, b, c, line, column)`, with the opcode taken modulo the 20 defined
+opcodes. Literal spans are read with `str::get`, and `Chunk::name` uses
+`str::get` as well, so an operand that points past the source or to the middle of
+a multi-byte character yields no text instead of slicing it. Hand-built
+instructions can still ask for impossible things — an empty name, a jump to
+itself, a call with 65,535 arguments — and each is a positioned error the
+deterministic test asserts.
+
+There are two ways to run it, and the script prefers the first:
+
+1. **libFuzzer.** `crates/omni-core/fuzz` is a cargo-fuzz project with four
+   targets (`fuzz_lex`, `fuzz_parse`, `fuzz_lower`, `fuzz_vm`) and a seed corpus.
+   It is its own workspace because `libfuzzer-sys` needs a nightly toolchain and
+   must not become a dependency of the engine's build. On a machine with
+   `cargo +nightly` and `cargo-fuzz`:
+
+   ```bash
+   bash scripts/fuzz.sh                 # 30 s per target, or set FUZZ_SECONDS
+   cargo +nightly fuzz run fuzz_vm crates/omni-core/fuzz/corpus/fuzz_vm
+   ```
+
+2. **The deterministic harness**, which is what `scripts/verify-all.sh` runs.
+   It needs no nightly and no network: a xorshift64 generator mutates a fixed
+   corpus with insert/delete/flip/duplicate edits, every input goes through all
+   four pipeline stages and the raw decoder, each run is repeated to prove the
+   result is identical, and every error is required to carry `Line >= 1` and
+   `Col >= 1`. It ran 1,200 inputs in each of five paths with zero panics on this
+   machine. The harness also prints its numbers, so the verification row shows
+   how much it actually did rather than just asserting success.
+
+This machine has stable Rust and no network access to fetch `libfuzzer-sys`, so
+the cargo-fuzz targets are authored and reviewed but were **not executed here**.
+That is stated rather than papered over: the row that ran is the deterministic
+harness, and the targets are the same entry points with a different driver.
+
+### 8.5 What Phase 7 did not change
+
+ABI 4, the 16-byte `OmniValue`, the four SDKs, and language version 2 are
+untouched. The FFI and SDK tests did not move; the thirty-four rows of Phase 6
+still pass byte-for-byte, and one new row runs the fuzz harness, for thirty-five.
+The Rust core gained six tests (226 → 233): the step limit, its disable switch
+and default, the stack cap, the parser nesting cap, the shared module budget, and
+the Unix symlink case. The new public names are `DEFAULT_STEP_LIMIT`,
+`MAX_STACK_DEPTH`, `MAX_NESTING`, `Engine::step_limit`, and
+`Engine::set_step_limit`; none is an ABI symbol.
+
+---
+
+## 9. Verification
 
 One command, and it is the acceptance test for the whole brief:
 
@@ -1704,16 +1839,17 @@ One command, and it is the acceptance test for the whole brief:
 ./scripts/verify-all.sh
 ```
 
-Measured output on 2026-11-07, with the DevPack and updater increments in it:
+Measured output on 2026-11-08, with the Phase 7 security increment in it:
 
 ```
 == OmniEngine cross-host verification ==
    workspace: /d/OmniEngine
 
-Rust tests... Shared library... omni-cli... C embedding... Python SDK... Node SDK... A string is the same bytes in every host... One type error, the same text everywhere... Every surface agrees on the ABI level... String results do not grow memory... A host function answers the same bytes in every host... A host failure is data, and says so identically... Re-entering the engine from a callback is refused, not crashed... The registry says the same thing from both sides... A batch answers the same items in every host... A failing item names itself identically in every host... A batch counts items, not crossings, and reserves nothing extra... A batch inside a host callback is refused, not crashed... The DevPack math, string and type builtins answer the same in every host... A second-line error names line and byte column in every host... eval_str and eval hand back native values... The last execution timer crosses as microseconds...
+Rust tests... Deterministic fuzz harness... Shared library... omni-cli... C embedding... Python SDK... Node SDK... A string is the same bytes in every host... One type error, the same text everywhere... Every surface agrees on the ABI level... String results do not grow memory... A host function answers the same bytes in every host... A host failure is data, and says so identically... Re-entering the engine from a callback is refused, not crashed... The registry says the same thing from both sides... A batch answers the same items in every host... A failing item names itself identically in every host... A batch counts items, not crossings, and reserves nothing extra... A batch inside a host callback is refused, not crashed... The DevPack math, string and type builtins answer the same in every host... A second-line error names line and byte column in every host... eval_str and eval hand back native values... The last execution timer crosses as microseconds... omni --version names what it speaks... a build that matches the release... a newer release is offered... another ABI is refused, not offered... a wrong checksum leaves the target alone... a dry run downloads nothing... a verified update replaces the bytes... a running binary updates itself...
 == Results ==
-  PASS  cargo test --workspace (322 tests)
-  PASS  omni.dll (5.8M)
+  PASS  cargo test --workspace (329 tests)
+  PASS  fuzz harness: 1200 inputs x 4 stages, 1200 decoder chunks, 146 executed, 0 panics
+  PASS  omni.dll (6.2M)
   PASS  omni run examples/hello.omni -> 42
   PASS  omni run examples/strings.omni -> hello, world 😀
   PASS  examples/c/embed.c -> 42 via omni.h
@@ -1736,7 +1872,7 @@ Rust tests... Shared library... omni-cli... C embedding... Python SDK... Node SD
   PASS  math, string and type builtins reduce identically in: cli python node
   PASS  line 2, column 13, and the operator's message in: cli python node
   PASS  int/number, str/string, bool/boolean with no wrapper in: python node
-  PASS  one 200 KB execution timed, non-zero and in microseconds: python(857us) node(883us)
+  PASS  one 200 KB execution timed, non-zero and in microseconds: python(973us) node(911us)
   PASS  omni --version -> omni 0.1.0 (language v2, ABI 4)
   PASS  omni check-update -> 0, omni 0.1.0 is up to date (ABI 4)
   PASS  omni check-update -> 10, omni 99.0.0 is available; this build is 0.1.0
@@ -1757,7 +1893,14 @@ outside the repository, an extracted npm tarball, and a C archive compiled
 against its own header. Those runs are recorded in section 6.7, with the sizes
 they produced.
 
-The last twenty-four rows are the ones that could not exist in one host. The string
+The second row is the deterministic fuzz harness (§8.4): 1,200 mutated inputs
+through the lexer, parser, lowering pass, and VM, plus 1,200 decoder chunks
+built from arbitrary bytes, with two runs of every input required to agree and
+every error required to carry a real line and column. It is a row rather than a
+one-off because it is cheap (well under a second) and because a regression in a
+decoder or a position is exactly the kind that a happy-path suite cannot see.
+
+The cross-host and update rows are the ones that could not exist in one host. The string
 comparison is byte-exact — an escape decoded differently in Rust and Node passes
 both test suites and is still a broken bridge — and the ABI row reads the number
 off the header, the loaded library as C sees it, and the library as each SDK sees
@@ -1792,7 +1935,7 @@ deleted. On Unix the same row asserts no backup is left.
 The script degrades to `SKIP` rather than lying. `cargo`, `gcc`, `python` and
 `node` each have their own guard, Node without `koffi` is skipped with
 `npm install koffi` in the reason, and each cross-host row skips itself when fewer
-than two hosts answered. Nothing was skipped on this machine — all thirty-four
+than two hosts answered. Nothing was skipped on this machine — all thirty-five
 rows ran. The Rust row runs the suite once into a log and reads its exit status;
 an earlier version piped cargo into `grep` under `pipefail`, which let a failing
 suite inherit a successful-looking pipeline and briefly hid a stale CLI test. `omni-wasm` has no row here because `wasm32-unknown-unknown` is not
@@ -1804,17 +1947,17 @@ Against the brief's five phases:
 
 | Phase | Asked for | Verified by |
 | --- | --- | --- |
-| 1 | Workspace on D:, fast compiles, managed `target/` | `cargo test --workspace` 322 tests; `target/` measured at 351 MB |
+| 1 | Workspace on D:, fast compiles, managed `target/` | `cargo test --workspace` 329 tests; `target/` measured at 351 MB |
 | 2 | Ultra-fast memory-safe core, no GC | NaN-boxed 8-byte `Value` asserted for size; arena reset is O(chunks); egress rewind keeps reservations flat over 100,000 executions; no collector exists to pause |
 | 3 | C ABI callable from Python and JavaScript | same `42` and the same `hello, world 😀` from Rust, C, Python, Node; 16 exports confirmed with `objdump -p`; `omni.h` compiles warning-free under `-Wall -Wextra` |
 | 4 | A custom extension GitHub recognises | `.gitattributes` tier 1; the tier-2 limit is stated in section 5.3 rather than glossed over |
 | 5 | `pip`/`npm` SDKs that do not move the language stats | 122 + 116 SDK tests; `linguist-vendored` on `sdks/**`; release packages carry a CI-built engine, checkouts carry none |
 
-Test totals: **173** in `omni-core`, **62** in `omni-ffi` (21 unit, 13 in
+Test totals: **233** in `omni-core`, **62** in `omni-ffi` (21 unit, 13 in
 `tests/batch.rs`, 20 in `tests/ffi_contract.rs`, and 8 in
 `tests/host_callbacks.rs`, which drive the ABI exactly as a host does), **27** in
 `omni-cli` (12 library tests for the updater and the writer, 10 for `omni`, 5
-for `omniup`), **7** in `omni-wasm`, **120** Python, **114** Node. The batch and
+for `omniup`), **7** in `omni-wasm`, **122** Python, **116** Node. The batch and
 callback suites are contract tests against the header, not unit tests of the
 implementation they sit next to.
 
@@ -1827,7 +1970,7 @@ cargo fmt --all --check                                  # clean
 
 ---
 
-## 9. Storage ledger
+## 10. Storage ledger
 
 Measured, all of it on this machine, at the time of writing. Sizes are `du`,
 which is what the drive charges; file-byte totals differ because the registry
@@ -1864,7 +2007,7 @@ complexity one.
 
 ---
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 **`link: missing operand after '■'`** — MSVC's linker is being shadowed by Git
 for Windows' coreutils `link.exe`. Run `where link`. This workspace pins the GNU
@@ -1887,6 +2030,15 @@ the library it loaded (and when it finds none, it lists every location it tried)
 and in Node `engine.libraryPath` is the absolute path of the artifact that engine
 is talking to. `OMNI_ENGINE_LIBRARY` pins one exact file in either host, which is
 the shortest way to prove the search found what you think it found.
+
+**`execution exceeded the step limit of 16777216 instructions`** — the program
+ran longer than the default allowance, usually because it imported a module in a
+loop that never terminates. It is the gas check doing its job, not a bug: the
+same source fails at the same instruction on every machine. A trusted embedder
+can raise it with `engine.set_step_limit(n)` or disable it with `0`; the SDKs
+cannot, because the limit is a Rust policy rather than an ABI field. A deep
+syntax error is separate: expressions past 128 levels fail in the parser with
+`expressions are nested 128 deep, the limit`, before any gas is spent.
 
 **A string result changed after I ran another program** — expected, and the
 reason the SDKs copy. The bytes live in the egress block, which rewinds at the
@@ -1962,7 +2114,7 @@ the call site.
 
 ---
 
-## 11. What comes next
+## 12. What comes next
 
 Three increments shipped after the first bridge. Strings made `OmniValue` a union,
 promoted a result's bytes into a block a host can copy from, and made
@@ -1980,9 +2132,12 @@ math, string and type builtins, errors that point at a line and byte column in e
 execution timer in four bytes that were already padding, and native-value sugar
 (`eval_str` / `eval`) in both SDKs. A sixth replaced the one-pass evaluator with
 an AST and a bytecode VM — still behind unchanged ABI 4 — and added `import`,
-the module sandbox, filesystem permissions, and scalar JSON. The next language
-increment is still the one section 3.7 lists — control flow, collections, and
-user-defined functions.
+the module sandbox, filesystem permissions, and scalar JSON. A seventh hardened
+the existing surface without adding a feature: execution gas shared across
+modules, a VM stack cap, a parser nesting cap, a symlink-safe write check, and a
+fuzz surface with both libFuzzer targets and a deterministic harness. The next
+language increment is still the one section 3.7 lists — control flow,
+collections, and user-defined functions.
 
 Release-side, three things are deliberately unfinished rather than unknown:
 
@@ -2024,6 +2179,11 @@ What the same memory model is still waiting for, in rough order:
    rather than a function pointer.
 6. **Linguist tier 2.** The upstream PR from section 5.3, which would also make
    the new `examples/strings.omni` show up under its own language name.
+7. **A step-limit knob for the SDKs, and continuous libFuzzer.** `set_step_limit`
+   is Rust-only in Phase 7; exposing it (and a per-call override) is an ABI 5
+   decision, deliberately not taken here. The cargo-fuzz project is ready, but
+   this machine has no nightly toolchain, so running it on a schedule is a CI
+   change rather than a code change.
 
 **One cosmetic defect, deliberately left for its own commit.** `display_kind`
 already quotes a symbol — `'='` — and two parse-error templates wrap it in quotes
