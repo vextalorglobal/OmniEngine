@@ -22,20 +22,21 @@
  * 1. A string result is an address the engine owns, not a copy. omni_exec()
  *    returns tag OMNI_STRING with `payload.ptr` pointing into the engine's
  *    egress block. That block is rewound -- never freed or unmapped -- at the
- *    start of the next omni_exec() or omni_exec_many() on the same engine, so
- *    the bytes stay valid memory for the life of the handle and the documented
- *    contract is:
+ *    start of the next omni_exec(), omni_exec_many() or omni_exec_parallel()
+ *    on the same engine, so the bytes stay valid memory for the life of the
+ *    handle and the documented contract is:
  *
- *        valid until your next omni_exec() or omni_exec_many() on this engine.
+ *        valid until your next omni_exec(), omni_exec_many() or
+ *        omni_exec_parallel() on this engine.
  *
  *    Reading it after that is a wrong read, never a crash: you get whatever the
  *    later execution wrote at those addresses. To keep a string, copy it with
  *    omni_str_copy() into storage you own.
  *
- *    omni_exec_many() is the one call where several results are live at once:
- *    it rewinds the block once for the whole batch, so all `count` string
- *    results stay readable together until your next execution of either kind.
- *    See rule 11.
+ *    omni_exec_many() and omni_exec_parallel() are the calls where several
+ *    results are live at once: they rewind the block once for the whole batch,
+ *    so all `count` string results stay readable together until your next
+ *    execution of any kind. See rule 11.
  *
  *    `payload.ptr` identifies the string, it is not the first byte of the text:
  *    the engine keeps a length word in front of the bytes it stores. That is
@@ -65,8 +66,14 @@
  *    unwinds into your process. After OMNI_ERR_PANIC the engine is still
  *    usable, but treat the handle as suspect and recreate it if you can.
  *
- * 7. One engine handle is one thread. Do not share a handle across threads
- *    without your own lock.
+ * 7. One engine handle is one thread at a time. Do not call two functions in
+ *    this header on the same handle concurrently without your own lock.
+ *    omni_exec_parallel() is the supported way to use several cores from one
+ *    handle: it forks isolated engines internally and joins them before it
+ *    returns. Host callbacks registered on that handle may then run on worker
+ *    threads, so anything their user_data points at must be usable from those
+ *    threads; a host that cannot promise this must not use the parallel entry
+ *    point (or must not register that callback).
  *
  * 8. A host function's arguments are a borrowed view, and the one place a
  *    pointer is the text itself. Inside an omni_host_fn callback, an args[i]
@@ -84,8 +91,8 @@
  *    omni_str_copy(), omni_unregister_host_fn(), omni_last_error() and
  *    omni_batch_error() report it as 0, because a size_t and a bool carry no
  *    status. Rule 8 holds precisely because this rule does: the arena is reset
- *    at the entry of omni_exec() and of omni_exec_many(), and a nested call can
- *    never reach that entry.
+ *    at the entry of omni_exec(), omni_exec_many() and omni_exec_parallel(), and
+ *    a nested call can never reach that entry.
  *
  * 10. Your callback reports failure by returning OMNI_HOST_ERR, never by
  *    unwinding. A C++ exception, a Python exception and a JavaScript throw all
@@ -107,9 +114,14 @@
  *
  *    The whole batch shares one egress rewind, so every string result is
  *    readable when the call returns and stays readable until your next
- *    execution of either kind. The trade is memory: reserved egress bytes are
+ *    execution of any kind. The trade is memory: reserved egress bytes are
  *    bounded by one batch's total demand rather than by one item's, so a batch
  *    of 4096 long strings reserves more than 4096 single calls would.
+ *
+ *    omni_exec_parallel() follows every rule in this item. Items run on forked
+ *    engines, one per worker, but results are still written in source order and
+ *    all live together in the caller's egress block. Each item gets its own
+ *    execution gas, so one runaway program cannot spend another item's budget.
  *
  *    Argument errors refuse the whole call before any item runs. A NULL array,
  *    a count above OMNI_MAX_BATCH, an over-long `lengths[i]`, or non-UTF-8 in
@@ -211,7 +223,7 @@ extern "C" {
 #define OMNI_MAX_ARGS           16u /* arguments a call may pass, and an arity may claim */
 #define OMNI_MAX_CALL_DEPTH     64u /* nested calls one execution may reach              */
 #define OMNI_MAX_SOURCE_LEN     (256u * 1024u * 1024u) /* bytes one program may carry */
-#define OMNI_MAX_BATCH          4096u /* items one omni_exec_many() may carry        */
+#define OMNI_MAX_BATCH          4096u /* items one batch call may carry            */
 
 /* The payload of an OmniValue: whichever arm its tag says is live. */
 typedef union OmniPayload {
@@ -417,14 +429,48 @@ OMNI_API uint32_t OMNI_CALL omni_exec_number(OmniEngine *engine,
  * allows sources and lengths to be NULL.
  *
  * Every OMNI_STRING in `out` follows caller rule 1, and all of them are live
- * together until your next omni_exec() or omni_exec_many(). From inside a
- * callback on this handle it returns OMNI_ERR_REENTRANT and runs nothing. */
+ * together until your next omni_exec(), omni_exec_many() or
+ * omni_exec_parallel(). From inside a callback on this handle it returns
+ * OMNI_ERR_REENTRANT and runs nothing. */
 OMNI_API uint32_t OMNI_CALL omni_exec_many(OmniEngine *engine,
                                            const char *const *sources,
                                            const size_t *lengths,
                                            size_t count,
                                            OmniValue *out,
                                            uint32_t *statuses);
+
+/* Evaluate `count` programs across up to max_threads forked engines.
+ *
+ * The call is synchronous: it returns when every item has finished. It accepts
+ * and writes exactly what omni_exec_many() does, in the same source order, and
+ * leaves the same per-item errors available to omni_batch_error(). A failing or
+ * gas-exhausted item does not stop its neighbours.
+ *
+ * max_threads of 0 asks for the library's automatic choice -- available
+ * parallelism, bounded by count and 64. max_threads of 1 is the sequential
+ * path. The handle is borrowed for the whole call, so this is not a licence to
+ * call two exports on the same handle concurrently.
+ *
+ * Host callbacks may run on worker threads. Anything user_data addresses must
+ * be safe to use from several threads at once; see caller rule 7.
+ *
+ * Returns OMNI_OK when every item succeeded, otherwise the status of the FIRST
+ * failing item. Argument validation is identical to omni_exec_many(): a NULL
+ * engine, out or statuses array, a count above OMNI_MAX_BATCH, a NULL sources
+ * or lengths array with a nonzero count, an over-long length, or non-UTF-8 in
+ * any item returns OMNI_ERR_ARG and writes nothing. `count` of 0 returns
+ * OMNI_OK without writing or reclaiming anything.
+ *
+ * This export is additive within ABI version 4: it introduces no struct and
+ * changes no existing signature. An SDK loading an older library should fall
+ * back to omni_exec_many() when the symbol is absent. */
+OMNI_API uint32_t OMNI_CALL omni_exec_parallel(OmniEngine *engine,
+                                               const char *const *sources,
+                                               const size_t *lengths,
+                                               size_t count,
+                                               uint32_t max_threads,
+                                               OmniValue *out,
+                                               uint32_t *statuses);
 
 /* Copy the rendered error of item `index` of the most recent batch into buf.
  *

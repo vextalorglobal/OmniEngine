@@ -27,6 +27,17 @@ mutable reference. `omni_exec_many` / `run_many` / `runMany` carries up to 4,096
 programs in one crossing; a failing item reports its own status and text without
 stopping the rest.
 
+**Parallel execution.** `omni_exec_parallel` / `run_parallel` / `runParallel`
+spreads one batch over up to 64 forked engines. Each worker owns its arena,
+egress block, gas meter, `let` bindings, and module cache; the batch still
+returns in source order, the first failure is the call's status, and all string
+results stay readable together. The Rust `Engine` is `Send + Sync` and can be
+moved or read across threads, while the C handle keeps its one-borrow-at-a-time
+rule. The parallel entry point is additive in ABI 4, and both SDKs fall back to
+the sequential batch against a library that predates it. In Node, a registered
+host function forces that sequential path, because koffi can only enter
+JavaScript on the main thread.
+
 **A bytecode VM behind the same ABI.** Source is lexed, parsed into a flat AST,
 lowered into bytecode, and run on a stack VM. The lowering pass never recurses,
 so expression depth costs heap the engine already owns rather than the host's
@@ -78,8 +89,8 @@ Both SDKs can report the same answer (`omni.check_updates()`,
 in the engine's `omni_check_update` export so every surface agrees on what
 "newer" means. Plain HTTP is refused by default.
 
-**Quality.** 35 of 35 cross-host verification rows pass on this machine: 329 Rust
-tests, 122 Python, 116 Node, plus the C embedding example and the deterministic
+**Quality.** 36 of 36 cross-host verification rows pass on this machine: 348 Rust
+tests, 131 Python, 126 Node, plus the C embedding example and the deterministic
 fuzz harness. `cargo fmt --check` and `cargo clippy -- -D warnings` are clean.
 
 **Packaging.** A platform wheel carries the engine in `omni/_native/`; the npm

@@ -841,6 +841,105 @@ class Batch(unittest.TestCase):
         self.assertEqual(values[0].number, 2.0)
 
 
+class Parallel(unittest.TestCase):
+    """One crossing, N engines: the shape of :meth:`Engine.run_parallel`.
+
+    The parallel entry point must not change an answer, only where the item ran.
+    These tests therefore compare it against the sequential batch as much as they
+    exercise it, and cover the one thing the SDK adds on top of the ABI: refusing
+    a bad ``max_threads`` locally, and falling back when the loaded library
+    predates the export.
+    """
+
+    def setUp(self) -> None:
+        self.engine = omni.Engine()
+        self.addCleanup(self.engine.close)
+
+    def test_run_parallel_returns_one_result_per_source_in_order(self) -> None:
+        results = self.engine.run_parallel(
+            ["6 * 7", '"hello, " + "parallel"', "1 == 1", ""], max_threads=4
+        )
+        self.assertEqual([r.tag for r in results], ["number", "string", "bool", "undef"])
+        self.assertEqual(results[0].value, 42.0)
+        self.assertEqual(results[1].value, "hello, parallel")
+        self.assertEqual(results[2].value, True)
+        self.assertIsNone(results[3].value)
+
+    def test_a_failing_item_raises_naming_its_index(self) -> None:
+        with self.assertRaises(omni.OmniError) as caught:
+            self.engine.run_parallel(["1 + 1", "1 / 0", "2 + 2"], max_threads=4)
+        self.assertIn("item 1 of 3", str(caught.exception))
+        self.assertIn("division by zero", str(caught.exception))
+        self.assertEqual(
+            self.engine.stats().execs, 3, "the item after the failure ran"
+        )
+
+    def test_try_run_parallel_keeps_running_after_a_failure(self) -> None:
+        items = self.engine.try_run_parallel(
+            ["1 +", "2 + 3", "1 / 0", "20 / 4"], max_threads=4
+        )
+        self.assertEqual([status for status, _r, _m in items], [1, 0, 2, 0])
+        self.assertIsNone(items[0][1])
+        self.assertEqual(items[1][1].value, 5.0)
+        self.assertEqual(items[3][1].value, 5.0, "the item after a failure ran")
+        self.assertIn("unexpected end of input", items[0][2])
+        self.assertIn("division by zero", items[2][2])
+
+    def test_zero_and_one_threads_never_change_an_answer(self) -> None:
+        sources = ["1 + 1", "1 / 0", "2 * 2", 'len("abcd")', "40 + 2"]
+        auto = self.engine.try_run_parallel(sources, max_threads=0)
+        one = self.engine.try_run_parallel(sources, max_threads=1)
+        self.assertEqual(
+            [(status, None if result is None else result.value) for status, result, _ in auto],
+            [(status, None if result is None else result.value) for status, result, _ in one],
+        )
+        self.assertEqual(auto[4][1].value, 42.0)
+
+    def test_every_string_of_a_parallel_batch_is_copied_out(self) -> None:
+        programs = ['"a" + "1"', '"b" + "2"', '"c" + "3"', '"d" + "4"']
+        results = self.engine.run_parallel(programs, max_threads=4)
+        self.assertEqual([r.text for r in results], [b"a1", b"b2", b"c3", b"d4"])
+        # Read again in reverse after an independent execution: every Result was
+        # copied out, so none of them points at the shared egress.
+        self.engine.run("0")
+        self.assertEqual([r.text for r in reversed(results)], [b"d4", b"c3", b"b2", b"a1"])
+
+    def test_a_host_function_is_callable_from_a_worker(self) -> None:
+        self.engine.register_function("square", lambda x: x * x, arity=1)
+        results = self.engine.run_parallel(
+            ["square(6)", "square(7) + 1", "square(21)"], max_threads=4
+        )
+        self.assertEqual([r.value for r in results], [36.0, 50.0, 441.0])
+
+    def test_a_non_uint32_max_threads_is_refused_locally(self) -> None:
+        for bad in (True, -1, 1.5, "4", 1 << 32):
+            with self.assertRaises(omni.OmniError) as caught:
+                self.engine.run_parallel(["1 + 1"], max_threads=bad)  # type: ignore[arg-type]
+            self.assertIn("max_threads", str(caught.exception))
+        self.assertEqual(self.engine.stats().execs, 0, "nothing crossed")
+
+    def test_a_library_without_the_parallel_symbol_falls_back(self) -> None:
+        raw = _ffi.RawEngine()
+        self.addCleanup(raw.close)
+        saved = raw._lib.omni_exec_parallel
+        raw._lib.omni_exec_parallel = None
+        try:
+            status, values, statuses = raw.exec_parallel(["1 + 1", "2 + 2"], 4)
+        finally:
+            raw._lib.omni_exec_parallel = saved
+        self.assertEqual(status, _ffi.OMNI_OK)
+        self.assertEqual(statuses, [0, 0])
+        self.assertEqual([value.number for value in values], [2.0, 4.0])
+
+    def test_an_empty_parallel_batch_is_an_empty_list(self) -> None:
+        held = self.engine.run('"still current"')
+        before = self.engine.stats()
+        self.assertEqual(self.engine.try_run_parallel([], max_threads=4), [])
+        self.assertEqual(self.engine.run_parallel([], max_threads=4), [])
+        self.assertEqual(self.engine.stats().execs, before.execs)
+        self.assertEqual(held.text, b"still current")
+
+
 class SafetyBoundaries(unittest.TestCase):
     """The cases a host is most likely to get wrong, tested on purpose."""
 

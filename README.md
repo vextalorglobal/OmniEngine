@@ -8,7 +8,9 @@ This is a **runnable engine**, not a toy skeleton. `let answer = 40 + 2`
 evaluates to `42`, and `"hello, " + "world"` evaluates to `hello, world`, through
 the same code path from four hosts — Rust, C, Python, and Node — and a script can
 call *back* into whichever host embeds it. One crossing can carry several
-programs at once (`run_many` / `runMany` / `omni_exec_many`), and the performance
+programs at once (`run_many` / `runMany` / `omni_exec_many`), and on a multi-core
+host that crossing can be spread over worker engines (`run_parallel` /
+`runParallel` / `omni_exec_parallel`). The performance
 numbers in this repository are measured runs, not promises: `scripts/bench.sh`
 prints them for this machine. Every claim below is covered by a test that has
 been run on this machine.
@@ -312,6 +314,38 @@ can only amortise the smaller term. On this machine, batches earned 1.2–1.4× 
 item at their best N in Python and Node, and in Rust the win is unconditional but
 in allocations: 0.00 per execution, 0.004 per *item* inside a 256-batch. Run
 `./scripts/bench.sh` for the machine you are on.
+
+## Running in parallel
+
+`run_parallel` / `runParallel` / `omni_exec_parallel` dispatch one batch across
+a worker group instead of evaluating it in order. The answers are the same and
+stay in source order; only where each item ran changes:
+
+```python
+engine.run_parallel(["1 + 1", '"two"', "shout('hey')"], max_threads=4)
+```
+
+```js
+engine.runParallel(['1 + 1', '"two"', "shout('hey')"], 4);
+```
+
+Workers are forked engines, each with its own arena, egress block, gas meter,
+and `let` bindings. They inherit configuration — module root, filesystem roots,
+step limit, host globals and callbacks, and cached module sources — and nothing
+a previous item executed. The call is synchronous: when it returns every item
+has a status, the return value is the first failure, and all string results are
+readable together until the next execution. `0` asks for the automatic worker
+count; `1` takes the sequential path.
+
+Rust's `Engine` is `Send + Sync`: a reference may be read from any thread and an
+owned engine may move between them. The C handle is still one borrow at a time —
+`omni_exec_parallel` is the supported way to use several cores through one
+handle, not a licence to call two exports on it concurrently. Host callbacks may
+run on workers, so what their `user_data` addresses must be thread-safe. Node is
+the exception at the SDK layer: koffi marshals a JavaScript callback to the main
+thread, which is blocked inside the synchronous call, so `runParallel` falls back
+to sequential whenever a host function is registered. Python's ctypes callbacks
+do run on the workers.
 
 ## Staying current
 

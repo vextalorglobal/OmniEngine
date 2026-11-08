@@ -336,14 +336,75 @@ class Engine {
   }
 
   /**
+   * Evaluate every source on a worker group and return one Result per source.
+   *
+   * The parallel shape of `runMany`: the same per-item isolation, ordering, and
+   * result lifetime, with evaluation spread over up to `maxThreads` forked
+   * engines. `0` asks the engine for its automatic choice and `1` runs the
+   * sequential path.
+   *
+   * A library built before the parallel export existed falls back to
+   * `omni_exec_many` internally, so this method still answers correctly; only
+   * the concurrency is missing.
+   *
+   * Every string result is copied out before this returns, so nothing in the
+   * list expires.
+   *
+   * If any host function is registered, this runs sequentially instead:
+   * koffi marshals a JavaScript callback to the main thread, and the main
+   * thread is blocked inside the synchronous call, so dispatching a callback
+   * from a worker would deadlock. `runMany` is therefore the right shape when
+   * a batch calls into JavaScript.
+   *
+   * @param {Iterable<string|Buffer>} sources at most `MAX_BATCH` of them
+   * @param {number} [maxThreads] 0 for automatic, otherwise 1..64
+   * @returns {Result[]}
+   * @throws {OmniError} naming the first item that failed. Items after it still
+   *   ran -- use `tryRunParallel` to see them all.
+   */
+  runParallel(sources, maxThreads = 0) {
+    const items = this._batch(sources, maxThreads);
+    for (let index = 0; index < items.length; index++) {
+      if (items[index].status !== STATUS.OK) {
+        throw new OmniError(items[index].status, `item ${index} of ${items.length}: ${items[index].message}`);
+      }
+    }
+    return items.map((item) => item.result);
+  }
+
+  /**
+   * Evaluate a batch on a worker group without throwing: one `{ status,
+   * statusName, result, message }` per source, in order.
+   *
+   * The per-item shape of `runParallel`; the same rules as `tryRunMany`.
+   *
+   * Like `runParallel`, this runs sequentially while any host function is
+   * registered, because koffi can only enter JavaScript from the main thread.
+   *
+   * @param {Iterable<string|Buffer>} sources
+   * @param {number} [maxThreads] 0 for automatic, otherwise 1..64
+   * @throws {OmniError} when the call itself was refused -- too many sources, an
+   *   over-long source, a closed engine, or a bad maxThreads.
+   */
+  tryRunParallel(sources, maxThreads = 0) {
+    return this._batch(sources, maxThreads);
+  }
+
+  /**
    * One crossing, then every string copied out before anything else runs.
    *
    * The copy has to happen here and has to happen for every item: the batch
    * shares one egress rewind, so all N results are live at once right now and
-   * all N expire on the next execution of either kind.
+   * all N expire on the next execution of either kind. `maxThreads` of null
+   * selects the sequential entry point; a number selects the parallel one.
    */
-  _batch(sources) {
+  _batch(sources, maxThreads = null) {
     const b = this._require();
+    if (maxThreads !== null) {
+      if (!Number.isInteger(maxThreads) || maxThreads < 0 || maxThreads > 0xffffffff) {
+        throw new OmniError(STATUS.ERR_ARG, `maxThreads must be a uint32, not ${maxThreads}`);
+      }
+    }
     const list = sources === null || sources === undefined ? [] : Array.from(sources);
     if (list.length > bindingsModule.MAX_BATCH) {
       throw new OmniError(
@@ -368,8 +429,23 @@ class Engine {
     // batch's failures as this one's.
     this._batchStatuses.fill(0, 0, count);
 
+    // `_hostFns` non-empty forces the sequential path: koffi queues a callback
+    // to the main thread, which is blocked right here inside this synchronous
+    // call, so a worker-thread dispatch would deadlock instead of answering.
+    const useParallel =
+      maxThreads !== null && b.execParallel !== null && this._hostFns.size === 0;
     const callStatus = Number(
-      b.execMany(this._handle, this._batchAddrs, this._batchLengths, count, this._batchValues, this._batchStatuses)
+      useParallel
+        ? b.execParallel(
+            this._handle,
+            this._batchAddrs,
+            this._batchLengths,
+            count,
+            maxThreads,
+            this._batchValues,
+            this._batchStatuses
+          )
+        : b.execMany(this._handle, this._batchAddrs, this._batchLengths, count, this._batchValues, this._batchStatuses)
     );
     this._lastStatus = callStatus;
 

@@ -38,6 +38,7 @@ import os
 import platform
 import sys
 from collections.abc import Callable, Sequence
+from typing import Any
 from ctypes import (
     POINTER,
     Structure,
@@ -529,6 +530,21 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     ]
     lib.omni_exec_many.restype = c_uint32
 
+    # Additive in ABI 4. A library built before concurrent dispatch still serves
+    # every other call; RawEngine.exec_parallel() falls back to omni_exec_many()
+    # when this symbol is absent rather than refusing to run.
+    if hasattr(lib, "omni_exec_parallel"):
+        lib.omni_exec_parallel.argtypes = [
+            c_void_p,
+            POINTER(c_char_p),
+            POINTER(c_size_t),
+            c_size_t,
+            c_uint32,
+            POINTER(OmniValue),
+            POINTER(c_uint32),
+        ]
+        lib.omni_exec_parallel.restype = c_uint32
+
     lib.omni_batch_error.argtypes = [c_void_p, c_size_t, POINTER(ctypes.c_char), c_size_t]
     lib.omni_batch_error.restype = c_size_t
 
@@ -834,6 +850,68 @@ class RawEngine:
                 than :data:`MAX_SOURCE_LEN`. Both are checked here, before any
                 pointer is handed over, so the engine never sees a bad array.
         """
+        prepared = self._prepare_batch(sources)
+        if prepared is None:
+            return OMNI_OK, [], []
+        count, ptrs, lengths, values, statuses = prepared
+        status = self._lib.omni_exec_many(self._handle, ptrs, lengths, count, values, statuses)
+        return status, [values[index] for index in range(count)], [statuses[index] for index in range(count)]
+
+    def exec_parallel(
+        self,
+        sources: Sequence[str | bytes],
+        max_threads: int = 0,
+    ) -> tuple[int, list[OmniValue], list[int]]:
+        """Evaluate every source on a worker group; never raises on a script error.
+
+        The call is synchronous and writes results in source order, so the
+        return value has the same shape and lifetime as :meth:`exec_many`.
+        ``max_threads`` of 0 asks the engine for its automatic choice; 1 runs
+        the sequential path. A failing item does not stop its neighbours.
+
+        A library built before this export existed has no
+        ``omni_exec_parallel`` symbol; this method then runs ``omni_exec_many``
+        instead, so the call keeps working with the same answers and only the
+        concurrency is missing.
+
+        Raises:
+            OmniError: the same batch limits as :meth:`exec_many`, or a
+                ``max_threads`` that is not a non-negative 32-bit integer.
+        """
+        if (
+            not isinstance(max_threads, int)
+            or isinstance(max_threads, bool)
+            or max_threads < 0
+            or max_threads > 0xFFFFFFFF
+        ):
+            raise OmniError(
+                OMNI_ERR_ARG,
+                f"max_threads must be a uint32, not {max_threads!r}",
+            )
+        prepared = self._prepare_batch(sources)
+        if prepared is None:
+            return OMNI_OK, [], []
+        count, ptrs, lengths, values, statuses = prepared
+        parallel = getattr(self._lib, "omni_exec_parallel", None)
+        if parallel is None:
+            status = self._lib.omni_exec_many(
+                self._handle, ptrs, lengths, count, values, statuses
+            )
+        else:
+            status = parallel(
+                self._handle, ptrs, lengths, count, max_threads, values, statuses
+            )
+        return status, [values[index] for index in range(count)], [statuses[index] for index in range(count)]
+
+    def _prepare_batch(
+        self, sources: Sequence[str | bytes]
+    ) -> tuple[int, Any, Any, Any, Any] | None:
+        """Encode and marshal one batch; ``None`` means there was nothing to run.
+
+        Shared by the sequential and parallel entry points so both validate the
+        count, own the encoded bytes for the ABI call, and start from zeroed
+        statuses in exactly one place.
+        """
         encoded = [self._encode(source) for source in sources]
         count = len(encoded)
         if count > MAX_BATCH:
@@ -842,7 +920,7 @@ class RawEngine:
                 f"a batch carries at most {MAX_BATCH} programs, not {count}",
             )
         if count == 0:
-            return OMNI_OK, [], []
+            return None
         self._grow_batch(count)
         ptrs, lengths, values, statuses = (
             self._batch_ptrs,
@@ -862,8 +940,7 @@ class RawEngine:
             # whole call without writing a single status, and a stale non-zero
             # from the previous batch would read back as this batch's failure.
             statuses[index] = 0
-        status = self._lib.omni_exec_many(self._handle, ptrs, lengths, count, values, statuses)
-        return status, [values[index] for index in range(count)], [statuses[index] for index in range(count)]
+        return count, ptrs, lengths, values, statuses
 
     def _grow_batch(self, count: int) -> None:
         """Make the reused batch arrays hold at least `count` sources.

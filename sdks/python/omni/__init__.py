@@ -639,15 +639,63 @@ class Engine:
         """
         return self._batch(sources)
 
-    def _batch(self, sources: Sequence[str]) -> list[tuple[int, Result | None, str]]:
+    def run_parallel(
+        self, sources: Sequence[str], max_threads: int = 0
+    ) -> list[Result]:
+        """Evaluate every source on a worker group and return one Result each.
+
+        The parallel shape of :meth:`run_many`: the same per-item isolation,
+        ordering, and result lifetime, with evaluation spread over up to
+        ``max_threads`` worker engines. ``0`` asks the engine for its automatic
+        choice and ``1`` runs the sequential path.
+
+        A library built before the parallel export existed falls back to
+        ``omni_exec_many`` internally, so this method still answers correctly;
+        only the concurrency is missing.
+
+        Every string result is copied out before this returns, so the list is
+        ordinary Python data and nothing in it expires.
+
+        Raises:
+            OmniError: the first item that failed, named by its index. Items
+                after it still ran -- use :meth:`try_run_parallel` to see them
+                all.
+        """
+        items = self._batch(sources, max_threads=max_threads)
+        for index, (status, _result, message) in enumerate(items):
+            if status != OMNI_OK:
+                raise OmniError(status, f"item {index} of {len(items)}: {message}")
+        return [result for _status, result, _message in items]  # type: ignore[return-value]
+
+    def try_run_parallel(
+        self, sources: Sequence[str], max_threads: int = 0
+    ) -> list[tuple[int, Result | None, str]]:
+        """Evaluate a batch on a worker group without exceptions.
+
+        The per-item shape of :meth:`run_parallel`; see :meth:`try_run_many`
+        for the tuple layout and the expiration rule.
+
+        Raises:
+            OmniError: the call itself was refused -- too many sources, an
+                over-long source, a closed engine, or a bad ``max_threads``.
+        """
+        return self._batch(sources, max_threads=max_threads)
+
+    def _batch(
+        self, sources: Sequence[str], max_threads: int | None = None
+    ) -> list[tuple[int, Result | None, str]]:
         """One crossing, then every string copied out before anything else runs.
 
         The copy has to happen here and has to happen for every item: the batch
         shares one egress rewind, so all N results are live at once right now
-        and all N expire on the next evaluation.
+        and all N expire on the next evaluation. ``max_threads=None`` selects
+        the sequential entry point; a number selects the parallel one.
         """
         raw = self._require()
-        status, values, statuses = raw.exec_many(sources)
+        if max_threads is None:
+            status, values, statuses = raw.exec_many(sources)
+        else:
+            status, values, statuses = raw.exec_parallel(sources, max_threads)
         self._last_status = status
         results = [
             _convert(value, raw.read_string(value)) if code == OMNI_OK else None

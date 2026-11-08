@@ -93,6 +93,57 @@ else
   tail -20 "$OUT/fuzz.log"
 fi
 
+# The concurrency suite is the zero-data-race proof: it puts 64 threads on a
+# barrier and gives each one its own engine under a strict step budget, then
+# shares one `Arc<Engine>` read-only from a dozen threads. The Python half of
+# the row measures the SDK dispatching a batch across worker engines, which is
+# the same crossing a server would make; its accounting (`execs` moving by the
+# item count, every answer in source order) is what a race would disturb.
+printf 'Concurrent execution contexts... '
+if cargo test -p omni-core --test concurrency >"$OUT/concurrency.log" 2>&1; then
+  stress=$(grep -oE '[0-9]+ passed' "$OUT/concurrency.log" | awk '{s += $1} END {print s+0}')
+  par_summary=''
+  par_host=''
+  if have python || have py; then
+    par_host=$(have python && echo python || echo "py -3")
+  fi
+  if [[ -n "$par_host" ]]; then
+    par_summary=$(cd sdks/python && $par_host - <<'PY' 2>&1
+import sys
+import time
+
+sys.path.insert(0, ".")
+import omni
+
+engine = omni.Engine()
+programs = [f"let n = {index}\nn * 2 + 1" for index in range(64)]
+expected = [index * 2 + 1 for index in range(64)]
+engine.run_parallel(programs, 8)  # warm the forks and the module imports
+before = engine.stats().execs
+start = time.perf_counter()
+results = engine.run_parallel(programs, 8)
+elapsed = time.perf_counter() - start
+after = engine.stats().execs
+values = [result.value for result in results]
+ok = values == expected and after - before == 64
+rate = 64 / elapsed if elapsed else 0.0
+print(f"{'ok' if ok else 'bad'} {elapsed * 1000:.1f}ms {rate:.0f} items/s")
+engine.close()
+PY
+)
+  fi
+  if [[ "$par_summary" == ok* ]]; then
+    pass "${stress:-?} concurrency tests, 64 gas-bounded items across 8 workers (${par_summary#ok })"
+  elif [[ -z "$par_host" ]]; then
+    pass "${stress:-?} concurrency tests (python unavailable for SDK throughput)"
+  else
+    fail "parallel throughput: $par_summary"
+  fi
+else
+  fail "concurrency stress suite"
+  tail -20 "$OUT/concurrency.log"
+fi
+
 printf 'Shared library... '
 if cargo build -p omni-ffi >"$OUT/build.log" 2>&1; then
   lib="$ROOT/target/debug/$(case "$OSTYPE" in

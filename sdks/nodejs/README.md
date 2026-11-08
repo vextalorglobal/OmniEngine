@@ -252,6 +252,33 @@ through koffi while one wrapped `run` costs ~8.5 µs, so a batch can only
 amortise the smaller term. `node bench.js` prints the numbers for the machine
 you are on.
 
+## Running in parallel
+
+`runParallel` is the same batch contract spread over worker engines:
+
+```js
+engine.runParallel(['1 + 1', '"two"', "shout('hey')"], 4);
+```
+
+Results stay in source order, each item keeps its own gas meter and `let`
+bindings, and every string is copied out before the array returns. `0` asks the
+engine for its automatic count and `1` takes the sequential path. A failing item
+still throws naming its index, with the same text; use `tryRunParallel` for the
+per-item shape.
+
+Workers inherit the engine's configuration — globals, registered functions,
+module root, filesystem roots, step limit — and none of its execution history.
+
+One rule matters more in Node than anywhere else: **if any host function is
+registered, `runParallel` runs sequentially.** Koffi has to enter JavaScript on
+the main thread, which is blocked inside this synchronous call, so dispatching a
+callback from a worker would deadlock. The answers are unchanged; only the
+concurrency is given up. Batch host-function work with `runMany`, or unregister
+the callbacks first.
+
+A library built before this export existed falls back to `omni_exec_many`
+internally, so the method keeps working with the same answers.
+
 ## What is guaranteed
 
 - The engine handle is a **BigInt**. Converting it with `Number()` would

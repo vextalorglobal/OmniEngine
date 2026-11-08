@@ -146,6 +146,28 @@ through ctypes while one wrapped `run` costs ~10 µs, so a batch can only amorti
 the smaller term. `sdks/python/bench.py` prints the numbers for the machine you
 are on.
 
+## Running in parallel
+
+`run_parallel` is the same batch contract spread over worker engines:
+
+```python
+engine.run_parallel(["1 + 1", '"two"', "shout('hey')"], max_threads=4)
+```
+
+Results stay in source order, each item keeps its own gas meter and `let`
+bindings, and every string is copied out before the list returns. `max_threads=0`
+asks the engine for its automatic count and `1` takes the sequential path. A
+failing item still raises naming its index, with the same text; use
+`try_run_parallel` for the per-item shape.
+
+Workers inherit the engine's configuration — globals, registered functions,
+module root, filesystem roots, step limit — and none of its execution history.
+A registered Python function may run on a worker: ctypes re-acquires the GIL
+there while the call has released it. Anything the function touches (a counter,
+a shared object) is therefore reached from more than one thread. A library built
+before this export existed falls back to `omni_exec_many` internally, so the
+method keeps working with the same answers and only the concurrency is missing.
+
 ## Checking for updates
 
 ```python

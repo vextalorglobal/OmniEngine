@@ -16,18 +16,21 @@
 //! leaves this crate addresses the execution arena.
 //!
 //! The consequence is worth stating out loud: **a stale `OmniValue` is a wrong
-//! read, never a dangling one.** A result is valid until the next `omni_exec` or
-//! `omni_exec_many` on the same engine; calling `omni_str_copy` after that copies
-//! whatever now sits at those addresses. And because [`omni_str_copy`] re-checks
-//! the address against the engine that owns it, a fabricated pointer — or one
-//! that belongs to *another* engine, or one whose binding has since been
-//! redefined — copies zero bytes rather than reading memory it has no claim on.
+//! read, never a dangling one.** A result is valid until the next `omni_exec`,
+//! `omni_exec_many`, or `omni_exec_parallel` on the same engine; calling
+//! `omni_str_copy` after that copies whatever now sits at those addresses. And
+//! because [`omni_str_copy`] re-checks the address against the engine that owns
+//! it, a fabricated pointer — or one that belongs to *another* engine, or one
+//! whose binding has since been redefined — copies zero bytes rather than reading
+//! memory it has no claim on.
 //!
-//! [`omni_exec_many`] is the one place where *several* results are live at once.
-//! It rewinds egress once for the whole batch rather than once per item, so all
-//! N string results stay readable together until the next execution of either
-//! kind. The price is stated rather than hidden: reserved egress bytes are
-//! bounded by one batch's total demand, not by one item's.
+//! [`omni_exec_many`] and [`omni_exec_parallel`] are the places where *several*
+//! results are live at once. They rewind egress once for the whole batch rather
+//! than once per item, so all N string results stay readable together until the
+//! next execution of any kind. The price is stated rather than hidden: reserved
+//! egress bytes are bounded by one batch's total demand, not by one item's.
+//! Parallel workers own forked engines and copy every result back into the
+//! caller's egress before they exit, so no worker memory outlives the call.
 //!
 //! **A Rust panic may never unwind into a host.** Unwinding past `extern "C"` is
 //! undefined behaviour, and it is the most common defect in hand-rolled Rust FFI.
@@ -65,12 +68,13 @@ use omni_core::{Engine, ErrorKind, HostError, HostOutcome, OmniError, Value};
 /// number duplicated on both sides of a module boundary is a number that drifts.
 pub use omni_core::{MAX_ARGS, MAX_CALL_DEPTH, MAX_IDENTIFIER_LEN, MAX_SOURCE_LEN, MAX_STRING_LEN};
 
-/// Items one [`omni_exec_many`] call may carry.
+/// Items one batch call may carry.
 ///
 /// A boundary bound, not a language one: it caps how many pointers this crate
 /// will read from a host array, and with it the size of the per-item error list
 /// the handle retains. 4096 programs in one crossing is already far past the
-/// point where the crossing cost has been amortised to nothing.
+/// point where the crossing cost has been amortised to nothing. The same bound
+/// applies to [`omni_exec_many`] and [`omni_exec_parallel`].
 pub const MAX_BATCH: usize = 4096;
 
 pub const OMNI_OK: u32 = 0;
@@ -363,9 +367,14 @@ pub const OMNI_HOST_ERR: i32 = 1;
 #[derive(Clone, Copy)]
 struct HostContext(*mut c_void);
 
-// Safety: the pointer is only ever dereferenced by the host that supplied it, on
-// the thread that registered it, while the engine's borrow is held.
+// Safety: the pointer is only ever dereferenced by the host that supplied it,
+// while the engine's borrow is held. `Sync` extends the existing contract to
+// `omni_exec_parallel`: a registered callback may run on several worker threads
+// at once, so whatever `user_data` addresses must itself be safe to use from
+// those threads. A host that cannot promise this must not call the parallel
+// entry point, or must not register that callback.
 unsafe impl Send for HostContext {}
+unsafe impl Sync for HostContext {}
 
 fn status_for(kind: ErrorKind) -> u32 {
     match kind {
@@ -764,6 +773,49 @@ pub unsafe extern "C" fn omni_exec(
     })
 }
 
+/// Read and validate `count` sources from caller-owned arrays.
+///
+/// Every source is validated before any of them runs, so a malformed item refuses
+/// the whole call with nothing written — the same answer [`omni_exec`] gives for
+/// bad UTF-8, rather than a half-executed batch the host built wrong.
+///
+/// # Safety
+///
+/// `sources` must be readable for `count` pointers and `lengths` for `count`
+/// `size_t`s; each `sources[i]` must be readable for `lengths[i]` bytes and be
+/// UTF-8, or be null when that length is zero. The returned slices borrow that
+/// memory for as long as the caller keeps it alive and unmodified.
+unsafe fn read_sources<'a>(
+    sources: *const *const c_char,
+    lengths: *const usize,
+    count: usize,
+) -> Result<Vec<&'a str>, u32> {
+    if sources.is_null() || lengths.is_null() {
+        return Err(OMNI_ERR_ARG);
+    }
+    // Safety: the caller guarantees `count` readable elements in each array.
+    let ptrs = unsafe { slice::from_raw_parts(sources, count) };
+    let lens = unsafe { slice::from_raw_parts(lengths, count) };
+    let mut texts = Vec::with_capacity(count);
+    for (&src, &len) in ptrs.iter().zip(lens) {
+        if len > MAX_SOURCE_LEN || (src.is_null() && len != 0) {
+            return Err(OMNI_ERR_ARG);
+        }
+        let text = if len == 0 {
+            ""
+        } else {
+            // Safety: as above, `src` is readable for `len` bytes.
+            let bytes = unsafe { slice::from_raw_parts(src.cast::<u8>(), len) };
+            match std::str::from_utf8(bytes) {
+                Ok(text) => text,
+                Err(_) => return Err(OMNI_ERR_ARG),
+            }
+        };
+        texts.push(text);
+    }
+    Ok(texts)
+}
+
 /// Evaluate `count` programs in one crossing, writing one value and one status
 /// per item into caller-owned arrays.
 ///
@@ -804,8 +856,87 @@ pub unsafe extern "C" fn omni_exec_many(
     if count == 0 {
         return OMNI_OK;
     }
-    if sources.is_null() || lengths.is_null() {
+    // Safety: the null checks ran and the caller guarantees a live handle.
+    let handle = unsafe { &*engine };
+    let mut engine = match borrow_mut(handle) {
+        Ok(borrow) => borrow,
+        Err(code) => return code,
+    };
+    guarded(|| {
+        // Safety: `count` is bounded and the caller guarantees readable arrays.
+        let texts = match unsafe { read_sources(sources, lengths, count) } {
+            Ok(texts) => texts,
+            Err(code) => return code,
+        };
+
+        let items = engine.exec_many(&texts);
+        let mut batch = handle.batch.borrow_mut();
+        batch.clear();
+        let mut first = OMNI_OK;
+        for (i, item) in items.iter().enumerate() {
+            let status = match &item.error {
+                Some(error) => status_for(error.kind),
+                None => OMNI_OK,
+            };
+            // Safety: `out` and `statuses` are writable for `count` elements and
+            // `i < count`, because core returns one item per source.
+            unsafe {
+                *out.add(i) = encode(&engine, item.value);
+                *statuses.add(i) = status;
+            }
+            batch.push(item.error.clone());
+            if first == OMNI_OK {
+                first = status;
+            }
+        }
+        first
+    })
+}
+
+/// Evaluate `count` programs across a worker group, writing one value and one
+/// status per item into caller-owned arrays.
+///
+/// This is [`omni_exec_many`] with the evaluation spread over up to `max_threads`
+/// forked engines. The call is **synchronous**: it returns only when every item
+/// has finished. Results are written in source order, every item gets a status,
+/// and the per-item errors are available from [`omni_batch_error`] exactly as
+/// after a sequential batch. All N string results are readable together until the
+/// next `omni_exec`, `omni_exec_many`, or `omni_exec_parallel` on this engine.
+///
+/// `max_threads == 0` asks the engine for its automatic choice
+/// (`available_parallelism`, bounded by `count` and 64). `max_threads == 1` runs
+/// the sequential path, byte for byte. A failing or gas-exhausted item never stops
+/// its neighbours.
+///
+/// The handle itself is still borrowed for the duration; this is the supported
+/// way to use several cores through one handle, not a licence to call two exports
+/// on the same handle concurrently. Host functions registered on the engine may
+/// run on worker threads, so anything their `user_data` addresses must be safe to
+/// use from those threads.
+///
+/// # Safety
+///
+/// `engine` must come from [`omni_engine_new`]. `sources` must be readable for
+/// `count` pointers and `lengths` for `count` `size_t`s; each `sources[i]` must
+/// be readable for `lengths[i]` bytes and be UTF-8, or be null when that length
+/// is zero. `out` must be writable for `count` [`OmniValue`]s and `statuses` for
+/// `count` `uint32_t`s. A `lengths[i]` beyond the allocation is rejected by the
+/// size bound but is still undefined behaviour.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn omni_exec_parallel(
+    engine: *mut OmniEngine,
+    sources: *const *const c_char,
+    lengths: *const usize,
+    count: usize,
+    max_threads: u32,
+    out: *mut OmniValue,
+    statuses: *mut u32,
+) -> u32 {
+    if engine.is_null() || out.is_null() || statuses.is_null() || count > MAX_BATCH {
         return OMNI_ERR_ARG;
+    }
+    if count == 0 {
+        return OMNI_OK;
     }
     // Safety: the null checks ran and the caller guarantees a live handle.
     let handle = unsafe { &*engine };
@@ -814,33 +945,13 @@ pub unsafe extern "C" fn omni_exec_many(
         Err(code) => return code,
     };
     guarded(|| {
-        // Safety: checked non-null, and the caller guarantees `count` readable
-        // elements in each array.
-        let ptrs = unsafe { slice::from_raw_parts(sources, count) };
-        let lens = unsafe { slice::from_raw_parts(lengths, count) };
-        // Every source is validated before any of them runs, so a malformed item
-        // refuses the whole call with nothing written — the same answer
-        // `omni_exec` gives for bad UTF-8, rather than a half-executed batch the
-        // host built wrong.
-        let mut texts = Vec::with_capacity(count);
-        for (&src, &len) in ptrs.iter().zip(lens) {
-            if len > MAX_SOURCE_LEN || (src.is_null() && len != 0) {
-                return OMNI_ERR_ARG;
-            }
-            let text = if len == 0 {
-                ""
-            } else {
-                // Safety: as above, `src` is readable for `len` bytes.
-                let bytes = unsafe { slice::from_raw_parts(src.cast::<u8>(), len) };
-                match std::str::from_utf8(bytes) {
-                    Ok(text) => text,
-                    Err(_) => return OMNI_ERR_ARG,
-                }
-            };
-            texts.push(text);
-        }
+        // Safety: `count` is bounded and the caller guarantees readable arrays.
+        let texts = match unsafe { read_sources(sources, lengths, count) } {
+            Ok(texts) => texts,
+            Err(code) => return code,
+        };
 
-        let items = engine.exec_many(&texts);
+        let items = engine.exec_parallel(&texts, max_threads as usize);
         let mut batch = handle.batch.borrow_mut();
         batch.clear();
         let mut first = OMNI_OK;

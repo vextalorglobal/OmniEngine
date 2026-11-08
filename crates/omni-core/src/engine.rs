@@ -39,9 +39,13 @@
 //! because taking `&self` means no `exec` can run while the bytes are borrowed.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::Value;
 use crate::arena::{Arena, Slot};
@@ -96,6 +100,26 @@ pub const MAX_STACK_DEPTH: usize = 65_536;
 /// error instead of a native stack overflow. It composes with
 /// [`MAX_CALL_DEPTH`], and the sum stays comfortably inside a thread stack.
 pub const MAX_NESTING: u32 = 128;
+
+/// How many modules one engine remembers the source of. A program with more
+/// distinct imports than this is rare, and clearing is cheaper than an eviction
+/// policy that would need its own bookkeeping.
+const MAX_MODULE_CACHE: usize = 64;
+
+/// Upper bound on worker threads for one parallel batch. The limit is a guard
+/// against a host asking for thousands of OS threads, not a hardware count:
+/// `available_parallelism` chooses the automatic value.
+pub const MAX_PARALLEL_WORKERS: usize = 64;
+
+/// A module this engine has already read, remembered only while its metadata
+/// still matches. The source is an `Arc<str>` so a fork can share the immutable
+/// bytes without sharing a mutable map.
+#[derive(Clone)]
+struct CachedModule {
+    length: u64,
+    modified: Option<SystemTime>,
+    source: Arc<str>,
+}
 
 /// The instruction budget one top-level execution shares with every module it
 /// imports. Created per `exec` (and per batch item), never per module.
@@ -320,13 +344,23 @@ pub enum HostOutcome {
 /// `&Engine` rather than `&mut Engine` is the whole contract. A callback may look
 /// up a string's bytes because they are still on hand, and it may not allocate,
 /// bind, or reset — the engine is busy running the very call that invoked it.
-pub type HostCall = dyn Fn(&Engine, &[Value]) -> HostOutcome + Send;
+///
+/// `Sync` extends that contract across threads: [`Engine::exec_parallel`] calls
+/// host functions from several forked engines at once, so everything a callback
+/// captures must itself be shareable. The FFI states the same requirement for
+/// `user_data`.
+pub type HostCall = dyn Fn(&Engine, &[Value]) -> HostOutcome + Send + Sync;
 
 /// One registered host function: a name, a fixed arity, and the callback.
+///
+/// The callback is an `Arc` so [`Engine::fork`] can give each worker the same
+/// function without asking the host to register it again or cloning a closure
+/// that may own something unshareable.
+#[derive(Clone)]
 struct HostFunction {
     name: String,
     arity: u32,
-    call: Box<HostCall>,
+    call: Arc<HostCall>,
 }
 
 /// One result of [`Engine::exec_many`]: what the item produced, or why it did
@@ -354,6 +388,24 @@ impl BatchItem {
             None => Ok(self.value),
         }
     }
+}
+
+/// A worker's result before it is copied into the parent's egress block.
+///
+/// A string cannot be handed back as a `Value`: it addresses memory inside the
+/// worker's arena, and that engine dies at the end of the scoped thread. The bytes
+/// cross by copy, exactly as they do when a module exports a string.
+enum ParallelValue {
+    Scalar(Value),
+    String(Vec<u8>),
+}
+
+/// What one worker thread reports back: the items it claimed, in claim order,
+/// and the counters it accumulated.
+#[derive(Default)]
+struct WorkerReport {
+    items: Vec<(usize, Result<ParallelValue, OmniError>, u32)>,
+    stats: Stats,
 }
 
 /// Counters a host reads to prove the memory story from outside Rust.
@@ -433,6 +485,11 @@ pub struct Engine {
     /// Canonical paths of modules currently loading, innermost last. Cycles are
     /// detected against this stack; it is empty between top-level executions.
     loading_modules: Vec<PathBuf>,
+    /// Sources this engine has read, keyed by canonical path and held only while
+    /// length and modification time still match the file. Engine-local by
+    /// construction: there is no static or shared map, so parallel workers cannot
+    /// observe or invalidate each other's imports.
+    module_cache: HashMap<PathBuf, CachedModule>,
     /// Namespaces imported during the current execution, for a diagnostic that
     /// names the module rather than the flattened `ns.name`.
     namespaces: Vec<String>,
@@ -473,6 +530,7 @@ impl Engine {
             call_depth: 0,
             module_root: None,
             loading_modules: Vec::new(),
+            module_cache: HashMap::new(),
             namespaces: Vec::new(),
             module_bindings: Vec::new(),
             fs_read_roots: Vec::new(),
@@ -585,6 +643,200 @@ impl Engine {
             });
         }
         items
+    }
+
+    /// Build a fresh execution context from this engine's configuration.
+    ///
+    /// The fork inherits *what* to execute — module root, filesystem roots, step
+    /// limit, globals, host functions, cached module sources — and inherits no
+    /// execution history: arena, egress, `let` bindings, diagnostics, and counters
+    /// all start empty. A host may keep the fork, move it to a worker thread, and
+    /// reuse it for many batches.
+    ///
+    /// String globals are re-materialized into the child's own boxes rather than
+    /// copied as pointers, so the child can account for every value it holds and
+    /// the parent may redefine a global without changing what the child sees.
+    pub fn fork(&self) -> Engine {
+        let mut child = Engine::new();
+        child.module_root = self.module_root.clone();
+        child.fs_read_roots = self.fs_read_roots.clone();
+        child.fs_write_roots = self.fs_write_roots.clone();
+        child.step_limit = self.step_limit;
+        child.module_cache = self.module_cache.clone();
+        for global in &self.globals {
+            if global.value.is_string() {
+                if let Some(bytes) = self.string_of(global.value) {
+                    let _ = child.define_string(&global.name, bytes);
+                    continue;
+                }
+            }
+            // A value whose bytes this engine cannot prove it owns stays a
+            // scalar. It is copied as an inert eight-byte token, not dereferenced.
+            child.define(&global.name, global.value);
+        }
+        child.host_fns = self.host_fns.clone();
+        // Forking is setup, not execution; the child's counters describe the
+        // batch it is about to run.
+        child.strings_built = 0;
+        child
+    }
+
+    /// Run several programs on a scoped worker group, one engine per worker.
+    ///
+    /// Returns one [`BatchItem`] per source, in source order, with the same
+    /// reclamation and result-lifetime rules as [`Engine::exec_many`]: all string
+    /// results are readable together until the next execution on this engine.
+    /// Each item gets its own budget, so one runaway program cannot spend another
+    /// item's gas, and a failing item never stops its neighbours.
+    ///
+    /// `max_threads` of zero asks for `available_parallelism`, bounded by the item
+    /// count and [`MAX_PARALLEL_WORKERS`]. One worker delegates to `exec_many`, so
+    /// the sequential and parallel paths share their state machine exactly.
+    ///
+    /// No thread outlives the call and no global pool is involved: the scope owns
+    /// the workers, the workers own forked engines, and an item is claimed with
+    /// one atomic increment. A panic inside one item is caught and reported as
+    /// that item's [`ErrorKind::Panic`]; it cannot poison the batch or the engine.
+    pub fn exec_parallel(&mut self, sources: &[&str], max_threads: usize) -> Vec<BatchItem> {
+        if sources.is_empty() {
+            return Vec::new();
+        }
+        let threads = parallel_worker_count(sources.len(), max_threads);
+        if threads <= 1 {
+            return self.exec_many(sources);
+        }
+
+        self.reclaim();
+        let workers: Vec<Engine> = (0..threads).map(|_| self.fork()).collect();
+        let next = AtomicUsize::new(0);
+
+        let reports: Vec<WorkerReport> = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers.len());
+            for mut worker in workers {
+                let next = &next;
+                handles.push(scope.spawn(move || {
+                    let mut report = WorkerReport::default();
+                    loop {
+                        // Relaxed is enough: the index counter orders nothing but
+                        // itself, and every result travels back through `join`.
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        if index >= sources.len() {
+                            break;
+                        }
+                        let (outcome, micros) = worker.eval_parallel_item(sources[index]);
+                        report.items.push((index, outcome, micros));
+                    }
+                    report.stats = worker.stats();
+                    report
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap_or_default())
+                .collect()
+        });
+
+        // Reassemble by source index. Workers finish in whatever order the OS
+        // schedules them; the batch does not.
+        let mut ordered: Vec<Option<(Result<ParallelValue, OmniError>, u32)>> =
+            (0..sources.len()).map(|_| None).collect();
+        for report in reports {
+            self.execs = self.execs.saturating_add(report.stats.execs);
+            self.strings_built = self
+                .strings_built
+                .saturating_add(report.stats.strings_built);
+            for (index, outcome, micros) in report.items {
+                if let Some(slot) = ordered.get_mut(index) {
+                    *slot = Some((outcome, micros));
+                }
+            }
+        }
+
+        let mut batch = Vec::with_capacity(ordered.len());
+        for (index, slot) in ordered.into_iter().enumerate() {
+            let (outcome, micros) = slot.unwrap_or_else(|| {
+                (
+                    Err(OmniError::new(
+                        ErrorKind::Panic,
+                        Pos::default(),
+                        format!("worker thread ended before item {index} produced a result"),
+                    )),
+                    0,
+                )
+            });
+            match outcome {
+                Ok(value) => {
+                    let value = self.materialize_parallel(value);
+                    self.last_value = value;
+                    self.last_error = None;
+                    self.last_exec_micros = micros;
+                    batch.push(BatchItem { value, error: None });
+                }
+                Err(error) => {
+                    self.last_error = Some(error.clone());
+                    self.last_exec_micros = micros;
+                    batch.push(BatchItem {
+                        value: Value::UNDEF,
+                        error: Some(error),
+                    });
+                }
+            }
+        }
+        batch
+    }
+
+    /// Run one source on a forked worker and copy anything arena-resident out
+    /// before the next item can rewind it.
+    fn eval_parallel_item(&mut self, source: &str) -> (Result<ParallelValue, OmniError>, u32) {
+        let limit = self.step_limit;
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let mut budget = Budget::new(limit);
+            self.exec_with_budget(source, &mut budget)
+        }));
+        match outcome {
+            Ok(Ok(value)) => {
+                let micros = self.last_exec_micros;
+                if value.is_string() {
+                    let bytes = self.string_of(value).map(<[u8]>::to_vec);
+                    match bytes {
+                        Some(bytes) => (Ok(ParallelValue::String(bytes)), micros),
+                        // `exec_with_budget` promotes every string result, so this
+                        // is an internal invariant break rather than bad input.
+                        None => (
+                            Err(OmniError::new(
+                                ErrorKind::Panic,
+                                Pos::default(),
+                                "a string result is not readable by the worker that produced it",
+                            )),
+                            micros,
+                        ),
+                    }
+                } else {
+                    (Ok(ParallelValue::Scalar(value)), micros)
+                }
+            }
+            Ok(Err(error)) => (Err(error), self.last_exec_micros),
+            Err(payload) => (
+                Err(OmniError::new(
+                    ErrorKind::Panic,
+                    Pos::default(),
+                    format!("worker panicked: {}", panic_text(payload.as_ref())),
+                )),
+                0,
+            ),
+        }
+    }
+
+    /// Copy a worker's scalar or string result into parent memory.
+    fn materialize_parallel(&mut self, value: ParallelValue) -> Value {
+        match value {
+            ParallelValue::Scalar(value) => value,
+            ParallelValue::String(bytes) => {
+                let p = object::build(&mut self.egress, &bytes);
+                self.strings_built += 1;
+                Value::from_ptr(p)
+            }
+        }
     }
 
     /// Give back everything the previous execution claimed.
@@ -706,7 +958,7 @@ impl Engine {
     /// the global and `foo(1)` calls the function, because position decides.
     pub fn register_host_fn<F>(&mut self, name: &str, arity: u32, call: F) -> Result<(), HostError>
     where
-        F: Fn(&Engine, &[Value]) -> HostOutcome + Send + 'static,
+        F: Fn(&Engine, &[Value]) -> HostOutcome + Send + Sync + 'static,
     {
         if name.is_empty() {
             return Err(HostError::EmptyName);
@@ -720,7 +972,7 @@ impl Engine {
         let entry = HostFunction {
             name: name.to_string(),
             arity,
-            call: Box::new(call),
+            call: Arc::new(call),
         };
         match self.host_fns.iter_mut().find(|h| h.name == name) {
             Some(existing) => *existing = entry,
@@ -1227,9 +1479,8 @@ impl Engine {
                 format!("module name '{namespace}' is not a valid identifier"),
             ));
         }
-        let length = std::fs::metadata(&path)
-            .map_err(|e| module_io_error(&namespace, &e, at))?
-            .len();
+        let metadata = std::fs::metadata(&path).map_err(|e| module_io_error(&namespace, &e, at))?;
+        let length = metadata.len();
         if length > MAX_STRING_LEN as u64 {
             return Err(OmniError::new(
                 ErrorKind::Runtime,
@@ -1240,26 +1491,52 @@ impl Engine {
                 ),
             ));
         }
-        let bytes = std::fs::read(&path).map_err(|e| module_io_error(&namespace, &e, at))?;
-        let source = std::str::from_utf8(&bytes).map_err(|_| {
-            OmniError::new(
-                ErrorKind::Runtime,
-                at,
-                format!("module '{namespace}' is not UTF-8 text"),
-            )
-        })?;
+        let modified = metadata.modified().ok();
+        let cached = self
+            .module_cache
+            .get(&path)
+            .filter(|entry| entry.length == length && entry.modified == modified)
+            .map(|entry| Arc::clone(&entry.source));
+        let source: Arc<str> = match cached {
+            Some(source) => source,
+            None => {
+                let bytes =
+                    std::fs::read(&path).map_err(|e| module_io_error(&namespace, &e, at))?;
+                let text = std::str::from_utf8(&bytes).map_err(|_| {
+                    OmniError::new(
+                        ErrorKind::Runtime,
+                        at,
+                        format!("module '{namespace}' is not UTF-8 text"),
+                    )
+                })?;
+                let source: Arc<str> = Arc::from(text);
+                if self.module_cache.len() >= MAX_MODULE_CACHE {
+                    self.module_cache.clear();
+                }
+                self.module_cache.insert(
+                    path.clone(),
+                    CachedModule {
+                        length,
+                        modified,
+                        source: Arc::clone(&source),
+                    },
+                );
+                source
+            }
+        };
 
         let mut child = Engine::new();
         child.module_root = Some(root);
         child.fs_read_roots = self.fs_read_roots.clone();
         child.fs_write_roots = self.fs_write_roots.clone();
+        child.module_cache = self.module_cache.clone();
         child.loading_modules = self.loading_modules.clone();
         child.loading_modules.push(path);
         // The module spends from the parent's budget rather than a fresh one, so
         // importing the same expensive module twice cannot double the allowed
         // work. `exec_with_budget` still resets the child's arena and counters.
         child
-            .exec_with_budget(source, budget)
+            .exec_with_budget(&source, budget)
             .map_err(|mut error| {
                 error.message = format!("in module '{namespace}': {}", error.message);
                 error
@@ -2019,6 +2296,28 @@ fn module_stem(path: &Path) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Worker count for one parallel batch: automatic when `requested` is zero,
+/// never more than one worker per item, never more than the hard bound.
+fn parallel_worker_count(items: usize, requested: usize) -> usize {
+    if items == 0 {
+        return 0;
+    }
+    let automatic = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    let wanted = if requested == 0 { automatic } else { requested };
+    wanted.clamp(1, items.min(MAX_PARALLEL_WORKERS))
+}
+
+/// Best-effort text from a caught panic payload, for the item's diagnostic.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string payload".to_string())
+}
+
 /// Whether a module stem can be written as an identifier, and therefore read as
 /// `stem.export`. The check mirrors the lexer's ASCII identifier rule rather than
 /// duplicating `MAX_IDENTIFIER_LEN`, because the binding table is keyed by string.
@@ -2056,6 +2355,15 @@ impl Default for Engine {
         Engine::new()
     }
 }
+
+// Compile-time proof of the Phase 8 contract. If a future field is added that is
+// not thread-safe, this stops the build rather than leaving the claim stale.
+const _: () = {
+    #[allow(dead_code)]
+    trait AssertSendSync: Send + Sync {}
+    impl AssertSendSync for Engine {}
+    impl AssertSendSync for HostCall {}
+};
 
 /// Whole microseconds, saturating where the ABI's counter cannot go further.
 ///
@@ -3896,6 +4204,83 @@ mod tests {
             error.message,
             "module 'math' has no public export '_hidden'"
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn module_sources_are_cached_until_the_file_changes() {
+        let root = temp_root("cache");
+        write_module(&root, "math", "let value = 1");
+        let mut e = Engine::new();
+        e.set_module_root(&root).unwrap();
+
+        assert_eq!(
+            e.exec("import \"math\"\nmath.value").unwrap().as_f64(),
+            Some(1.0)
+        );
+        assert_eq!(e.module_cache.len(), 1);
+        let path = root.join("math.omni").canonicalize().unwrap();
+        let first = Arc::clone(&e.module_cache[&path].source);
+
+        // Same bytes and metadata: the source is the cached allocation, not a
+        // second read.
+        assert_eq!(
+            e.exec("import \"math\"\nmath.value").unwrap().as_f64(),
+            Some(1.0)
+        );
+        assert!(Arc::ptr_eq(&first, &e.module_cache[&path].source));
+
+        // A longer file invalidates even when the modification time is too
+        // coarse to distinguish the two writes.
+        write_module(&root, "math", "let value = 2222");
+        assert_eq!(
+            e.exec("import \"math\"\nmath.value").unwrap().as_f64(),
+            Some(2222.0)
+        );
+        assert_eq!(e.module_cache.len(), 1);
+        let second = Arc::clone(&e.module_cache[&path].source);
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(&*second, "let value = 2222");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_module_cache_is_bounded() {
+        let root = temp_root("cache-bound");
+        let mut e = Engine::new();
+        e.set_module_root(&root).unwrap();
+        for index in 0..=MAX_MODULE_CACHE {
+            let name = format!("m{index}");
+            write_module(&root, &name, "let value = 1");
+            e.exec(&format!("import \"{name}\"\n{name}.value")).unwrap();
+        }
+        // The insert that would exceed the bound clears instead, so the engine
+        // keeps one live entry rather than growing without limit.
+        assert_eq!(e.module_cache.len(), 1);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_fork_has_an_independent_module_cache() {
+        let root = temp_root("cache-fork");
+        write_module(&root, "math", "let value = 1");
+        let mut e = Engine::new();
+        e.set_module_root(&root).unwrap();
+        e.exec("import \"math\"\nmath.value").unwrap();
+        let path = root.join("math.omni").canonicalize().unwrap();
+
+        let mut child = e.fork();
+        assert_eq!(child.module_cache.len(), 1);
+        // The fork clones the map but shares the immutable source, so a warm
+        // import costs no second read.
+        assert!(Arc::ptr_eq(
+            &e.module_cache[&path].source,
+            &child.module_cache[&path].source
+        ));
+
+        child.module_cache.clear();
+        assert_eq!(child.module_cache.len(), 0);
+        assert_eq!(e.module_cache.len(), 1);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

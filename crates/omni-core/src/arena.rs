@@ -460,10 +460,15 @@ impl Default for Arena {
 }
 
 // Safety: an Arena is the sole owner of its chunks, so moving it between threads
-// transfers unique ownership and is sound. This says nothing about *sharing* one
-// arena across threads: an `&mut` alias over a handle handed to a host is a data
-// race, and single-thread-per-engine is the documented host contract.
+// transfers unique ownership and is sound.
 unsafe impl Send for Arena {}
+
+// Safety: every method that allocates, resets, rewinds, or marks takes
+// `&mut self`, so while an `&Arena` is shared no cursor can move and no chunk can
+// be freed. The shared surface is pure accounting plus `StrRef`'s bounds check,
+// which only reads the chunk table. Execution itself requires `&mut Engine`,
+// which is exclusive with every other reference to the same arena.
+unsafe impl Sync for Arena {}
 
 /// A typed cell allocated inside an [`Arena`].
 ///
@@ -513,6 +518,12 @@ impl<T> Copy for Slot<T> {}
 // Safety: same reasoning as Arena — a Slot is a view into memory the Arena owns
 // and moves with it.
 unsafe impl<T> Send for Slot<T> {}
+
+// Safety: `get` is the only operation reachable through `&Slot`, and `set`
+// requires `&mut`. Sharing a read-only view of a `T: Sync` value is safe as long
+// as the backing allocation cannot be reset, which the engine guarantees by
+// dropping slots before touching their arena.
+unsafe impl<T: Sync> Sync for Slot<T> {}
 
 #[cfg(test)]
 mod tests {

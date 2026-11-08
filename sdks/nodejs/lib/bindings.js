@@ -289,6 +289,18 @@ function declare(koffi, lib, resolvedPath) {
     checkUpdate = null;
   }
 
+  // Additive in ABI 4 as well. A library built before concurrent dispatch keeps
+  // every sequential call; Engine.runParallel() falls back to `execMany` when
+  // this is null rather than failing at the first parallel request.
+  let execParallel = null;
+  try {
+    execParallel = lib.func(
+      'uint32_t omni_exec_parallel(void *engine, const void *sources, const void *lengths, size_t count, uint32_t max_threads, void *out, void *statuses)'
+    );
+  } catch {
+    execParallel = null;
+  }
+
   const bindings = {
     koffi,
     lib,
@@ -330,6 +342,7 @@ function declare(koffi, lib, resolvedPath) {
     // pointers rather than an array of strings -- the ABI reads `count` of each
     // and validates every source before running any of them.
     execMany: lib.func('uint32_t omni_exec_many(void *engine, const void *sources, const void *lengths, size_t count, void *out, void *statuses)'),
+    execParallel,
     // `char *` for the destination: koffi needs to know it is writable, and a
     // Buffer is what the caller owns. The ABI writes no NUL and reads no NUL --
     // `cap` and the return value are the whole contract.
