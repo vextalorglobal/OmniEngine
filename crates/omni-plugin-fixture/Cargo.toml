@@ -1,0 +1,18 @@
+[package]
+name = "omni-plugin-fixture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "A test plugin for omni-ffi's native plugin loader: one good function, one crash."
+
+[lib]
+crate-type = ["cdylib"]
+
+# No dependencies on purpose: a plugin must not drag the engine (or another
+# copy of it) into the host process. The manifest and value types below are
+# ABI copies, kept layout-identical by the loader's verification and by the
+# omni-ffi test suite's assertions.
+[dependencies]

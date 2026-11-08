@@ -22,7 +22,7 @@ use crate::lexer::{BinOp, Token, TokenKind};
 pub(crate) const NONE: u32 = u32::MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NodeKind {
+pub enum NodeKind {
     /// A decimal literal; `start`/`len` address the source text.
     Number,
     /// A string literal; `start`/`len` address the *contents*, quotes excluded.
@@ -50,7 +50,7 @@ pub(crate) enum NodeKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Node {
+pub struct Node {
     pub kind: NodeKind,
     pub pos: Pos,
     /// Primary span in the source: literal contents, identifier, or binding name.
@@ -84,14 +84,17 @@ impl Node {
 }
 
 /// One parsed program. Both vectors are reused across executions.
+///
+/// Public because pipeline drivers outside this crate — the JIT tier and the
+/// fuzz binaries — parse through the same door [`crate::Engine`] uses.
 #[derive(Debug, Default)]
-pub(crate) struct Ast {
+pub struct Ast {
     pub nodes: Vec<Node>,
     pub statements: Vec<u32>,
 }
 
 impl Ast {
-    pub(crate) fn new() -> Ast {
+    pub fn new() -> Ast {
         Ast::default()
     }
 
@@ -100,7 +103,7 @@ impl Ast {
     /// The tree is cleared even when parsing fails, so a caller that ignored the
     /// `Result` cannot walk half a program — the same all-or-nothing contract
     /// `lex_into` gives its token buffer.
-    pub(crate) fn parse_into(&mut self, source: &str, tokens: &[Token]) -> Result<(), OmniError> {
+    pub fn parse_into(&mut self, source: &str, tokens: &[Token]) -> Result<(), OmniError> {
         self.nodes.clear();
         self.statements.clear();
         let mut parser = Parser {

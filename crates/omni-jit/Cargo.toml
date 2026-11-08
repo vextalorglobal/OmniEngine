@@ -1,0 +1,24 @@
+[package]
+name = "omni-jit"
+description = "Phase 10 JIT tier: compiles hot OmniEngine chunks to native machine code with Cranelift, with a deopt path back to the bytecode VM."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+omni-core.workspace = true
+# The one dependency this crate adds to the workspace, pinned exactly: the
+# tier's correctness rests on the generated-code contract, not on the API, so
+# an accidental minor bump must be a deliberate edit. `host-arch` selects the
+# running machine's backend; `arm64` is compiled in so the cross-compile smoke
+# test can build for aarch64 from any host.
+cranelift-codegen = { version = "=0.121.2", default-features = false, features = ["std", "host-arch", "arm64"] }
+cranelift-control = { version = "=0.121.2", default-features = false }
+cranelift-frontend = { version = "=0.121.2", default-features = false, features = ["std"] }
+cranelift-native = { version = "=0.121.2", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# Only the aarch64 cross-compile smoke test names a triple explicitly.
+target-lexicon = "=0.12.16"

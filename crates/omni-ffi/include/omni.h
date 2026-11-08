@@ -231,6 +231,16 @@ extern "C" {
 #define OMNI_MAX_BATCH          4096u /* items one batch call may carry            */
 #define OMNI_MAX_OPCODES        64u   /* entries in an OmniProfile heatmap array   */
 
+/* ---- plugin limits: mirrors of omni_ffi::plugin ----
+ *
+ * A plugin manifest that exceeds one of these is refused at load with
+ * OMNI_ERR_ARG, before any of its code is entered. */
+#define OMNI_PLUGIN_MAGIC         0x4F4D4E49u /* "OMNI", the manifest's first word */
+#define OMNI_PLUGIN_ABI_VERSION   1u    /* manifest wire version; bumps with layout */
+#define OMNI_MAX_PLUGIN_FUNCTIONS 64u   /* functions one manifest may declare       */
+#define OMNI_MAX_PLUGIN_NAME      32u   /* bytes of the manifest's name, NUL-padded */
+#define OMNI_MAX_PLUGIN_PATH      4096u /* bytes of a load path the engine accepts  */
+
 /* The payload of an OmniValue: whichever arm its tag says is live. */
 typedef union OmniPayload {
   double number;       /* OMNI_NUMBER, OMNI_BOOL                     */
@@ -343,6 +353,65 @@ OMNI_STATIC_ASSERT(offsetof(OmniProfile, opcode_calls) == 40,
                    "OmniProfile::opcode_calls must stay at offset 40");
 OMNI_STATIC_ASSERT(offsetof(OmniProfile, opcode_ns) == 552,
                    "OmniProfile::opcode_ns must stay at offset 552");
+
+/* ---- native plugins: a shared library the engine loads and verifies ---- */
+
+/* The calling convention of one plugin function: the omni_host_fn contract
+ * with a C-unwind boundary. A plugin panic unwinds only as far as the engine's
+ * trampoline, which turns it into a host-call failure. */
+typedef int32_t(OMNI_CALL *omni_plugin_call)(void *user_data,
+                                             const OmniValue *args,
+                                             uint32_t argc,
+                                             OmniValue *out);
+
+/* One exported function, as the plugin's manifest declares it. The engine
+ * reads the table once, at load, and copies everything it needs; nothing here
+ * is trusted past verification. */
+typedef struct OmniPluginFn {
+  const char *name;         /* NUL-terminated UTF-8; read at load, copied */
+  uint32_t arity;           /* parameters the engine calls with; <= OMNI_MAX_ARGS */
+  uint32_t reserved;        /* must be zero */
+  omni_plugin_call call;    /* NULL is refused at load */
+} OmniPluginFn;
+
+/* The bytes behind the `omni_plugin_manifest` symbol. 80 bytes, fixed.
+ *
+ * The manifest is read with unaligned, offset-bounded reads: a hostile library
+ * gets itself refused, never a wild read. size is what the plugin claims and
+ * must equal sizeof(OmniPluginManifest) or the load fails. */
+typedef struct OmniPluginManifest {
+  uint32_t magic;                /* OMNI_PLUGIN_MAGIC                     */
+  uint32_t size;                 /* sizeof(OmniPluginManifest)            */
+  uint32_t abi_version;          /* OMNI_PLUGIN_ABI_VERSION               */
+  uint32_t omni_abi;             /* OMNI_ABI_VERSION the plugin was built for */
+  char name[OMNI_MAX_PLUGIN_NAME]; /* NUL-padded UTF-8                    */
+  uint32_t version_major;
+  uint32_t version_minor;
+  uint32_t version_patch;
+  uint32_t reserved;
+  uint32_t function_count;       /* <= OMNI_MAX_PLUGIN_FUNCTIONS          */
+  const OmniPluginFn *functions; /* NULL is refused when function_count > 0 */
+} OmniPluginManifest;
+
+OMNI_STATIC_ASSERT(sizeof(OmniPluginFn) == 24, "OmniPluginFn must stay 24 bytes");
+OMNI_STATIC_ASSERT(offsetof(OmniPluginFn, name) == 0, "OmniPluginFn::name must stay at offset 0");
+OMNI_STATIC_ASSERT(offsetof(OmniPluginFn, arity) == 8, "OmniPluginFn::arity must stay at offset 8");
+OMNI_STATIC_ASSERT(offsetof(OmniPluginFn, call) == 16, "OmniPluginFn::call must stay at offset 16");
+OMNI_STATIC_ASSERT(sizeof(OmniPluginManifest) == 80, "OmniPluginManifest must stay 80 bytes");
+OMNI_STATIC_ASSERT(offsetof(OmniPluginManifest, magic) == 0,
+                   "OmniPluginManifest::magic must stay at offset 0");
+OMNI_STATIC_ASSERT(offsetof(OmniPluginManifest, size) == 4,
+                   "OmniPluginManifest::size must stay at offset 4");
+OMNI_STATIC_ASSERT(offsetof(OmniPluginManifest, abi_version) == 8,
+                   "OmniPluginManifest::abi_version must stay at offset 8");
+OMNI_STATIC_ASSERT(offsetof(OmniPluginManifest, omni_abi) == 12,
+                   "OmniPluginManifest::omni_abi must stay at offset 12");
+OMNI_STATIC_ASSERT(offsetof(OmniPluginManifest, name) == 16,
+                   "OmniPluginManifest::name must stay at offset 16");
+OMNI_STATIC_ASSERT(offsetof(OmniPluginManifest, function_count) == 64,
+                   "OmniPluginManifest::function_count must stay at offset 64");
+OMNI_STATIC_ASSERT(offsetof(OmniPluginManifest, functions) == 72,
+                   "OmniPluginManifest::functions must stay at offset 72");
 
 /* Opaque. Never dereference; the layout is a Rust private detail. */
 typedef struct OmniEngine OmniEngine;
@@ -614,6 +683,31 @@ OMNI_API size_t OMNI_CALL omni_unregister_host_fn(OmniEngine *engine,
  * engine. A teardown check that the count is back to its baseline is the
  * cheapest proof that a host released every callback it registered. */
 OMNI_API size_t OMNI_CALL omni_host_fn_count(const OmniEngine *engine);
+
+/* Load a native plugin and register every function its manifest declares.
+ *
+ * `path` is `path_len` bytes of UTF-8 (not NUL-terminated) naming a shared
+ * library (.dll / .so) built against the plugin ABI: it must export
+ * `omni_plugin_manifest` whose bytes pass the strict verification above. On
+ * success the plugin's functions join the host-function table and are callable
+ * from programs until the engine is freed; the handle keeps the library mapped
+ * for that whole span, so do not unload the same module out from under it.
+ *
+ * Returns OMNI_OK, OMNI_ERR_ARG for a NULL engine or path, an empty or over-long
+ * path, non-UTF-8 in `path`, or a library that fails verification -- wrong
+ * magic, wrong manifest size, plugin-ABI or engine-ABI mismatch, a bad plugin
+ * or function name, more than OMNI_MAX_PLUGIN_FUNCTIONS functions, a NULL
+ * function pointer, an arity above OMNI_MAX_ARGS, or a duplicate name. A
+ * refused plugin changes nothing: one that fails partway through registration
+ * rolls back the functions it already registered. OMNI_ERR_REENTRANT applies
+ * as it does to every engine call. */
+OMNI_API uint32_t OMNI_CALL omni_engine_load_plugin(OmniEngine *engine,
+                                                    const char *path,
+                                                    size_t path_len);
+
+/* How many plugins this engine has loaded. Returns 0 for a NULL engine. The
+ * zero-count check after teardown proves no foreign code is still mapped. */
+OMNI_API size_t OMNI_CALL omni_plugin_count(const OmniEngine *engine);
 
 /* Fill *out with the engine's counters and OMNI_OK, or return OMNI_ERR_ARG if
  * engine or out is NULL.

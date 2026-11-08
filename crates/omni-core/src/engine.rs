@@ -1233,18 +1233,28 @@ impl Engine {
         result
     }
 
-    /// Execute a chunk with a budget of its own. Used by [`crate::fuzz_api`],
-    /// which builds chunks by hand and has no source to parse.
-    pub(crate) fn run_chunk_for_fuzz(
-        &mut self,
-        chunk: &Chunk,
-        source: &str,
-    ) -> Result<Value, OmniError> {
+    /// Execute an already-compiled chunk on the VM.
+    ///
+    /// This is the deopt path for the JIT tier, and the door [`crate::fuzz_api`]
+    /// uses for hand-built chunks: the caller compiled (and possibly optimized)
+    /// the chunk, and this runs it with the engine's own stack, step limit, and
+    /// profile — exactly the VM stage [`Engine::exec`] would reach — so the
+    /// errors it raises are the canonical ones, position included.
+    pub fn run_compiled(&mut self, chunk: &Chunk, source: &str) -> Result<Value, OmniError> {
         let mut stack = std::mem::take(&mut self.stack);
         let mut budget = Budget::new(self.step_limit);
         let result = self.run_chunk(chunk, source, &mut stack, &mut budget);
         self.stack = stack;
         result
+    }
+
+    /// [`Engine::run_compiled`] under its historical name.
+    pub(crate) fn run_chunk_for_fuzz(
+        &mut self,
+        chunk: &Chunk,
+        source: &str,
+    ) -> Result<Value, OmniError> {
+        self.run_compiled(chunk, source)
     }
 
     /// Execute one chunk. The stack is the engine's, cleared but not freed.

@@ -10,7 +10,7 @@ JavaScript can call, a custom file extension that GitHub recognises, and
 SDKs that install through `pip` and `npm`.
 
 Two numbering systems are in use and both are kept, because the brief's five
-phases are how the work was asked for and how section 11 is scored. **"Phase 1–5"
+phases are how the work was asked for and how section 12 is scored. **"Phase 1–5"
 means the brief's deliverables** (workspace, core, bridge, Linguist, SDKs).
 **"The strings increment" or "ABI v2"** means the second round of work on the
 language and the bridge — strings, the egress memory model, and the four new
@@ -38,11 +38,12 @@ or Phase 3.
 | Phase 7 — hardened security and fuzzing | done | shared execution gas, a 65,536-value VM stack cap, a 128-level parser nesting cap, symlink-safe writes, cargo-fuzz targets plus a deterministic in-repo harness, 233 `omni-core` tests (§8) |
 | Phase 8 — concurrency and parallel execution | done | `Send + Sync` core, `Engine::fork`, engine-local module caches, `omni_exec_parallel`, 64-thread stress suite, `run_parallel` / `runParallel`, 243 `omni-core` tests (§9) |
 | Phase 9 — optimizer, profiler, diagnostics | done | constant folding + DCE ahead of the VM, `OmniProfile` heatmaps through three additive ABI-4 exports, 261 `omni-core` tests (§10) |
+| Phase 10 — JIT machine-code tier and native plugins | done | a Cranelift expression tier that compiles JIT-safe chunks to native code with a deopt seam onto the VM, a hand-rolled `dlopen`/`LoadLibraryW` loader with fail-closed manifest verification and a panic containment contract, 15 `omni-jit` tests and 6 plugin tests (§11) |
 | Auto-updater and CLI manager | done | `omni_check_update` in the C ABI, `omni update` / `omni check-update` / `omniup`, `omni.check_updates()` and `checkUpdates()`, `scripts/cli-binaries.py` + `scripts/make-manifest.py` (§6.4–6.5) |
-| Same answer from four hosts | done | `scripts/verify-all.sh` — 37 rows, all passing |
+| Same answer from four hosts | done | `scripts/verify-all.sh` — 38 rows, all passing |
 
 ```
-cargo test --workspace          # 373 tests
+cargo test --workspace          # 395 tests
 ./scripts/verify-all.sh         # Rust, C, Python, Node: 42, "hello, world", ABI 4
 ./scripts/fuzz.sh               # libFuzzer when nightly is present, harness otherwise
 ./scripts/bench.sh              # three hosts, one crossing each, measured
@@ -2171,7 +2172,7 @@ and the surface is additive within ABI 4. The Python suite adds eight profile
 tests and Node adds eight — both including the struct-layout pin and the
 missing-symbol fallback.
 
-Row 37 of `scripts/verify-all.sh` (§11) is the cross-host form of the same
+Row 37 of `scripts/verify-all.sh` (§12) is the cross-host form of the same
 facts: the two Rust suites, then `(2 + 3) * 4 - 8 / 2` evaluated in Python and
 Node must answer 16.0 with the whole expression collapsed to one `PUSH_FOLDED`
 dispatch (four folds, but the stream the VM runs is one push and one `RET`),
@@ -2189,7 +2190,149 @@ as an optimizer output — the compiler never emits it.
 
 ---
 
-## 11. Verification
+## 11. Phase 10 — JIT machine-code tier and native plugins
+
+Phase 10 makes hot expression code run natively and lets a `.dll` / `.so`
+grow the engine's function table, both without moving ABI 4 or language v2.
+The design is `docs/superpowers/specs/2026-11-08-phase10-jit-plugins-design.md`,
+with the deviations found during implementation recorded inline there; this
+section is the outcome.
+
+### 11.1 The JIT tier
+
+`crates/omni-jit` is an optional tier above the bytecode VM. It compiles a
+chunk whose opcodes are all in the JIT-safe subset — the expression language:
+pushes, `Add` / `Sub` / `Mul` / `Div`, `Eq` / `Ne`, `Neg`, `Pop`, `Ret` — into
+one parameterless Cranelift function returning the result's bits in a single
+`i64`. Anything else (`Mod` included: Cranelift 0.121 has no `frem`, and a
+bit-exact software `fmod` is not worth it) keeps the chunk on the VM.
+
+The seam is *deopt-on-error*: the compiled code executes only the happy path.
+Any condition the VM would answer with an error — a non-number operand, a
+zero divisor — branches to a deopt block that returns a sentinel the tier can
+never produce as a value (`0x7FF8_0000_0000_00FF`: the canonical-NaN row with
+a payload outside the singleton slots and the canonical quiet NaN). The caller
+then re-runs the **same chunk** through the VM, which raises the canonical
+positioned error. Error text therefore exists in exactly one place, and the
+contract holds by construction: *for any program, the sequence of runtime
+errors, each with its line and column, is identical whether or not the JIT
+tier ran.* Results are bit-exact too — the compiled code reproduces
+`Value::from_f64` NaN canonicalization, the pointer/singleton row tests, IEEE
+equality, and the `nil` / `true` / `false` / `undef` singleton tags.
+
+A single-`i64` return was chosen deliberately: it lands in `rax` on SysV and
+Win64 x86-64 alike and in `x0` on aarch64, so the entry transmutes to
+`unsafe extern "C" fn() -> u64` with no ABI variance. A two-register `u128`
+return was measured and rejected — this host's toolchain returns `u128` in
+`xmm0` while Cranelift hands back register pairs. Executable memory is
+hand-rolled (~40 cfg'd lines: `VirtualAlloc` + `FlushInstructionCache` on
+Windows, `mmap(PROT_EXEC)` + `__clear_cache` elsewhere), because a leaf
+function has no relocations and nothing to link. `cranelift-native` selects
+the host ISA, and a compile-only test builds the same function for an
+explicit aarch64 triple to prove the codegen path is architecture-clean
+without executing it.
+
+The entry point for embedders is `omni_jit::exec_with(&mut engine, source,
+optimize)`, whose contract is *the same `Result<Value, OmniError>` as
+`Engine::exec`, bit-for-bit, errors included.* The tier is opt-in: `Engine`
+gained no flag and no dependency, and `omni-ffi`, the SDKs, and the CLI are
+untouched. Measured on this machine (dev profile, `cargo test -p omni-jit
+-- --nocapture`): **9,484 ns/run on the JIT vs 532,286 ns/run on the VM —
+56x** on a 2,000-term straight-line sum. Two documented deltas: a JIT'd
+success does not touch the engine's `execs` / `last_value` accounting, and
+JIT'd instructions spend no gas and appear in no heatmap — both moot today,
+because the safe subset has no calls, imports, or jumps, so a JIT'd chunk
+terminates by construction.
+
+### 11.2 The native plugin loader
+
+`crates/omni-ffi/src/plugin.rs` loads a native library exporting one symbol,
+`omni_plugin_manifest`, which points at an 80-byte `OmniPluginManifest`: magic
+`"OMNI"`, a `size` that must equal the struct (so a fixture compiled against a
+drifted layout is refused), an `abi_version`, an `omni_abi` that must equal
+the engine's, a name, a version triple, a function count capped at 64, and a
+table of 24-byte entries — each a name, an `arity <= MAX_ARGS`, and a `call`
+pointer in the existing `OmniHostFn` shape. The loader is hand-rolled
+(`LoadLibraryW` + `GetProcAddress` on Windows, `dlopen(RTLD_NOW)` + `dlsym`
+elsewhere) so `omni-ffi` stays one-dependency.
+
+Verification is fail-closed and bounded. Every read is an unaligned read
+checked against a window — for the real-library path, 64 KiB below and above
+the manifest symbol (this toolchain's linker placed the function table 224
+bytes *below* the symbol; an upward-only window refused a valid plugin), and
+for the test door `verify_bytes`, exactly the supplied slice. Names are copied
+into owned Rust structures, so after verification nothing is ever read out of
+the plugin image again — only function pointers are kept. A hostile library
+can get itself refused; it cannot make the verifier read past the window or
+keep a pointer alive past the load.
+
+One additive C export: `omni_engine_load_plugin(engine, path, path_len)`. It
+loads, verifies, and registers every function as a host function (replacing
+an existing registration, exactly like `omni_register_host_fn`), and stores
+the loaded library in a registry owned by the handle — pinned for the engine's
+lifetime and freed at `omni_engine_free`, never while a registration points
+into it. Status codes follow house style: `OMNI_ERR_ARG` for a bad path or a
+failed verification; the Rust `PluginError` carries the specific check for
+hosts that want the detail.
+
+Memory isolation is stated honestly: plugins run at the same boundary every
+host callback already has — values cross as copies, engine addresses are never
+handed out, and a `.dll` in the process is the process. What the loader adds
+is verification before any plugin code runs and containment when it does. The
+containment contract has one measured caveat: on Windows, a panic that unwinds
+out of a statically-linked-std cdylib is a *foreign exception* the host's
+`catch_unwind` cannot catch (the process aborts). The contract therefore is:
+plugins catch their own panics at their exported boundaries and report the
+message as a host failure; the engine-side `catch_unwind` trampoline remains
+the last line of defense for plugins that share its runtime. The fixture's
+`crash` function is the worked pattern, and the plugin test proves a contained
+panic leaves the engine executing afterwards.
+
+### 11.3 The fixture and the suites
+
+`crates/omni-plugin-fixture` is a zero-dependency cdylib and a default
+workspace member (the spec's cargo artifact-dependency plan proved
+unavailable: on the pinned cargo 1.99.1 it still requires `-Z bindeps`). A
+plain `cargo build` therefore produces the DLL, and the tests locate it under
+`target/{debug,release}` at run time, skipping with a hint when absent. A
+nested `cargo build` inside the tests was ruled out on principle: the outer
+`cargo test` holds the target-directory lock for its whole run. The fixture
+exports `double`, `add`, and `crash` — the last catches its own panic and
+reports the payload as a host failure.
+
+The suites:
+
+- `crates/omni-jit/tests/jit.rs` (5 tests): the safe subset against hand-built
+  and lowered chunks; a differential corpus where `omni_jit::exec_with` and
+  `Engine::exec` must return bit-identical values or character-identical
+  errors with optimization on and off; the 2,000-term throughput comparison
+  (the suite itself asserts the JIT wins); and the aarch64 compile-only
+  check. Ten more tests live in the crate.
+- `crates/omni-ffi/tests/plugin.rs` (6 tests): every manifest-rejection arm
+  fed through `verify_bytes` with hostile byte slices — bad magic, wrong
+  size, wrong ABI levels, unnamed or non-UTF-8 names, a 65-function table,
+  null or over-arity functions, duplicate names, and pointers that run past
+  the window; then the real fixture through `plugin::Plugin` (load, register,
+  `double(21) == 42`, a contained `crash()`, unregister) and through the FFI
+  export (load, `omni_exec`, a missing library refused, a manifest-less image
+  refused).
+
+Row 38 of `scripts/verify-all.sh` (§12) is the cross-host form: it builds the
+fixture, runs the JIT suite with `--nocapture` (the speedup line becomes the
+row text), runs the plugin suite, and sends the same 2,000-term sum through
+both SDKs — which were not touched at all — requiring the same answer from
+every host.
+
+### 11.4 What Phase 10 did not change
+
+ABI 4, language v2, the SDKs (140 / 134 suite checks), the CLI, the wasm
+scaffold, and every existing export signature. `omni_exec_parallel` is
+untouched. The VM is still the only error formatter, the optimizer still runs
+ahead of both tiers, and `Engine::exec` still means exactly what it did.
+
+---
+
+## 12. Verification
 
 One command, and it is the acceptance test for the whole brief:
 
@@ -2197,19 +2340,20 @@ One command, and it is the acceptance test for the whole brief:
 ./scripts/verify-all.sh
 ```
 
-Measured output on 2026-11-08, with the Phase 9 optimizer and profiler increment in it:
+Measured output on 2026-11-08, with the Phase 10 JIT and plugin increment in it:
 
 ```
 == OmniEngine cross-host verification ==
    workspace: /d/OmniEngine
 
-Rust tests... Deterministic fuzz harness... Concurrent execution contexts... Optimizer, profiler, and their heatmaps... Shared library... omni-cli... C embedding... Python SDK... Node SDK... A string is the same bytes in every host... One type error, the same text everywhere... Every surface agrees on the ABI level... String results do not grow memory... A host function answers the same bytes in every host... A host failure is data, and says so identically... Re-entering the engine from a callback is refused, not crashed... The registry says the same thing from both sides... A batch answers the same items in every host... A failing item names itself identically in every host... A batch counts items, not crossings, and reserves nothing extra... A batch inside a host callback is refused, not crashed... The DevPack math, string and type builtins answer the same in every host... A second-line error names line and byte column in every host... eval_str and eval hand back native values... The last execution timer crosses as microseconds... omni --version names what it speaks... a build that matches the release... a newer release is offered... another ABI is refused, not offered... a wrong checksum leaves the target alone... a dry run downloads nothing... a verified update replaces the bytes... a running binary updates itself... 
+Rust tests... Deterministic fuzz harness... Concurrent execution contexts... Optimizer, profiler, and their heatmaps... JIT throughput and the native plugin loader... Shared library... omni-cli... C embedding... Python SDK... Node SDK... A string is the same bytes in every host... One type error, the same text everywhere... Every surface agrees on the ABI level... String results do not grow memory... A host function answers the same bytes in every host... A host failure is data, and says so identically... Re-entering the engine from a callback is refused, not crashed... The registry says the same thing from both sides... A batch answers the same items in every host... A failing item names itself identically in every host... A batch counts items, not crossings, and reserves nothing extra... A batch inside a host callback is refused, not crashed... The DevPack math, string and type builtins answer the same in every host... A second-line error names line and byte column in every host... eval_str and eval hand back native values... The last execution timer crosses as microseconds... omni --version names what it speaks... a build that matches the release... a newer release is offered... another ABI is refused, not offered... a wrong checksum leaves the target alone... a dry run downloads nothing... a verified update replaces the bytes... a running binary updates itself... 
 == Results ==
-  PASS  cargo test --workspace (373 tests)
+  PASS  cargo test --workspace (395 tests)
   PASS  fuzz harness: 1200 inputs x 4 stages, 1200 decoder chunks, 146 executed, 0 panics
-  PASS  7 concurrency tests, 64 gas-bounded items across 8 workers (6.5ms 9837 items/s)
+  PASS  7 concurrency tests, 64 gas-bounded items across 8 workers (1.5ms 43109 items/s)
   PASS  11 optimizer tests, 6 profiler tests, one folded program profiled identically in: python node
-  PASS  omni.dll (6.6M)
+  PASS  JIT: 9484 ns/run vs VM: 532286 ns/run (56.12x); 6 plugin tests; the same 2,000-term sum in: python node
+  PASS  omni.dll (6.7M)
   PASS  omni run examples/hello.omni -> 42
   PASS  omni run examples/strings.omni -> hello, world 😀
   PASS  examples/c/embed.c -> 42 via omni.h
@@ -2232,7 +2376,7 @@ Rust tests... Deterministic fuzz harness... Concurrent execution contexts... Opt
   PASS  math, string and type builtins reduce identically in: cli python node
   PASS  line 2, column 13, and the operator's message in: cli python node
   PASS  int/number, str/string, bool/boolean with no wrapper in: python node
-  PASS  one 200 KB execution timed, non-zero and in microseconds: python(930us) node(1423us)
+  PASS  one 200 KB execution timed, non-zero and in microseconds: python(979us) node(999us)
   PASS  omni --version -> omni 0.1.0 (language v2, ABI 4)
   PASS  omni check-update -> 0, omni 0.1.0 is up to date (ABI 4)
   PASS  omni check-update -> 10, omni 99.0.0 is available; this build is 0.1.0
@@ -2276,6 +2420,15 @@ to its instruction count, and `let x = 1` / `x / 0` must still fail at
 form of the invariant the optimizer suite asserts in Rust: the fold changed
 the cost, not the answer or the positions.
 
+The fifth row is the Phase 10 increment (§11): the JIT suite runs with
+`--nocapture` so its measured speedup line — `JIT: … ns/run vs VM: … ns/run
+(…x)` — becomes the row text, the plugin suite proves a real cdylib loads,
+verifies, runs, and contains its own panic, and both SDKs then evaluate the
+same 2,000-term sum the JIT benchmarks and must answer the same value. The
+SDKs were not touched in the phase, so the row is the regression proof: the
+bridge still returns the same bytes from every host with a native tier and a
+plugin loader sitting beside it.
+
 The cross-host and update rows are the ones that could not exist in one host. The string
 comparison is byte-exact — an escape decoded differently in Rust and Node passes
 both test suites and is still a broken bridge — and the ABI row reads the number
@@ -2311,7 +2464,7 @@ deleted. On Unix the same row asserts no backup is left.
 The script degrades to `SKIP` rather than lying. `cargo`, `gcc`, `python` and
 `node` each have their own guard, Node without `koffi` is skipped with
 `npm install koffi` in the reason, and each cross-host row skips itself when fewer
-than two hosts answered. Nothing was skipped on this machine — all thirty-seven
+than two hosts answered. Nothing was skipped on this machine — all thirty-eight
 rows ran. The Rust row runs the suite once into a log and reads its exit status;
 an earlier version piped cargo into `grep` under `pipefail`, which let a failing
 suite inherit a successful-looking pipeline and briefly hid a stale CLI test. `omni-wasm` has no row here because `wasm32-unknown-unknown` is not
@@ -2330,14 +2483,15 @@ Against the brief's five phases:
 | 5 | `pip`/`npm` SDKs that do not move the language stats | 140 + 134 SDK tests; `linguist-vendored` on `sdks/**`; release packages carry a CI-built engine, checkouts carry none |
 
 Test totals: **261** in `omni-core` (237 unit, 7 in `tests/concurrency.rs`, 11 in
-`tests/optimizer.rs`, 6 in `tests/profiler.rs`), **78** in `omni-ffi` (21 unit,
+`tests/optimizer.rs`, 6 in `tests/profiler.rs`), **85** in `omni-ffi` (22 unit,
 13 in `tests/batch.rs`, 20 in `tests/ffi_contract.rs`, 8 in
-`tests/host_callbacks.rs`, 9 in `tests/parallel.rs`, and 7 in
-`tests/profile.rs`), **27** in `omni-cli` (12 library tests for the updater and
-the writer, 10 for `omni`, 5 for `omniup`), **7** in `omni-wasm`, **140**
-Python, **134** Node. The batch, callback, parallel, and profile suites are
-contract tests against the header, not unit tests of the implementation they
-sit next to.
+`tests/host_callbacks.rs`, 9 in `tests/parallel.rs`, 6 in `tests/plugin.rs`,
+and 7 in `tests/profile.rs`), **27** in `omni-cli` (12 library tests for the
+updater and the writer, 10 for `omni`, 5 for `omniup`), **15** in `omni-jit`
+(10 unit, 5 in `tests/jit.rs`), **7** in `omni-wasm`, **140** Python, **134**
+Node — 395 in `cargo test --workspace`. The batch, callback, parallel,
+profile, and plugin suites are contract tests against the header, not unit
+tests of the implementation they sit next to.
 
 Static checks are part of the definition of done:
 
@@ -2348,7 +2502,7 @@ cargo fmt --all --check                                  # clean
 
 ---
 
-## 12. Storage ledger
+## 13. Storage ledger
 
 Measured, all of it on this machine, at the time of writing. Sizes are `du`,
 which is what the drive charges; file-byte totals differ because the registry
@@ -2385,7 +2539,7 @@ complexity one.
 
 ---
 
-## 13. Troubleshooting
+## 14. Troubleshooting
 
 **`link: missing operand after '■'`** — MSVC's linker is being shadowed by Git
 for Windows' coreutils `link.exe`. Run `where link`. This workspace pins the GNU
@@ -2492,7 +2646,7 @@ the call site.
 
 ---
 
-## 14. What comes next
+## 15. What comes next
 
 Three increments shipped after the first bridge. Strings made `OmniValue` a union,
 promoted a result's bytes into a block a host can copy from, and made
@@ -2520,7 +2674,13 @@ can run over a worker group (`omni_exec_parallel`), and both SDKs expose the
 parallel shape with a sequential fallback. A ninth made the bytecode cheaper to
 run and its cost visible: an ahead-of-time optimizer that folds constants and
 erases dead statements without moving an error position, and opcode-granularity
-profiles through three additive exports. The next
+profiles through three additive exports. A tenth added speed and surface
+without moving the bridge: an optional Cranelift tier that compiles hot
+straight-line expression chunks to native code (56x measured, with a
+deopt-on-error seam that keeps every error text in the VM where it lives) and
+a verified native plugin loader behind one additive export
+(`omni_engine_load_plugin`), so a `.dll` / `.so` can grow the engine's
+function table under the same rules a host callback obeys. The next
 language increment is still the one section 3.7 lists — control flow,
 collections, and user-defined functions.
 

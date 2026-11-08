@@ -79,6 +79,13 @@ impl Optimizer {
     }
 }
 
+/// The pass for pipeline drivers outside this crate — the JIT tier compiles
+/// what the engine would have executed. Runs both passes with scratch buffers
+/// of its own rather than the engine's recycled ones.
+pub fn optimize_chunk(chunk: &mut Chunk, source: &str) -> OptimizeStats {
+    Optimizer::default().optimize(chunk, source)
+}
+
 /// The compile-time value of one stack slot. Only numbers fold today: string
 /// concatenation folding waits for a non-span literal encoding (see the
 /// Phase 9 spec, "Deliberately deferred").

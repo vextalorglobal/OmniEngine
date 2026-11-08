@@ -1,11 +1,28 @@
 [workspace]
 resolver = "3"
-members = ["crates/omni-core", "crates/omni-ffi", "crates/omni-cli", "crates/omni-wasm"]
+members = [
+    "crates/omni-core",
+    "crates/omni-ffi",
+    "crates/omni-cli",
+    "crates/omni-wasm",
+    "crates/omni-jit",
+    "crates/omni-plugin-fixture",
+]
 
 # omni-wasm is a member but not a default member: cargo build must not require
 # the wasm32-unknown-unknown target, which is not installed on this machine.
 # Build it explicitly with `cargo build -p omni-wasm` once that target lands.
-default-members = ["crates/omni-core", "crates/omni-ffi", "crates/omni-cli"]
+# omni-plugin-fixture is a default member even though only tests load it: the
+# plugin integration tests find the built cdylib under target/, and a default
+# `cargo build` must produce it. It has no dependencies, so the cost is one
+# tiny crate.
+default-members = [
+    "crates/omni-core",
+    "crates/omni-ffi",
+    "crates/omni-cli",
+    "crates/omni-jit",
+    "crates/omni-plugin-fixture",
+]
 
 [workspace.package]
 version = "0.1.0"

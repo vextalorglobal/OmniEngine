@@ -9,10 +9,10 @@
 #
 # Later sections take one answer through every host that is present and compare
 # what came back: strings and errors, a function the host owns, one crossing for
-# many programs, the DevPack surfaces, the profiler heatmaps, and finally the
-# update path -- a release check, a refused checksum, and a binary that replaces
-# itself. That comparison is the only way to catch a bridge that is internally
-# consistent and externally wrong.
+# many programs, the DevPack surfaces, the profiler heatmaps, the JIT and the
+# plugin loader, and finally the update path -- a release check, a refused
+# checksum, and a binary that replaces itself. That comparison is the only way
+# to catch a bridge that is internally consistent and externally wrong.
 #
 # Exits non-zero if anything that could run, failed.
 
@@ -65,6 +65,11 @@ PEEK_PROGRAM='peek(1)'
 # Both SDKs supply this text themselves, because the engine is busy and the one
 # thing it cannot do is render a message about being busy.
 PEEK_WANT='already inside a host function'
+# Phase 10. The same 2,000-term sum the JIT suite benchmarks, built here so the
+# row can send it through the SDKs untouched: the answer must be the same value
+# from every host, because the JIT tier and the plugin loader were added without
+# changing a single existing crossing.
+SUM_PROGRAM=$(printf '1 + %.0s' {1..1999})'1'
 
 echo "== OmniEngine cross-host verification =="
 echo "   workspace: $ROOT"
@@ -217,6 +222,62 @@ else
   fail "optimizer or profiler suite"
   tail -20 "$OUT/optimizer.log"
   tail -20 "$OUT/profiler.log"
+fi
+
+# ---------------------------------------------------- Phase 10: the JIT and the plugin loader
+#
+# The row is the machine-code tier's and the loader's whole proof in one place.
+# The JIT suite compiles a 2,000-term straight-line sum to native code and
+# measures its margin over the VM, printing a `JIT: … ns/run vs VM: … ns/run`
+# line the row captures; the suite itself asserts the margin is real. The
+# plugin suite builds the fixture cdylib, loads it through the engine's FFI,
+# and proves a contained panic cannot unwind across the boundary. The
+# differential then sends the same 2,000-term sum through both SDKs, which were
+# not touched at all -- the answer must still be the same value from every host.
+printf 'JIT throughput and the native plugin loader... '
+if cargo build -q -p omni-plugin-fixture >"$OUT/fixture.log" 2>&1 && \
+   cargo test -p omni-jit -- --nocapture >"$OUT/jit.log" 2>&1 && \
+   cargo test -p omni-ffi --test plugin >"$OUT/plugin.log" 2>&1; then
+  jit_line=$(grep -oE 'JIT: [0-9]+ ns/run vs VM: [0-9]+ ns/run \([0-9.]+x\)' \
+    "$OUT/jit.log" | head -1 | tr -d '\r')
+  plugins=$(grep -oE '[0-9]+ passed' "$OUT/plugin.log" | awk '{s += $1} END {print s+0}')
+  sum_hosts=''
+  sum_wrong=''
+  py_host=''
+  if have python || have py; then
+    py_host=$(have python && echo python || echo "py -3")
+  fi
+  if [[ -n "$py_host" ]]; then
+    got=$(cd sdks/python && P="$SUM_PROGRAM" $py_host -c '
+import os, sys; sys.path.insert(0, ".")
+import omni
+with omni.Engine() as e:
+    print(e.eval_str(os.environ["P"]))
+' 2>&1)
+    if [[ "$got" == "2000" ]]; then sum_hosts+=' python'
+    else sum_wrong+=" python='$got'"; fi
+  fi
+  if have node && [[ -d sdks/nodejs/node_modules/koffi ]]; then
+    got=$(cd sdks/nodejs && P="$SUM_PROGRAM" node -e '
+const { Engine } = require("./index.js");
+const e = new Engine();
+console.log(e.eval(process.env.P));
+e.close();
+' 2>&1)
+    if [[ "$got" == "2000" ]]; then sum_hosts+=' node'
+    else sum_wrong+=" node='$got'"; fi
+  fi
+  if [[ -n "$sum_wrong" ]]; then
+    fail "the 2,000-term sum differs through the SDKs:$sum_wrong"
+  elif [[ -z "$jit_line" ]]; then
+    fail "the JIT suite passed but printed no speedup line"
+  else
+    pass "$jit_line; ${plugins:-?} plugin tests; the same 2,000-term sum in:$sum_hosts"
+  fi
+else
+  fail "JIT or plugin suite"
+  tail -20 "$OUT/jit.log"
+  tail -20 "$OUT/plugin.log"
 fi
 
 printf 'Shared library... '

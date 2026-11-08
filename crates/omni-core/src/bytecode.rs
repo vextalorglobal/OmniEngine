@@ -26,9 +26,11 @@ use crate::lexer::BinOp;
 /// defined here because they are part of the VM's contract and because tests
 /// build chunks by hand to exercise the dispatch loop the compiler will use once
 /// control flow reaches the language.
+/// Public because the JIT tier reads the stream the VM executes; the module
+/// doc explains the encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
-pub(crate) enum OpCode {
+pub enum OpCode {
     PushNumber,
     PushStr,
     PushFolded,
@@ -123,7 +125,7 @@ impl OpCode {
     /// top, so both answer `None`. A compiler backend that needs a stack depth
     /// can use this to verify a chunk; the VM itself does not need it because
     /// lowering has already balanced the stack.
-    pub(crate) fn stack_effect(self) -> Option<(u8, u8)> {
+    pub fn stack_effect(self) -> Option<(u8, u8)> {
         Some(match self {
             OpCode::PushNumber
             | OpCode::PushStr
@@ -150,7 +152,7 @@ impl OpCode {
 
 /// One instruction. `Copy`, so the VM may hold it while the chunk is borrowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Instr {
+pub struct Instr {
     pub op: OpCode,
     /// Source span for literals and imports, name offset for loads/stores/calls,
     /// jump target for branches, the low 32 bits of a folded `f64` for
@@ -166,7 +168,7 @@ pub(crate) struct Instr {
 
 impl Instr {
     #[allow(dead_code)]
-    pub(crate) fn new(op: OpCode, a: u32, b: u32, c: u32, at: Pos) -> Instr {
+    pub fn new(op: OpCode, a: u32, b: u32, c: u32, at: Pos) -> Instr {
         Instr {
             op,
             a,
@@ -177,14 +179,14 @@ impl Instr {
         }
     }
 
-    pub(crate) fn pos(self) -> Pos {
+    pub fn pos(self) -> Pos {
         Pos::new(self.line, self.column)
     }
 }
 
 /// A compiled program: instructions plus the identifier bytes they address.
 #[derive(Debug, Default)]
-pub(crate) struct Chunk {
+pub struct Chunk {
     pub code: Vec<Instr>,
     /// Concatenated UTF-8 identifier bytes. `Load`, `Store`, and `Call` address
     /// a slice of this buffer, so an instruction stays fixed-size.
@@ -192,17 +194,17 @@ pub(crate) struct Chunk {
 }
 
 impl Chunk {
-    pub(crate) fn new() -> Chunk {
+    pub fn new() -> Chunk {
         Chunk::default()
     }
 
-    pub(crate) fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.code.clear();
         self.names.clear();
     }
 
     /// The identifier bytes an instruction names.
-    pub(crate) fn name(&self, instr: Instr) -> &str {
+    pub fn name(&self, instr: Instr) -> &str {
         let start = instr.a as usize;
         let end = start.saturating_add(instr.b as usize);
         self.names
@@ -222,7 +224,7 @@ impl Chunk {
 /// the number of enclosing calls, counted syntactically as the fused parser
 /// counted it.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum Task {
+pub enum Task {
     Visit(u32, u32),
     Emit(OpCode, u32, u32, u32, Pos),
 }
@@ -237,7 +239,11 @@ pub(crate) enum Task {
 /// The work stack is the caller's, like every other buffer in the engine: it is
 /// cleared on entry and keeps its capacity, so a warm program allocates nothing
 /// to lower.
-pub(crate) fn compile(
+///
+/// Public because the JIT tier lowers through the same door: it compiles a
+/// chunk and runs it natively, then hands the same chunk to
+/// [`crate::Engine::run_compiled`] when a deopt needs the VM's error.
+pub fn compile(
     ast: &Ast,
     source: &str,
     engine: &crate::Engine,
@@ -488,7 +494,7 @@ impl Compiler<'_> {
 /// and is for tests, diagnostics, and anyone reading a compilation; the VM never
 /// calls it.
 #[allow(dead_code)]
-pub(crate) fn disassemble(chunk: &Chunk, source: &str) -> String {
+pub fn disassemble(chunk: &Chunk, source: &str) -> String {
     use std::fmt::Write as _;
 
     let mut out = String::new();

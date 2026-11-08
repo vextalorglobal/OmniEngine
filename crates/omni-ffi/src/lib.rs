@@ -62,6 +62,8 @@ use std::slice;
 
 use omni_core::{Engine, ErrorKind, HostError, HostOutcome, OmniError, Value};
 
+pub mod plugin;
+
 /// The ceilings a host has to size its buffers and names against.
 ///
 /// Re-exported rather than restated: they are part of the ABI's contract, and a
@@ -389,6 +391,12 @@ pub struct OmniEngine {
     /// live. Cleared by `omni_exec`: after a single execution there is no current
     /// batch, and a stale message would be worse than none.
     batch: RefCell<Vec<Option<OmniError>>>,
+    /// Every loaded plugin, in load order. Each keeps its library mapped, and
+    /// the field is declared after `inner` so the engine — whose host-function
+    /// table holds the plugins' function pointers — drops before the modules
+    /// unload. Its own cell so a load can push while the engine borrow is held
+    /// elsewhere.
+    plugins: RefCell<Vec<plugin::Plugin>>,
 }
 
 /// The callback a host registers, and the only shape a host function may have.
@@ -544,7 +552,7 @@ fn encode(engine: &Engine, v: Value) -> OmniValue {
 /// the very call that is handing the argument over. The bytes cannot move while
 /// the callback runs, because nothing that resets the arena can run while this
 /// borrow is held — which is exactly what the header's re-entrancy rule buys.
-fn encode_argument(engine: &Engine, v: Value) -> OmniValue {
+pub(crate) fn encode_argument(engine: &Engine, v: Value) -> OmniValue {
     if v.is_string() {
         // The same empty-string rule as `encode`: no address is handed out for
         // nothing, so a host that sees a null pointer sees a length of zero too.
@@ -567,7 +575,7 @@ fn encode_argument(engine: &Engine, v: Value) -> OmniValue {
 /// turns into a failure rather than a partial read. The bytes are copied into an
 /// owned buffer, which is what keeps the engine from ever storing a host address —
 /// the same rule [`omni_define_string`] states from the other side.
-fn host_bytes(value: &OmniValue) -> Option<Vec<u8>> {
+pub(crate) fn host_bytes(value: &OmniValue) -> Option<Vec<u8>> {
     let len = usize::try_from(value.len).ok()?;
     if len > MAX_STRING_LEN {
         return None;
@@ -611,10 +619,18 @@ fn call_host(
     // Safety: `f` is the host's own function, registered by name on this thread;
     // `buf`, `out`, and the null `user_data` are all the host agreed to accept.
     let code = unsafe { f(context.0, buf.as_ptr(), argc, &mut out) };
+    outcome(code, &out)
+}
+
+/// Turn a callback's status and its `out` value into the engine's answer.
+///
+/// Shared by [`call_host`] and the plugin trampoline, which have identical
+/// contracts on their respective panic boundaries.
+pub(crate) fn outcome(code: i32, out: &OmniValue) -> HostOutcome {
     if code != OMNI_HOST_OK {
         // The host's message if it sent one. A failure with no string attached is
         // still a failure, and core prints the function's name for it.
-        return HostOutcome::Failure(host_bytes(&out).unwrap_or_default());
+        return HostOutcome::Failure(host_bytes(out).unwrap_or_default());
     }
     match out.tag {
         OMNI_NUMBER => match out.number() {
@@ -629,7 +645,7 @@ fn call_host(
         },
         OMNI_NIL => HostOutcome::Nil,
         OMNI_UNDEF => HostOutcome::Undefined,
-        OMNI_STRING => match host_bytes(&out) {
+        OMNI_STRING => match host_bytes(out) {
             Some(bytes) => HostOutcome::String(bytes),
             None => HostOutcome::Failure(b"a string result has no readable bytes".to_vec()),
         },
@@ -735,6 +751,7 @@ pub extern "C" fn omni_engine_new() -> *mut OmniEngine {
         Box::into_raw(Box::new(OmniEngine {
             inner: RefCell::new(Engine::new()),
             batch: RefCell::new(Vec::new()),
+            plugins: RefCell::new(Vec::new()),
         }))
     })) {
         Ok(handle) => handle,
@@ -1610,6 +1627,82 @@ pub unsafe extern "C" fn omni_host_fn_count(engine: *const OmniEngine) -> usize 
     guarded_len(|| engine.host_fn_count())
 }
 
+/// Load a native plugin and register every function its manifest declares.
+///
+/// `path` is `path_len` bytes of UTF-8 (not NUL-terminated) naming a shared
+/// library built against the plugin ABI: it must export `omni_plugin_manifest`
+/// whose bytes pass [`plugin::Plugin::load`]'s strict verification. On success
+/// the plugin's functions join the host-function table and are callable from
+/// programs until the engine is freed; the handle keeps the library mapped for
+/// that whole span, so the host must not unload the same module out from under
+/// it.
+///
+/// Returns [`OMNI_OK`], or [`OMNI_ERR_ARG`] when the arguments are malformed
+/// or the library is refused: wrong magic, wrong manifest size, plugin-ABI or
+/// engine-ABI mismatch, a bad plugin or function name, more than 64 functions,
+/// a null function pointer, an arity above the ABI's cap, or a duplicate name.
+/// A refused plugin changes nothing — one that fails partway through
+/// registration rolls back the functions it already registered — and
+/// [`OMNI_ERR_REENTRANT`] applies as it does to every engine call.
+///
+/// # Safety
+///
+/// As [`omni_engine_new`]; `path` must be readable for `path_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn omni_engine_load_plugin(
+    engine: *mut OmniEngine,
+    path: *const c_char,
+    path_len: usize,
+) -> u32 {
+    if engine.is_null() || path.is_null() || path_len == 0 {
+        return OMNI_ERR_ARG;
+    }
+    if path_len > plugin::OMNI_MAX_PLUGIN_PATH {
+        return OMNI_ERR_ARG;
+    }
+    // Safety: bounded length, and the caller guarantees `path` is readable for it.
+    let bytes = unsafe { slice::from_raw_parts(path.cast::<u8>(), path_len) };
+    let Ok(path) = std::str::from_utf8(bytes) else {
+        return OMNI_ERR_ARG;
+    };
+    let handle = unsafe { &*engine };
+    let mut borrow = match borrow_mut(handle) {
+        Ok(borrow) => borrow,
+        Err(code) => return code,
+    };
+    guarded(|| {
+        let loaded = match plugin::Plugin::load(path) {
+            Ok(loaded) => loaded,
+            Err(_) => return OMNI_ERR_ARG,
+        };
+        if loaded.register(&mut borrow).is_err() {
+            return OMNI_ERR_ARG;
+        }
+        // `borrow` holds `inner`; the plugin lands in its own cell, so a load
+        // never needs a second borrow of the same cell. Field order in
+        // `OmniEngine` keeps the library mapped until after the engine drops.
+        handle.plugins.borrow_mut().push(loaded);
+        OMNI_OK
+    })
+}
+
+/// How many plugins this engine has loaded.
+///
+/// Zero means no foreign code is mapped, which is what a leak test asserts
+/// after it frees everything it loaded.
+///
+/// # Safety
+///
+/// `engine` must come from [`omni_engine_new`], or be null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn omni_plugin_count(engine: *const OmniEngine) -> usize {
+    if engine.is_null() {
+        return 0;
+    }
+    let handle = unsafe { &*engine };
+    guarded_len(|| handle.plugins.borrow().len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1650,6 +1743,24 @@ mod tests {
         assert_eq!(std::mem::offset_of!(OmniStats, size), 0);
         assert_eq!(std::mem::offset_of!(OmniStats, last_exec_micros), 4);
         assert_eq!(std::mem::offset_of!(OmniStats, execs), 8);
+    }
+
+    #[test]
+    fn plugin_layout_is_what_the_header_claims() {
+        use plugin::{OMNI_MAX_PLUGIN_NAME, OmniPluginFn, OmniPluginManifest};
+        assert_eq!(OMNI_MAX_PLUGIN_NAME, 32);
+        assert_eq!(std::mem::size_of::<OmniPluginFn>(), 24);
+        assert_eq!(std::mem::offset_of!(OmniPluginFn, name), 0);
+        assert_eq!(std::mem::offset_of!(OmniPluginFn, arity), 8);
+        assert_eq!(std::mem::offset_of!(OmniPluginFn, call), 16);
+        assert_eq!(std::mem::size_of::<OmniPluginManifest>(), 80);
+        assert_eq!(std::mem::offset_of!(OmniPluginManifest, magic), 0);
+        assert_eq!(std::mem::offset_of!(OmniPluginManifest, size), 4);
+        assert_eq!(std::mem::offset_of!(OmniPluginManifest, abi_version), 8);
+        assert_eq!(std::mem::offset_of!(OmniPluginManifest, omni_abi), 12);
+        assert_eq!(std::mem::offset_of!(OmniPluginManifest, name), 16);
+        assert_eq!(std::mem::offset_of!(OmniPluginManifest, function_count), 64);
+        assert_eq!(std::mem::offset_of!(OmniPluginManifest, functions), 72);
     }
 
     #[test]
