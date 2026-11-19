@@ -1,5 +1,8 @@
 # OmniEngine
 
+OmniEngine is Vextalor Global's high-performance execution engine for local,
+self-hosted, and managed cloud workloads.
+
 A custom programming language and the ecosystem around it: a Rust core with no
 garbage collector, a C ABI that Python, Node, and C can call directly, and a
 CLI that runs `.omni` files.
@@ -14,6 +17,24 @@ host that crossing can be spread over worker engines (`run_parallel` /
 numbers in this repository are measured runs, not promises: `scripts/bench.sh`
 prints them for this machine. Every claim below is covered by a test that has
 been run on this machine.
+
+## Deployment model
+
+OmniEngine supports two deployment modes:
+
+- **Self-hosted / local SDKs** are free and unrestricted by OmniEngine API
+  quotas. Execution stays on the user's device or server, adds no network
+  latency, and keeps submitted data local. The host operator remains responsible
+  for local CPU, memory, and filesystem policy.
+- **Managed Cloud / SaaS** executes source received through a remote API
+  request in an isolated sandbox. Cloud execution processes only the source,
+  configuration, and response data included in that request; it does not receive
+  unrelated local files or data.
+
+The architecture, gateway contract, and default usage tiers are specified in
+[`docs/HYBRID-DEPLOYMENT.md`](docs/HYBRID-DEPLOYMENT.md),
+[`docs/CLOUD-API.md`](docs/CLOUD-API.md), and
+[`policies/usage-tiers.toml`](policies/usage-tiers.toml).
 
 ## Get started in 60 seconds
 
@@ -60,7 +81,7 @@ cargo run -p omni-cli -- run examples/hello.omni    # -> 42
 cargo run -p omni-cli -- eval '"omni" + " " + "engine"'  # -> omni engine
 
 cargo install --path crates/omni-cli                # `omni` and `omniup` on PATH
-omni --version                                      # omni 0.1.0 (language v2, ABI 4)
+omni --version                                      # omni 0.1.0 (language v2, ABI 5)
 omni run examples/hello.omni                        # -> 42
 ```
 
@@ -184,16 +205,18 @@ negative number and a `pow` that overflows fail with a positioned error rather
 than returning `NaN` or infinity. `type_of` answers `"number"`, `"string"`,
 `"boolean"`, or `"null"` — `null` is reachable through a host callback, since
 the grammar has no literal for it yet. Neither SDK unwraps into `list` or `dict`:
-ABI 4 has no collection type for a program to produce.
+ABI 5 has no collection type for a program to produce.
 
 `json.parse` and `json.stringify` cover exactly the four kinds that fit a
 16-byte `OmniValue` — number, string, boolean, `null`. An array or object is a
-deliberate error (`json.parse: arrays and objects are not supported at ABI 4`)
+deliberate error (`json.parse: arrays and objects are not supported at ABI 5`)
 rather than a string-shaped stand-in. `fs` fails closed: with no permission
 roots both builtins report that they are disabled. The CLI grants none, so a
 script cannot touch the disk by default; a Rust embedder opts in with
-`Engine::allow_fs_read(path)` and `Engine::allow_fs_write(path)`, and a target
-outside those roots is refused before the OS is asked.
+`Engine::allow_fs_read(path)` and `Engine::allow_fs_write(path)` — and, since
+ABI 5, so can a Python or Node host through `engine.allow_fs_read(path)` /
+`engine.allowFsRead(path)` and their write and module-root companions — and a
+target outside those roots is refused before the OS is asked.
 
 ## How a program runs
 
@@ -207,7 +230,7 @@ left-deep spine — `1 + 1 + … + 1` thousands of terms long — costs heap, no
 thread stack. `Chunk`, the AST, the VM stack, and the lowering work stack all
 live on the engine and are cleared rather than freed, so a warm program still
 allocates nothing. Operand ordering, positions, and error text are the fused
-evaluator's, which is what keeps ABI 4 byte-identical.
+evaluator's, which is what keeps ABI 5 byte-identical.
 
 ## Staying safe by default
 
@@ -353,7 +376,7 @@ do run on the workers.
 SHA-256, and replaces the binary only if the bytes match:
 
 ```bash
-omni --version                    # omni 0.1.0 (language v2, ABI 4)
+omni --version                    # omni 0.1.0 (language v2, ABI 5)
 omni check-update                 # 0 current, 10 newer, 11 different ABI
 omni update --dry-run             # 10: an update would apply; nothing fetched
 omni update --yes                 # download, verify, install

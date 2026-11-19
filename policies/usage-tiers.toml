@@ -1,0 +1,53 @@
+# OmniEngine managed-cloud usage tiers.
+# This file is declarative policy scaffolding. It does not change local SDK behavior.
+
+[tiers.free]
+display_name = "Free"
+api_requests_per_month = 100000
+cpu_ms_per_request = 50
+sandbox_memory_mib = 128
+max_concurrent_requests = 10
+managed_cloud_enabled = true
+overage = "reject"
+
+[tiers.pay_as_you_go]
+display_name = "Pay-As-You-Go"
+managed_cloud_enabled = true
+api_requests_per_month = "metered"
+cpu_ms_per_request = "plan_configured"
+sandbox_memory_mib = "plan_configured"
+max_concurrent_requests = "plan_configured"
+overage = "bill_or_plan_limit"
+
+[tiers.enterprise]
+display_name = "Enterprise"
+managed_cloud_enabled = true
+api_requests_per_month = "contract"
+cpu_ms_per_request = "contract"
+sandbox_memory_mib = "contract"
+max_concurrent_requests = "contract"
+overage = "contract"
+private_regions = true
+dedicated_workers = true
+custom_retention = true
+
+[gateway]
+auth = "bearer_token"
+protocols = ["rest", "grpc"]
+rest_execute_endpoint = "/v1/execute"
+rest_health_endpoint = "/v1/health"
+grpc_service = "OmniExecution"
+tls_required = true
+
+[latency_targets]
+local_internal_ms = [1, 5]
+jit_internal_ms_max = 1
+cloud_end_to_end_ms = [30, 80]
+
+[sandbox_defaults]
+filesystem_reads = false
+filesystem_writes = false
+module_imports = false
+host_functions = false
+network_access = false
+deterministic_verification = true

@@ -9,7 +9,7 @@ it. The short version:
 
 ```bash
 python scripts/check-versions.py          # one version, one ABI
-./scripts/verify-all.sh                   # 395 Rust, 140 Python, 134 Node checks
+./scripts/verify-all.sh                   # 406 Rust, 140 Python, 142 Node checks
 ./scripts/fuzz.sh                         # libFuzzer if nightly, else the harness
 ./scripts/bench.sh                        # measured numbers, not regressions
 git tag v0.1.0 && git push origin v0.1.0  # the only release action
@@ -79,6 +79,16 @@ toolchain for the author's machine, where Git's `link.exe` shadows MSVC. The
 workflow sets `RUSTUP_TOOLCHAIN=stable`, so Linux and macOS runners use their
 native toolchain and Windows uses MSVC rather than MinGW.
 
+**Publishing waits on `package-verify`.** `scripts/prepack.js` guards the
+tarball at pack time, but a guard inside the packaging step cannot see the
+finished bytes the way an independent reader can. `scripts/package-verify.py`
+unpacks every artifact and checks container magic, the VGPL license text, the
+ABI 5 permission exports inside each binary, ABI agreement, and the sidecar
+hashes; the workflow's `pypi`, `npm-publish`, and `github-release` jobs all
+`needs: package-verify`, so nothing reaches a registry unproven. Locally,
+verify-all row 40 is the same gate plus the integration half: the unpacked
+wheel and tarball must both load and answer 42 outside the checkout.
+
 ## 3. Preflight
 
 Run these from a clean checkout of the tag's commit:
@@ -115,9 +125,10 @@ disagreeing tree even if the workflow is bypassed.
 - One version across all three manifests. The release workflow fails otherwise.
 - The ABI level changes only when a struct layout or a signature changes. Bumps
   so far: v2 strings and the 16-byte `OmniValue`, v3 host callbacks, v4 batch
-  execution and `OmniStats.execs` counting items.
+  execution and `OmniStats.execs` counting items, v5 the dynamic permission
+  exports.
 - A version bump does **not** imply an ABI bump. A 0.1.1 that fixes a wrapper
-  keeps ABI 4.
+  keeps ABI 5.
 - Both SDKs refuse to load an engine whose ABI differs from their own constant.
   A stale artifact is an error, not wrong numbers.
 
@@ -146,7 +157,7 @@ git push origin v0.1.0
 The tag push runs the workflow. Jobs, in order:
 
 1. **guard** — versions and ABI agree, tag matches the manifests.
-2. **verify** — fmt, clippy, 395 Rust tests, both SDK suites.
+2. **verify** — fmt, clippy, 406 Rust tests, both SDK suites.
 3. **native** — five platforms, in parallel; each archive is smoke-tested with
    `omni run examples/hello.omni` before upload, and the same job stages that
    platform's `omni` and `omniup` with their checksums.
@@ -155,10 +166,16 @@ The tag push runs the workflow. Jobs, in order:
 5. **python-wheels** — one wheel per platform, engine staged from that
    platform's build, retagged `py3-none-<platform>`.
 6. **npm-package** — all five libraries staged under `native/`, `prepack.js`
-   enforces completeness, `npm pack`, then `npm publish --provenance`.
-7. **pypi** — Trusted Publishing uploads the wheels.
-8. **github-release** — archives, wheels, tarball, both CLI binaries per
-   platform, the update manifest, and checksums attached.
+   enforces completeness, `npm pack`. This job packs only; it does not publish.
+7. **package-verify** — unpacks all five wheels and the tarball and proves,
+   from file bytes alone, that each binary has the right container magic for
+   its platform, carries the VGPL license text, and contains the three ABI 5
+   permission exports — so a stale or wrong-platform engine fails here instead
+   of on a registry. `--require-all-platforms` demands all five npm bundles.
+8. **pypi** — Trusted Publishing uploads the wheels.
+9. **npm-publish** — `npm publish --provenance`, only after package-verify.
+10. **github-release** — archives, wheels, tarball, both CLI binaries per
+    platform, the update manifest, and checksums attached.
 
 Re-running a failed tag build is safe: the GitHub Release step updates an
 existing release with `--clobber`, while PyPI and npm reject a version that
@@ -191,7 +208,7 @@ ls node_modules/omniengine/native/*/
 Then the update channel, from the same outside directory:
 
 ```bash
-omni --version            # omni 0.1.0 (language v2, ABI 4)
+omni --version            # omni 0.1.0 (language v2, ABI 5)
 omni check-update; echo $?  # 0 -- the release you just published is current
 omni update --dry-run; echo $?  # 10 only when a *later* release exists
 ```
@@ -201,7 +218,7 @@ a version the binaries do not; 2 means the manifest was not reachable or does no
 parse. Both are release bugs and are fixed by republishing, not by editing a
 client.
 
-The npm install prints `omniengine: bundled engine verified (<platform>, ABI 4)`
+The npm install prints `omniengine: bundled engine verified (<platform>, ABI 5)`
 when postinstall succeeds. `OMNI_SKIP_POSTINSTALL=1` skips it;
 `OMNI_STRICT_POSTINSTALL=1` turns a missing artifact into a failed install.
 

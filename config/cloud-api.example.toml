@@ -1,0 +1,38 @@
+# Copy this file to the managed gateway's private configuration.
+# Secrets must come from the deployment secret store, never this example file.
+
+[gateway]
+bind = "0.0.0.0:8443"
+tls_cert = "/run/secrets/tls/cert.pem"
+tls_key = "/run/secrets/tls/key.pem"
+allowed_origins = []
+execute_endpoint = "/v1/execute"
+health_endpoint = "/v1/health"
+
+[auth]
+mode = "bearer"
+token_header = "Authorization"
+token_secret_source = "env:OMNI_API_TOKEN_SIGNING_KEY"
+token_secret_required = true
+
+[gateway.rate_limit]
+free_requests_per_month = 100000
+free_max_concurrent = 10
+free_rate_window_seconds = 60
+free_max_requests_per_window = 1000
+retry_after_on_limit = true
+
+[gateway.resource_limits]
+cpu_ms_per_request = 50
+sandbox_memory_mib = 128
+max_source_bytes = 65536
+max_output_bytes = 65536
+request_timeout_ms = 50
+
+[gateway.sandbox]
+filesystem_reads = false
+filesystem_writes = false
+module_imports = false
+host_functions = false
+network_access = false
+deterministic_verification = true

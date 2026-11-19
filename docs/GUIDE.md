@@ -10,15 +10,13 @@ JavaScript can call, a custom file extension that GitHub recognises, and
 SDKs that install through `pip` and `npm`.
 
 Two numbering systems are in use and both are kept, because the brief's five
-phases are how the work was asked for and how section 12 is scored. **"Phase 1–5"
+phases are how the work was asked for and how section 14 is scored. **"Phase 1–5"
 means the brief's deliverables** (workspace, core, bridge, Linguist, SDKs).
 **"The strings increment" or "ABI v2"** means the second round of work on the
 language and the bridge — strings, the egress memory model, and the four new
 exports. **"The callback increment" or "ABI v3"** means the third — host
 functions, call syntax, and the re-entrancy guard. Neither is the brief's Phase 2
 or Phase 3.
-
----
 
 ## 0. Status
 
@@ -40,11 +38,14 @@ or Phase 3.
 | Phase 9 — optimizer, profiler, diagnostics | done | constant folding + DCE ahead of the VM, `OmniProfile` heatmaps through three additive ABI-4 exports, 261 `omni-core` tests (§10) |
 | Phase 10 — JIT machine-code tier and native plugins | done | a Cranelift expression tier that compiles JIT-safe chunks to native code with a deopt seam onto the VM, a hand-rolled `dlopen`/`LoadLibraryW` loader with fail-closed manifest verification and a panic containment contract, 15 `omni-jit` tests and 6 plugin tests (§11) |
 | Auto-updater and CLI manager | done | `omni_check_update` in the C ABI, `omni update` / `omni check-update` / `omniup`, `omni.check_updates()` and `checkUpdates()`, `scripts/cli-binaries.py` + `scripts/make-manifest.py` (§6.4–6.5) |
-| Same answer from four hosts | done | `scripts/verify-all.sh` — 38 rows, all passing |
+| Phase 11 — enterprise ABI v5 permissions | done | three fail-closed permission exports (`omni_engine_allow_fs_read` / `omni_engine_allow_fs_write` / `omni_engine_set_module_root`) with a 4 KB path cap, engine-local grants that forks inherit and siblings never see, re-entrancy refusal, 8 FFI contract tests, `allow_fs_read` / `allowFsRead` in both SDKs, 406 Rust tests (§12) |
+| Phase 12 — packaging verification and the artifact gate | done | `scripts/package-verify.py` (container magic, the ABI 5 permission exports as a binary-level proof, VGPL text, ABI agreement, sidecar hashes), a `package-verify` workflow job gating PyPI / npm / the GitHub Release, verify-all row 40 with unpacked wheel + tarball loads (§13) |
+| Same answer from four hosts | done | `scripts/verify-all.sh` — 40 rows, all passing |
+| Hybrid deployment and cloud API policy | documented | local/self-hosted and managed Cloud/SaaS privacy boundaries, API gateway contract, and tier limits in [`HYBRID-DEPLOYMENT.md`](HYBRID-DEPLOYMENT.md), [`CLOUD-API.md`](CLOUD-API.md), and [`usage-tiers.toml`](../policies/usage-tiers.toml) |
 
 ```
-cargo test --workspace          # 395 tests
-./scripts/verify-all.sh         # Rust, C, Python, Node: 42, "hello, world", ABI 4
+cargo test --workspace          # 406 tests
+./scripts/verify-all.sh         # Rust, C, Python, Node: 42, "hello, world", ABI 5
 ./scripts/fuzz.sh               # libFuzzer when nightly is present, harness otherwise
 ./scripts/bench.sh              # three hosts, one crossing each, measured
 python scripts/check-versions.py  # one version, one ABI across every surface
@@ -444,7 +445,7 @@ land inside a multi-byte character and produce text no host can decode, so the
 cutting operation pays for a character walk and the measuring operation keeps
 reporting the storage a caller allocates for. `type_of` answers `"null"` only
 for a value a host callback produced, because the grammar has no `null` literal
-yet; there is no `"array"` or `"object"` because ABI 4 has no collection type.
+yet; there is no `"array"` or `"object"` because ABI 5 has no collection type.
 
 The `fs` and `json` builtins are sandboxed. No permission root exists by
 default, so both filesystem calls fail closed with
@@ -643,7 +644,7 @@ to read: while a callback holds them, nothing else can move the engine.
 
 | Function | Returns |
 | --- | --- |
-| `omni_abi_version()` | `4` — read this before anything else |
+| `omni_abi_version()` | `5` — read this before anything else |
 | `omni_version()` | static NUL-terminated string, never freed |
 | `omni_engine_new()` | opaque `OmniEngine*`, null on failure |
 | `omni_engine_free(e)` | nothing; null is a no-op |
@@ -701,7 +702,7 @@ whole — `[Line 1, Col 5]: expected a name, found ''=''` — and the contract t
 asserts both the line and the column survive the boundary. Note the doubled
 quotes around `=`: that is the engine, not the SDK. `display_kind` renders a
 symbol as `'='` and the message template wraps it in quotes a second time. The
-hosts pass the text through untouched rather than prettifying it, and section 14
+hosts pass the text through untouched rather than prettifying it, and section 16
 records the one-character fix.
 
 **A zero-length program is legal even from a null pointer.** Node hands an empty
@@ -1110,7 +1111,7 @@ returns `(status, result | None, message)` and never raises. `close()` is
 idempotent and `__del__` is guarded by an `atexit` hook, so an engine that
 outlives the script is not a use-after-free.
 
-Neither `eval_str` nor `eval` produces a `list` or `dict`: ABI 4 has no
+Neither `eval_str` nor `eval` produces a `list` or `dict`: ABI 5 has no
 collection type for a program to return, so converting one would be inventing a
 value the engine never made. When collections land, the conversion belongs in
 `Result.value`, which both names read.
@@ -1260,7 +1261,7 @@ Measured, with no environment variables set:
 | `pip install -e sdks/python` | outside the repo | found — editable, so the package still lives in the repo |
 | `pip install dist/omniengine-0.1.0-py3-none-win_amd64.whl` (release wheel) | outside the repo | found — `omni/_native/omni.dll`, verified 2026-11-07 |
 | `npm install ../sdks/nodejs` | anywhere | found — npm symlinks `file:` installs, Node resolves the real path |
-| extracted `omniengine-0.1.0.tgz`, koffi on `NODE_PATH` | anywhere | found — `native/win32-x64/omni.dll`; `postinstall` verified ABI 4 |
+| extracted `omniengine-0.1.0.tgz`, koffi on `NODE_PATH` | anywhere | found — `native/win32-x64/omni.dll`; `postinstall` verified ABI 5 |
 | both | anywhere, `OMNI_ENGINE_HOME=D:\OmniEngine` | found |
 
 If nothing is found, the error prints the build command, the list of paths it
@@ -1278,7 +1279,7 @@ The CLI installs globally from the checkout; both binaries land in `~/.cargo/bin
 
 ```bash
 cargo install --path crates/omni-cli   # omni and omniup
-omni --version                         # omni 0.1.0 (language v2, ABI 4)
+omni --version                         # omni 0.1.0 (language v2, ABI 5)
 omni run examples/hello.omni           # 42
 ```
 
@@ -1288,7 +1289,7 @@ Running it without installing works too:
 cargo run -p omni-cli -- run examples/hello.omni      # 42
 cargo run -p omni-cli -- run examples/strings.omni    # hello, world 😀
 cargo run -p omni-cli -- eval "2 + 3 * 4"             # 14
-cargo run -p omni-cli -- --version                    # omni 0.1.0 (language v2, ABI 4)
+cargo run -p omni-cli -- --version                    # omni 0.1.0 (language v2, ABI 5)
 cargo run -p omni-cli -- check-update                 # 0, or 10 when newer exists
 cargo run -p omni-cli -- update --dry-run             # 10, downloads nothing
 ```
@@ -1354,7 +1355,7 @@ The manifest is one document per release:
 ```json
 {
   "version": "0.2.0",
-  "abi": 4,
+  "abi": 5,
   "notes": "what changed",
   "assets": {
     "win32-x64":    { "url": "https://…/omni-win32-x64.exe",   "sha256": "…64 hex…" },
@@ -1534,7 +1535,7 @@ Measured, with the Windows release engine staged:
 | --- | --- |
 | `npm pack --dry-run` | 8 files, 536.5 kB packed, 1.4 MB unpacked |
 | contents | `LICENSE`, `README.md`, `index.js`, `lib/bindings.js`, `lib/discover.js`, `native/win32-x64/omni.dll`, `package.json`, `scripts/postinstall.js` |
-| `postinstall` | `bundled engine verified (win32-x64, ABI 4)` |
+| `postinstall` | `bundled engine verified (win32-x64, ABI 5)` |
 | extracted tarball, koffi on `NODE_PATH` | `42 | packaged npm | [ 2, 'two' ]` |
 
 The published tarball carries five engines, not one, so its packed size is
@@ -2172,7 +2173,7 @@ and the surface is additive within ABI 4. The Python suite adds eight profile
 tests and Node adds eight — both including the struct-layout pin and the
 missing-symbol fallback.
 
-Row 37 of `scripts/verify-all.sh` (§12) is the cross-host form of the same
+Row 37 of `scripts/verify-all.sh` (§14) is the cross-host form of the same
 facts: the two Rust suites, then `(2 + 3) * 4 - 8 / 2` evaluated in Python and
 Node must answer 16.0 with the whole expression collapsed to one `PUSH_FOLDED`
 dispatch (four folds, but the stream the VM runs is one push and one `RET`),
@@ -2317,7 +2318,7 @@ The suites:
   export (load, `omni_exec`, a missing library refused, a manifest-less image
   refused).
 
-Row 38 of `scripts/verify-all.sh` (§12) is the cross-host form: it builds the
+Row 38 of `scripts/verify-all.sh` (§14) is the cross-host form: it builds the
 fixture, runs the JIT suite with `--nocapture` (the speedup line becomes the
 row text), runs the plugin suite, and sends the same 2,000-term sum through
 both SDKs — which were not touched at all — requiring the same answer from
@@ -2332,7 +2333,200 @@ ahead of both tiers, and `Engine::exec` still means exactly what it did.
 
 ---
 
-## 12. Verification
+## 12. Phase 11 — Enterprise ABI v5 and cross-language permission control
+
+Phase 11 promotes the sandbox's permission surface from a Rust-embedder-only
+knob to a named part of the C contract. ABI v5 adds three fail-closed exports —
+`omni_engine_allow_fs_read`, `omni_engine_allow_fs_write`,
+`omni_engine_set_module_root` — so a Python or Node host can grant filesystem
+access to one engine instance at runtime, under the same isolation rules the
+core already enforced for Rust embedders. The design is
+`docs/superpowers/specs/2026-11-09-phase11-permissions-abi5-design.md`, with the
+deviations found during implementation recorded inline there; this section is
+the outcome.
+
+### 12.1 The ABI v5 contract
+
+Three exports, one shape each: `(OmniEngine *, const uint8_t *path, size_t
+path_len) -> uint32_t`. Every entry point that was already in the table is
+unchanged; `omni_abi_version()` now answers `5`, and `scripts/check-versions.py`
+demands that `omni.h`, the Python `_ffi.py`, the Node `bindings.js`, and the CLI
+updater all say the same number or the tree refuses to build a release. The
+path cap is `OMNI_MAX_PATH` — 4096 bytes — declared once in `omni.h` and
+mirrored by both SDKs so a host can refuse an oversized grant before crossing.
+
+A grant is engine-local and monotone for that engine's lifetime: once a root is
+allowed, it stays allowed. A fresh engine has no read root, no write root, and
+no module root, so `fs.read_text`, `fs.write_text`, and `import` all fail
+closed until the host grants one. The three sets are independent — a read
+grant does not enable writes, and neither enables imports.
+
+### 12.2 The front door
+
+All three exports funnel through one `grant_path` in `omni-ffi`: validate the
+handle and the bytes, canonicalize the path, then take the engine's borrow and
+hand the root to the core. Every failure is a status, never a crash:
+
+- a null engine or path, an empty path, a path over `OMNI_MAX_PATH`, or
+  non-UTF-8 bytes → `OMNI_ERR_ARG`;
+- a path the OS cannot canonicalize (nonexistent directory) → `OMNI_ERR_ARG`;
+- a call from inside a host callback → `OMNI_ERR_REENTRANT`, the same
+  `borrow_mut` guard every mutating export uses;
+- anything that would still panic is caught by the same `guarded()` panic
+  containment every entry point runs under.
+
+Canonicalization is what makes the grant meaningful: the core compares a
+requested path against the *canonical* roots, so a script that got
+`C:\Data` granted cannot reach `C:\Data\..\secret` by spelling it differently.
+
+### 12.3 Core semantics: deny, grant, and isolation
+
+The permission machinery itself is Phase 6's — this increment exposed it. A
+denied read fails with the positioned error `fs.read_text is disabled: this
+engine has no filesystem read permission`, and a granted-but-outside request
+fails with `path '<request>' is outside the allowed read roots` (write and
+import have their own texts). The denial is checked before the disk is touched,
+so a blocked `fs.write_text` creates nothing.
+
+Isolation follows the fork model from §9: `Engine::fork` deep-copies the three
+root sets, so every `omni_exec_parallel` worker inherits the parent's grants,
+while a sibling engine created independently sees none of them — a grant can
+never leak between engines, in the same process or across threads.
+
+### 12.4 The SDK wrappers
+
+Python adds three methods to `Engine`, each accepting a `str` or any
+`os.PathLike` (`os.fspath` converts it):
+
+```python
+engine.allow_fs_read("/srv/app-data")
+engine.allow_fs_write("/srv/app-data/out")
+engine.set_module_root("/srv/app-modules")
+```
+
+Node adds `allowFsRead`, `allowFsWrite`, and `setModuleRoot` on `Engine`. The
+path is marshalled as a byte buffer through koffi, a string containing a NUL is
+a `TypeError` before the call, and an empty path or one over the 4096-byte cap
+is refused in the wrapper with the argument status. Both wrappers raise
+`OmniLibraryError` — with the rebuild command in the message — when the loaded
+engine predates the exports, because a library that speaks ABI 4 has no
+permission surface to call. Non-permitted operations raise the ordinary
+`OmniError` with the engine's positioned text; the host process never crashes
+and never touches the disk.
+
+### 12.5 The suite and row 39
+
+`crates/omni-ffi/tests/permissions.rs` holds eight contract tests: the three
+exports each refuse the four malformed shapes (null, empty, over-long,
+non-UTF-8), an uncanonicalizable directory is an argument error, a
+deny→grant→read round trip works, a denied write leaves the disk untouched,
+the module root gates `import`, a grant made from inside a host callback is
+`OMNI_ERR_REENTRANT` and the engine lives on, and a grant never leaks into a
+sibling engine while parallel workers inherit it. The Python suite
+(`tests/test_permissions.py`) and the Node suite
+(`tests/permissions.test.js`) mirror the same sequence through their wrappers.
+
+Row 39 of `scripts/verify-all.sh` (§14) is the cross-host form: the Rust leg
+runs the eight contract tests, then the Python and Node legs each build a
+temporary directory inside their own process, deny, grant, read, grant, write,
+import a module, and confirm a sibling engine is still refused — one host at a
+time, so no path ever crosses a host boundary.
+
+### 12.6 What Phase 11 did not change
+
+Language v2, the 16-byte `OmniValue`, every existing export signature, error
+positions, the fail-closed defaults, and the Phase 7 step-budget machinery.
+`grant_path` is additive: an ABI 4 client that never calls the new exports gets
+exactly the behavior it got before, which is why the bump is safe for every
+existing surface in one lockstep step.
+
+---
+
+## 13. Phase 12 — Automated packaging verification and the artifact release gate
+
+Phases 5 and 6 built the packaging: platform wheels with the engine inside, an
+npm tarball with five engines, a C archive per target, and a tag-driven
+workflow that publishes them. Phase 12 closes the loop those phases left open:
+nothing checked that the artifacts a stranger receives actually contain the
+engine the tree claims to ship. `scripts/package-verify.py` is that check, and
+it now gates both the local verification suite (row 40) and the release
+workflow (`package-verify` runs after the wheels and the tarball exist and
+before PyPI, npm, or the GitHub Release see a byte).
+
+### 13.1 What the verifier checks
+
+`package-verify.py` reads files only — it never builds, loads, downloads, or
+publishes anything, which keeps it runnable on a bare CI image and honest
+about what it proves. For every archive, wheel, or tarball it unpacks:
+
+- **Container magic.** Each binary must start with the signature its platform
+  claims: `MZ` for Windows, `\x7fELF` for Linux, the Mach-O magic words for
+  macOS (thin and fat binaries are both accepted). A text file or a wrong
+  platform's library renamed to `omni.dll` fails here.
+- **The ABI 5 permission surface.** Every engine binary must contain the
+  export-name bytes `omni_engine_allow_fs_read`, `omni_engine_allow_fs_write`,
+  and `omni_engine_set_module_root`. An ABI 4 engine predates those symbols,
+  so this is a binary-level proof of the ABI level — searchable as bytes, with
+  no `objdump` or platform toolchain required.
+- **The VGPIL license.** The license text (`Vextalor Global Public &
+  Integration License`) must appear in the archive, so what ships under the
+  release is licensed as the repository says it is.
+- **ABI agreement.** A C archive's bundled `omni.h`, the wheel's and
+  tarball's declared surfaces, and the repository's four ABI declarations
+  (`omni.h`, Python `_ffi.py`, Node `bindings.js`, the CLI updater) must all
+  name the same number, checked with the same patterns `check-versions.py`
+  uses.
+- **The `.sha256` sidecar**, when one is passed, must match the archive's
+  bytes.
+
+The npm tarball is checked per platform bundle: `native/<platform>/<library>`
+must exist and pass the binary checks for every platform the manifest claims.
+Locally, where a checkout only carries the host platform's bundle, the
+default is *present platforms*; the release workflow passes
+`--require-all-platforms`, which demands all five bundles and fails the job
+otherwise. `scripts/prepack.js` remains the pre-publish guard inside the
+packaging step; `package-verify.py` is the independent second look at the
+finished bytes.
+
+### 13.2 The workflow gate
+
+`.github/workflows/release.yml` now splits publishing from packaging. The
+`npm-package` job builds and uploads the tarball but no longer publishes;
+`package-verify` downloads the five wheels and the tarball, unpacks all of
+them, and runs the verifier with `--require-all-platforms`. Only then do
+`pypi` (Trusted Publishing), the new `npm-publish` job (provenance-signed),
+and `github-release` run. A wheel or tarball built from stale sources — an
+ABI 4 engine, a missing permission export, a wrong-platform binary — fails
+the gate in CI instead of reaching a registry.
+
+### 13.3 Row 40
+
+Row 40 of `scripts/verify-all.sh` (§14) is the local form of the same gate
+and its integration half. It builds the release library, archives it with
+`scripts/package.py`, builds a wheel (`pip wheel`, when the interpreter has
+pip and setuptools) and an npm tarball carrying the release bytes, runs
+`package-verify.py` over all of them, and then *loads each package from its
+unpacked form*: the wheel is unzipped into a temporary directory and imported
+with `PYTHONPATH` — no pip install — and the tarball is extracted elsewhere
+and required with koffi resolved from the checkout only. Both must evaluate
+`let answer = 40 + 2` to 42. A package that verifies but does not load, or
+loads only from the checkout it was built in, still fails the row.
+
+The row takes the archive path from `package.py`'s own report rather than a
+glob because `dist/` is scratch: the first run of this row failed exactly as
+designed on a stale ABI 4 archive left there from Phase 5, which is the
+failure mode the whole phase exists to catch.
+
+### 13.4 What Phase 12 did not change
+
+No engine code, no ABI movement, no SDK surface. The wheel and tarball
+layouts, the prepack guard, and the update manifest are untouched; the
+verifier only reads them. `package-verify.py` is additive to the release
+pipeline — removing the gate leaves every earlier behavior intact.
+
+---
+
+## 14. Verification
 
 One command, and it is the acceptance test for the whole brief:
 
@@ -2389,6 +2583,122 @@ Rust tests... Deterministic fuzz harness... Concurrent execution contexts... Opt
 
 All checks that could run, passed.
 ```
+
+Measured output on 2026-11-09, with the Phase 11 permission increment in it —
+39 rows:
+
+```
+== OmniEngine cross-host verification ==
+   workspace: /d/OmniEngine
+
+Rust tests... Deterministic fuzz harness... Concurrent execution contexts... Optimizer, profiler, and their heatmaps... JIT throughput and the native plugin loader... ABI 5 permission grants and fail-closed isolation... Shared library... omni-cli... C embedding... Python SDK... Node SDK... A string is the same bytes in every host... One type error, the same text everywhere... Every surface agrees on the ABI level... String results do not grow memory... A host function answers the same bytes in every host... A host failure is data, and says so identically... Re-entering the engine from a callback is refused, not crashed... The registry says the same thing from both sides... A batch answers the same items in every host... A failing item names itself identically in every host... A batch counts items, not crossings, and reserves nothing extra... A batch inside a host callback is refused, not crashed... The DevPack math, string and type builtins answer the same in every host... A second-line error names line and byte column in every host... eval_str and eval hand back native values... The last execution timer crosses as microseconds... omni --version names what it speaks... a build that matches the release... a newer release is offered... another ABI is refused, not offered... a wrong checksum leaves the target alone... a dry run downloads nothing... a verified update replaces the bytes... a running binary updates itself...
+== Results ==
+  PASS  cargo test --workspace (406 tests)
+  PASS  fuzz harness: 1200 inputs x 4 stages, 1200 decoder chunks, 146 executed, 0 panics
+  PASS  7 concurrency tests, 64 gas-bounded items across 8 workers (1.4ms 44762 items/s)
+  PASS  11 optimizer tests, 6 profiler tests, one folded program profiled identically in: python node
+  PASS  JIT: 25823 ns/run vs VM: 1256834 ns/run (48.67x); 6 plugin tests; the same 2,000-term sum in: python node
+  PASS  8 permission contract tests; deny->grant->write->import->isolation in: python node
+  PASS  omni.dll (6.7M)
+  PASS  omni run examples/hello.omni -> 42
+  PASS  omni run examples/strings.omni -> hello, world 😀
+  PASS  examples/c/embed.c -> 42 via omni.h
+  PASS  python ctypes -> 42.0
+  PASS  python SDK tests (140 tests)
+  PASS  node koffi -> 42
+  PASS  node SDK tests (ℹ tests 142 ℹ pass 142 ℹ fail 0 )
+  PASS  concat + \u{...} identical in: cli python node
+  PASS  the mixed-type message survives the boundary in: cli python node c
+  PASS  ABI 5 declared and read identically: header=5 C=5 python=5/lib=5 node=5/lib=5
+  PASS  2000 string executions, one rewind each, reservation flat: python(65536 B) node(65536 B)
+  PASS  an argument crossed in and a string crossed back out, identically in: python node
+  PASS  an exception was caught at the boundary and named in: python node
+  PASS  a second borrow of the same handle errors and the engine lives on in: python node
+  PASS  three registrations, one removal, then the name is unknown in: python node
+  PASS  four items, one crossing, the same values in: python node
+  PASS  statuses 0 2 0 2 and the engine text for items 1 and 3, identically in: python node
+  PASS  8000 items in 1000 crossings, execs +8000, reservation flat: python(0 B) node(0 B)
+  PASS  a batch from a borrowed handle errors with the shared refusal text in: python node
+  PASS  math, string and type builtins reduce identically in: cli python node
+  PASS  line 2, column 13, and the operator's message in: cli python node
+  PASS  int/number, str/string, bool/boolean with no wrapper in: python node
+  PASS  one 200 KB execution timed, non-zero and in microseconds: python(988us) node(1040us)
+  PASS  omni --version -> omni 0.1.0 (language v2, ABI 5)
+  PASS  omni check-update -> 0, omni 0.1.0 is up to date (ABI 5)
+  PASS  omni check-update -> 10, omni 99.0.0 is available; this build is 0.1.0
+  PASS  omni check-update -> 11, release 99.0.0 speaks ABI 6; this build speaks ABI 5
+  PASS  omniup update -> 3, target unchanged
+  PASS  omniup update --dry-run -> 10, nothing fetched
+  PASS  omniup update -> 0, target now the release bytes
+  PASS  the replaced binary still runs: omni 0.1.0 (language v2, ABI 5)
+  PASS  omni update -> 0, the running image is kept at omni.exe.bak
+
+All checks that could run, passed.
+```
+
+Measured output on 2026-11-09, with the Phase 12 packaging-verification
+increment in it — 40 rows:
+
+```
+== OmniEngine cross-host verification ==
+   workspace: /d/OmniEngine
+
+Rust tests... Deterministic fuzz harness... Concurrent execution contexts... Optimizer, profiler, and their heatmaps... JIT throughput and the native plugin loader... ABI 5 permission grants and fail-closed isolation... Release artifacts package, verify, and load unpacked... Shared library... omni-cli... C embedding... Python SDK... Node SDK... A string is the same bytes in every host... One type error, the same text everywhere... Every surface agrees on the ABI level... String results do not grow memory... A host function answers the same bytes in every host... A host failure is data, and says so identically... Re-entering the engine from a callback is refused, not crashed... The registry says the same thing from both sides... A batch answers the same items in every host... A failing item names itself identically in every host... A batch counts items, not crossings, and reserves nothing extra... A batch inside a host callback is refused, not crashed... The DevPack math, string and type builtins answer the same in every host... A second-line error names line and byte column in every host... eval_str and eval hand back native values... The last execution timer crosses as microseconds... omni --version names what it speaks... a build that matches the release... a newer release is offered... another ABI is refused, not offered... a wrong checksum leaves the target alone... a dry run downloads nothing... a verified update replaces the bytes... a running binary updates itself...
+== Results ==
+  PASS  cargo test --workspace (406 tests)
+  PASS  fuzz harness: 1200 inputs x 4 stages, 1200 decoder chunks, 146 executed, 0 panics
+  PASS  7 concurrency tests, 64 gas-bounded items across 8 workers (1.5ms 43381 items/s)
+  PASS  11 optimizer tests, 6 profiler tests, one folded program profiled identically in: python node
+  PASS  JIT: 9904 ns/run vs VM: 577301 ns/run (58.29x); 6 plugin tests; the same 2,000-term sum in: python node
+  PASS  8 permission contract tests; deny->grant->write->import->isolation in: python node
+  PASS  archive wheel tarball verified ABI 5; unpacked loads in: python node
+  PASS  omni.dll (6.7M)
+  PASS  omni run examples/hello.omni -> 42
+  PASS  omni run examples/strings.omni -> hello, world 😀
+  PASS  examples/c/embed.c -> 42 via omni.h
+  PASS  python ctypes -> 42.0
+  PASS  python SDK tests (140 tests)
+  PASS  node koffi -> 42
+  PASS  node SDK tests (ℹ tests 142 ℹ pass 142 ℹ fail 0 )
+  PASS  concat + \u{...} identical in: cli python node
+  PASS  the mixed-type message survives the boundary in: cli python node c
+  PASS  ABI 5 declared and read identically: header=5 C=5 python=5/lib=5 node=5/lib=5
+  PASS  2000 string executions, one rewind each, reservation flat: python(65536 B) node(65536 B)
+  PASS  an argument crossed in and a string crossed back out, identically in: python node
+  PASS  an exception was caught at the boundary and named in: python node
+  PASS  a second borrow of the same handle errors and the engine lives on in: python node
+  PASS  three registrations, one removal, then the name is unknown in: python node
+  PASS  four items, one crossing, the same values in: python node
+  PASS  statuses 0 2 0 2 and the engine text for items 1 and 3, identically in: python node
+  PASS  8000 items in 1000 crossings, execs +8000, reservation flat: python(0 B) node(0 B)
+  PASS  a batch from a borrowed handle errors with the shared refusal text in: python node
+  PASS  math, string and type builtins reduce identically in: cli python node
+  PASS  line 2, column 13, and the operator's message in: cli python node
+  PASS  int/number, str/string, bool/boolean with no wrapper in: python node
+  PASS  one 200 KB execution timed, non-zero and in microseconds: python(1001us) node(1004us)
+  PASS  omni --version -> omni 0.1.0 (language v2, ABI 5)
+  PASS  omni check-update -> 0, omni 0.1.0 is up to date (ABI 5)
+  PASS  omni check-update -> 10, omni 99.0.0 is available; this build is 0.1.0
+  PASS  omni check-update -> 11, release 99.0.0 speaks ABI 6; this build speaks ABI 5
+  PASS  omniup update -> 3, target unchanged
+  PASS  omniup update --dry-run -> 10, nothing fetched
+  PASS  omniup update -> 0, target now the release bytes
+  PASS  the replaced binary still runs: omni 0.1.0 (language v2, ABI 5)
+  PASS  omni update -> 0, the running image is kept at omni.exe.bak
+
+All checks that could run, passed.
+```
+
+The sixth row is the Phase 12 increment (§13): it packages the release
+library into a C archive, builds a wheel and an npm tarball from the same
+bytes, runs `package-verify.py` over all of them — container magic, VGPIL
+text, the ABI 5 permission exports inside every binary, sidecar hash — and
+then loads each package from its unpacked form, the wheel via `PYTHONPATH`
+with no pip install and the tarball extracted outside the checkout, with both
+required to answer 42. Its first run failed exactly as designed on a stale
+ABI 4 archive left in `dist/` from Phase 5; the row now takes the archive
+path from `package.py`'s own report so scratch files cannot impersonate the
+build under test.
 
 `verify-all.sh` tests the four hosts against a checkout build. The release
 artifacts are checked separately, because they are what a consumer gets and
@@ -2464,7 +2774,7 @@ deleted. On Unix the same row asserts no backup is left.
 The script degrades to `SKIP` rather than lying. `cargo`, `gcc`, `python` and
 `node` each have their own guard, Node without `koffi` is skipped with
 `npm install koffi` in the reason, and each cross-host row skips itself when fewer
-than two hosts answered. Nothing was skipped on this machine — all thirty-eight
+than two hosts answered. Nothing was skipped on this machine — all forty
 rows ran. The Rust row runs the suite once into a log and reads its exit status;
 an earlier version piped cargo into `grep` under `pipefail`, which let a failing
 suite inherit a successful-looking pipeline and briefly hid a stale CLI test. `omni-wasm` has no row here because `wasm32-unknown-unknown` is not
@@ -2482,16 +2792,17 @@ Against the brief's five phases:
 | 4 | A custom extension GitHub recognises | `.gitattributes` tier 1; the tier-2 limit is stated in section 5.3 rather than glossed over |
 | 5 | `pip`/`npm` SDKs that do not move the language stats | 140 + 134 SDK tests; `linguist-vendored` on `sdks/**`; release packages carry a CI-built engine, checkouts carry none |
 
-Test totals: **261** in `omni-core` (237 unit, 7 in `tests/concurrency.rs`, 11 in
-`tests/optimizer.rs`, 6 in `tests/profiler.rs`), **85** in `omni-ffi` (22 unit,
+Test totals: **264** in `omni-core` (237 unit, 7 in `tests/concurrency.rs`, 11 in
+`tests/optimizer.rs`, 6 in `tests/profiler.rs`, 3 permission/fork isolation),
+**93** in `omni-ffi` (22 unit,
 13 in `tests/batch.rs`, 20 in `tests/ffi_contract.rs`, 8 in
 `tests/host_callbacks.rs`, 9 in `tests/parallel.rs`, 6 in `tests/plugin.rs`,
-and 7 in `tests/profile.rs`), **27** in `omni-cli` (12 library tests for the
+7 in `tests/profile.rs`, and 8 in `tests/permissions.rs`), **27** in `omni-cli` (12 library tests for the
 updater and the writer, 10 for `omni`, 5 for `omniup`), **15** in `omni-jit`
-(10 unit, 5 in `tests/jit.rs`), **7** in `omni-wasm`, **140** Python, **134**
-Node — 395 in `cargo test --workspace`. The batch, callback, parallel,
-profile, and plugin suites are contract tests against the header, not unit
-tests of the implementation they sit next to.
+(10 unit, 5 in `tests/jit.rs`), **7** in `omni-wasm`, **140** Python, **142**
+Node — 406 in `cargo test --workspace`. The batch, callback, parallel,
+profile, plugin, and permission suites are contract tests against the header,
+not unit tests of the implementation they sit next to.
 
 Static checks are part of the definition of done:
 
@@ -2502,7 +2813,7 @@ cargo fmt --all --check                                  # clean
 
 ---
 
-## 13. Storage ledger
+## 15. Storage ledger
 
 Measured, all of it on this machine, at the time of writing. Sizes are `du`,
 which is what the drive charges; file-byte totals differ because the registry
@@ -2514,7 +2825,7 @@ cache and cargo's `deps` contain hardlinks.
 | `target/` total | **351 MB** | D: | 21 MB under `target/release`; release builds are the expensive part |
 | `target/debug/omni.dll` | 5.4 MB | D: | the artifact a checkout's hosts load |
 | `target/release/omni.dll` | 1.3 MB | D: | the artifact a release package carries |
-| `dist/` | 1.6 MB | D: | one wheel and two C archives, locally built |
+| `dist/` | 1.7 MB | D: | the row-40 ABI 5 zip and its sidecar, plus stale ABI 4 wheel/archive leftovers the verifier exists to refuse |
 | `CARGO_HOME` | 969 MB | C: | 897 MB registry + 170 MB `bin` by file size; none of it from this project |
 | `sdks/nodejs/node_modules` | 2.9 MB | D: | koffi prebuild, gitignored |
 | Free on C: | **6.5 GB** (94 % used) | | the binding constraint |
@@ -2539,7 +2850,7 @@ complexity one.
 
 ---
 
-## 14. Troubleshooting
+## 16. Troubleshooting
 
 **`link: missing operand after '■'`** — MSVC's linker is being shadowed by Git
 for Windows' coreutils `link.exe`. Run `where link`. This workspace pins the GNU
@@ -2646,7 +2957,7 @@ the call site.
 
 ---
 
-## 15. What comes next
+## 17. What comes next
 
 Three increments shipped after the first bridge. Strings made `OmniValue` a union,
 promoted a result's bytes into a block a host can copy from, and made
@@ -2680,7 +2991,17 @@ straight-line expression chunks to native code (56x measured, with a
 deopt-on-error seam that keeps every error text in the VM where it lives) and
 a verified native plugin loader behind one additive export
 (`omni_engine_load_plugin`), so a `.dll` / `.so` can grow the engine's
-function table under the same rules a host callback obeys. The next
+function table under the same rules a host callback obeys. An eleventh moved
+the ABI on purpose for the first time since v4: three fail-closed permission
+exports (`omni_engine_allow_fs_read` / `omni_engine_allow_fs_write` /
+`omni_engine_set_module_root`) make the sandbox configurable from Python and
+Node, one engine at a time, with the same deny→grant→isolate contract the
+Rust embedder already had. A twelfth added no engine code at all: it made the
+packaging prove itself. `scripts/package-verify.py` unpacks every archive,
+wheel, and tarball and checks container magic, the VGPIL license text, and
+the ABI 5 permission exports inside each binary before any of it can reach
+PyPI, npm, or a GitHub Release, and verify-all row 40 loads the unpacked
+wheel and tarball outside the checkout. The next
 language increment is still the one section 3.7 lists — control flow,
 collections, and user-defined functions.
 
@@ -2725,8 +3046,9 @@ What the same memory model is still waiting for, in rough order:
 6. **Linguist tier 2.** The upstream PR from section 5.3, which would also make
    the new `examples/strings.omni` show up under its own language name.
 7. **A step-limit knob for the SDKs, and continuous libFuzzer.** `set_step_limit`
-   is Rust-only in Phase 7; exposing it (and a per-call override) is an ABI 5
-   decision, deliberately not taken here. The cargo-fuzz project is ready, but
+   is Rust-only in Phase 7; exposing it (and a per-call override) is an
+   additive export on the ABI 5 surface or a future bump, deliberately not
+   taken here. The cargo-fuzz project is ready, but
    this machine has no nightly toolchain, so running it on a schedule is a CI
    change rather than a code change.
 8. **Parallel host callbacks from Node.** `runParallel` falls back to the

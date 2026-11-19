@@ -70,6 +70,21 @@ execution and is engine-local, so parallel workers and forked engines cannot
 observe each other. The export table goes from 17 to 20; nothing else in the
 ABI moved.
 
+**A JIT tier and native plugins.** Straight-line chunks — the whole
+expression language — compile to native machine code with Cranelift and run
+as a parameterless leaf function; a 2,000-term sum measures 56× faster than
+VM dispatch on the same chunk. The tier executes only the happy path: any
+condition the VM would raise branches to a deopt that re-runs the same
+chunk on the VM, so runtime errors keep their line and column by
+construction, and results are bit-identical with or without the tier.
+`omni_engine_load_plugin` adds one export and leaves ABI 4 alone: it loads a
+`.dll` / `.so`, verifies its `omni_plugin_manifest` fail-closed (magic,
+size, ABI versions, name rules, function caps), registers its functions as
+host functions, and pins the library for the engine's lifetime. A plugin
+that panics must catch its own panics at its exported boundaries — a
+statically-linked-std cdylib's panic is a foreign exception the host cannot
+catch on Windows.
+
 **Hardened execution.** A program cannot run forever or grow without bound. Each
 top-level execution carries a deterministic budget of 16,777,216 VM
 instructions, shared with every module it imports, and a backward jump or an
@@ -110,7 +125,7 @@ Both SDKs can report the same answer (`omni.check_updates()`,
 in the engine's `omni_check_update` export so every surface agrees on what
 "newer" means. Plain HTTP is refused by default.
 
-**Quality.** 37 of 37 cross-host verification rows pass on this machine: 373
+**Quality.** 38 of 38 cross-host verification rows pass on this machine: 395
 Rust tests, 140 Python, 134 Node, plus the C embedding example and the
 deterministic fuzz harness. `cargo fmt --check` and `cargo clippy -- -D
 warnings` are clean.
