@@ -10,8 +10,9 @@
 # Later sections take one answer through every host that is present and compare
 # what came back: strings and errors, a function the host owns, one crossing for
 # many programs, the DevPack surfaces, the profiler heatmaps, the JIT and the
-# plugin loader, and finally the update path -- a release check, a refused
-# checksum, and a binary that replaces itself. That comparison is the only way
+# plugin loader, the ABI 5 permission grants, and finally the update path -- a
+# release check, a refused checksum, and a binary that replaces itself. That
+# comparison is the only way
 # to catch a bridge that is internally consistent and externally wrong.
 #
 # Exits non-zero if anything that could run, failed.
@@ -31,6 +32,20 @@ pass() { record "PASS  $1"; }
 skip() { record "SKIP  $1 ($2)"; }
 fail() { record "FAIL  $1"; failures=$((failures + 1)); }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# The npm bundle key for the machine this script runs on. Defined before the
+# rows that pack or load a tarball; the Node SDK row below uses it too.
+host_platform() {
+  local machine
+  machine=$(uname -m 2>/dev/null || echo unknown)
+  case "$OSTYPE" in
+    msys*|cygwin*|win32*) echo win32-x64 ;;
+    darwin*)
+      case "$machine" in arm64|aarch64) echo darwin-arm64 ;; *) echo darwin-x64 ;; esac ;;
+    *)
+      case "$machine" in aarch64|arm64) echo linux-arm64 ;; *) echo linux-x64 ;; esac ;;
+  esac
+}
 
 # The Phase 2 and Phase 3 programs, defined once and used by several rows below.
 # They are written here rather than inline because a shell string inside $()
@@ -280,6 +295,257 @@ else
   tail -20 "$OUT/plugin.log"
 fi
 
+# ---------------------------------------------------- Phase 11: dynamic permissions
+#
+# The row is the sandbox's whole proof in one place. The FFI contract suite
+# asserts the fail-closed default, the positioned denials, re-entrancy refusal,
+# and the isolation rules at the raw-ABI level. Each host then re-proves the
+# same sequence through its own SDK, entirely inside its own process: every
+# temporary path is created and removed by the host that uses it, so no path
+# ever crosses a host boundary. The sequence is deny -> grant -> read ->
+# grant -> write -> module import, then a sibling engine that must stay denied.
+printf 'ABI 5 permission grants and fail-closed isolation... '
+if cargo test -p omni-ffi --test permissions >"$OUT/permissions.log" 2>&1; then
+  perm=$(grep -oE '[0-9]+ passed' "$OUT/permissions.log" | awk '{s += $1} END {print s+0}')
+  perm_hosts=''
+  perm_wrong=''
+  py_host=''
+  if have python || have py; then
+    py_host=$(have python && echo python || echo "py -3")
+  fi
+  if [[ -n "$py_host" ]]; then
+    got=$(cd sdks/python && $py_host - <<'PY' 2>&1
+import pathlib, shutil, sys, tempfile
+sys.path.insert(0, ".")
+import omni
+root = tempfile.mkdtemp(prefix="omni-verify-perm-")
+inside = pathlib.Path(root) / "in.txt"
+inside.write_text("7", encoding="utf-8")
+(pathlib.Path(root) / "helper.omni").write_text("let answer = 40 + 2", encoding="utf-8")
+q = lambda p: '"' + str(p).replace("\\", "\\\\") + '"'
+e = omni.Engine()
+sibling = omni.Engine()
+try:
+    denied = ""
+    try:
+        e.run("fs.read_text(%s)" % q(inside))
+    except omni.OmniError as err:
+        denied = err.message
+    if "no filesystem read permission" not in denied:
+        raise SystemExit("read not fail-closed: %r" % denied)
+    e.allow_fs_read(root)
+    if e.run("fs.read_text(%s)" % q(inside)).value != "7":
+        raise SystemExit("grant did not open the root")
+    e.allow_fs_write(root)
+    e.run("fs.write_text(%s, \"owned\")" % q(pathlib.Path(root) / "out.txt"))
+    e.set_module_root(root)
+    if e.run('import "helper"\nhelper.answer').value != 42.0:
+        raise SystemExit("module root grant failed")
+    try:
+        sibling.run("fs.read_text(%s)" % q(inside))
+        raise SystemExit("a grant leaked into a sibling engine")
+    except omni.OmniError:
+        pass
+    print("ok")
+finally:
+    e.close()
+    sibling.close()
+    shutil.rmtree(root, ignore_errors=True)
+PY
+)
+    [[ "$got" == "ok" ]] && perm_hosts+=' python' || perm_wrong+=" python='$got'"
+  fi
+  if have node && [[ -d sdks/nodejs/node_modules/koffi ]]; then
+    got=$(cd sdks/nodejs && node - <<'JS' 2>&1
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { Engine } = require('./index.js');
+const root = fs.mkdtempSync(path.join(os.tmpdir(), 'omni-verify-perm-'));
+const inside = path.join(root, 'in.txt');
+fs.writeFileSync(inside, '7');
+fs.writeFileSync(path.join(root, 'helper.omni'), 'let answer = 40 + 2');
+const q = (p) => `"${String(p).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+const e = new Engine();
+const sibling = new Engine();
+try {
+  let denied = '';
+  try { e.run(`fs.read_text(${q(inside)})`); } catch (err) { denied = err.message; }
+  if (!denied.includes('no filesystem read permission')) throw new Error(`read not fail-closed: ${denied}`);
+  e.allowFsRead(root);
+  if (e.run(`fs.read_text(${q(inside)})`).value !== '7') throw new Error('grant did not open the root');
+  e.allowFsWrite(root);
+  e.run(`fs.write_text(${q(path.join(root, 'out.txt'))}, "owned")`);
+  e.setModuleRoot(root);
+  if (e.run('import "helper"\nhelper.answer').value !== 42) throw new Error('module root grant failed');
+  let leaked = false;
+  try { sibling.run(`fs.read_text(${q(inside)})`); leaked = true; } catch {}
+  if (leaked) throw new Error('a grant leaked into a sibling engine');
+  console.log('ok');
+} finally {
+  e.close();
+  sibling.close();
+  fs.rmSync(root, { recursive: true, force: true });
+}
+JS
+)
+    [[ "$got" == "ok" ]] && perm_hosts+=' node' || perm_wrong+=" node='$got'"
+  fi
+  if [[ -n "$perm_wrong" ]]; then
+    fail "permission grants misbehave through:$perm_wrong"
+  else
+    pass "${perm:-?} permission contract tests; deny->grant->write->import->isolation in:$perm_hosts"
+  fi
+else
+  fail "permission contract suite"
+  tail -20 "$OUT/permissions.log"
+fi
+
+# ---------------------------------------------------- Phase 12: artifacts that survive outside the repo
+#
+# Everything above proves the engine in the tree. This row proves what a
+# stranger receives: package.py archives the release library, a wheel and an
+# npm tarball are built from those same bytes, package-verify unpacks all of
+# it and checks container magic, the VGPIL license text, and the ABI 5
+# permission exports inside every binary, and then each package is loaded
+# from its unpacked form -- the wheel by Python without pip, the tarball by
+# Node from a directory that is not the SDK checkout. A package that only
+# verifies but does not load, or loads only from the checkout, would still
+# fail here.
+printf 'Release artifacts package, verify, and load unpacked... '
+if ! have cargo; then
+  skip "release artifact gate" "cargo not on PATH"
+elif ! have python && ! have py; then
+  skip "release artifact gate" "python not on PATH"
+else
+  PY=$(have python && echo python || echo "py -3")
+  art_hosts=''
+  art_wrong=''
+  if ! cargo build --release -p omni-ffi >"$OUT/release-build.log" 2>&1; then
+    fail "cargo build --release -p omni-ffi"
+    tail -20 "$OUT/release-build.log"
+  else
+    rel_lib="$ROOT/target/release/$(case "$OSTYPE" in
+      msys*|cygwin*|win32*) echo omni.dll ;;
+      darwin*) echo libomni.dylib ;;
+      *) echo libomni.so ;;
+    esac)"
+    archive=''
+    if [[ ! -f "$rel_lib" ]]; then
+      fail "expected release artifact $rel_lib was not produced"
+    else
+      # The archive this build just produced, taken from package.py's own
+      # report rather than a glob: dist/ is scratch and can hold stale
+      # archives from an older ABI, which must not be what this row proves.
+      archive=$($PY scripts/package.py 2>"$OUT/package.log" \
+        | awk '/^package: .*[\\\/]dist[\\\/]/ { print $2; exit }' \
+        | sed 's|\\|/|g')
+      if [[ -z "$archive" || ! -f "$archive" ]]; then
+        fail "scripts/package.py did not produce an archive: $(tail -3 "$OUT/package.log" | tr '\n' ' ')"
+        archive=''
+      fi
+    fi
+    if [[ -n "$archive" ]]; then
+      artifacts=("$archive" "$archive.sha256")
+      art_kinds=' archive'
+
+      # The wheel, when this Python can build one. pip and setuptools are
+      # checked rather than assumed so a bare interpreter reports a skipped
+      # leg instead of a wall of traceback.
+      wheel=''
+      if $PY -c "import setuptools" >/dev/null 2>&1 && $PY -m pip --version >/dev/null 2>&1; then
+        rm -rf "$OUT/wheelhouse"
+        mkdir -p "$OUT/wheelhouse"
+        if OMNI_NATIVE="$rel_lib" OMNI_REQUIRE_NATIVE=1 $PY -m pip wheel \
+            --no-deps --no-build-isolation sdks/python -w "$OUT/wheelhouse" \
+            >"$OUT/wheel.log" 2>&1; then
+          wheel=$(ls "$OUT/wheelhouse"/omniengine-*.whl 2>/dev/null | head -1)
+        fi
+        if [[ -z "$wheel" ]]; then
+          art_wrong+=" wheel-build='$(tail -2 "$OUT/wheel.log" | tr '\n' ' ')'"
+        else
+          artifacts+=("$wheel")
+          art_kinds+=' wheel'
+        fi
+      fi
+
+      # The npm tarball, carrying the release library in the bundle so the
+      # bytes verified are the bytes shipped.
+      tgz=''
+      if have node && have npm; then
+        bundle_dir="sdks/nodejs/native/$(host_platform)"
+        mkdir -p "$bundle_dir"
+        cp -f "$rel_lib" "$bundle_dir/"
+        if (cd sdks/nodejs && npm pack --silent) >"$OUT/npm-pack.log" 2>&1; then
+          tgz=$(ls sdks/nodejs/omniengine-*.tgz 2>/dev/null | head -1)
+        fi
+        if [[ -z "$tgz" ]]; then
+          art_wrong+=" npm-pack='$(tail -2 "$OUT/npm-pack.log" | tr '\n' ' ')'"
+        else
+          artifacts+=("$tgz")
+          art_kinds+=' tarball'
+        fi
+      fi
+
+      if [[ -n "$art_wrong" ]]; then
+        fail "release artifacts could not be built:$art_wrong"
+      elif ! $PY scripts/package-verify.py "${artifacts[@]}" >"$OUT/package-verify.log" 2>&1; then
+        fail "package-verify: $(grep FAIL "$OUT/package-verify.log" | tr '\n' ' ')"
+      else
+        # Load the wheel from where an unzip put it, not from the checkout.
+        if [[ -n "$wheel" ]]; then
+          wdir=$(mktemp -d)
+          if $PY -m zipfile -e "$wheel" "$wdir" >/dev/null 2>&1; then
+            got=$(PYTHONPATH="$wdir" $PY -c '
+import omni
+print(omni.Engine().evaluate("let answer = 40 + 2"))
+' 2>&1)
+            if [[ "$got" == *42.0* ]]; then art_hosts+=' python'
+            else art_wrong+=" wheel-load='$got'"; fi
+          else
+            art_wrong+=" wheel-unzip"
+          fi
+          rm -rf "$wdir"
+        fi
+        # Load the tarball from an extracted directory, with koffi resolved
+        # from the SDK checkout only -- the package itself is elsewhere.
+        if [[ -n "$tgz" && -d sdks/nodejs/node_modules/koffi ]]; then
+          ndir=$(mktemp -d)
+          if tar -xzf "$tgz" -C "$ndir" >/dev/null 2>&1 \
+              && [[ -d "$ndir/package" ]]; then
+            got=$(cd "$ndir/package" && NODE_PATH="$ROOT/sdks/nodejs/node_modules" node -e '
+const { Engine } = require("./index.js");
+const e = new Engine();
+console.log(e.evaluate("let answer = 40 + 2"));
+e.close();
+' 2>&1)
+            if [[ "$got" == *42* ]]; then art_hosts+=' node'
+            else art_wrong+=" tarball-load='$got'"; fi
+          else
+            art_wrong+=" tarball-extract"
+          fi
+          rm -rf "$ndir"
+        fi
+        if [[ -n "$art_wrong" ]]; then
+          fail "unpacked artifacts:$art_wrong"
+        else
+          pass "${art_kinds# } verified ABI 5; unpacked loads in:${art_hosts:- no packaging host}"
+        fi
+      fi
+    fi
+  fi
+fi
+
+# -------------------------------------------------------------------- Row 41: distributed cluster
+printf 'Distributed cluster execution and fault recovery... '
+if cargo test -p omni-cluster --test cluster >"$OUT/cluster.log" 2>&1; then
+  cluster_count=$(grep -oE '[0-9]+ passed' "$OUT/cluster.log" | awk '{s += $1} END {print s+0}')
+  pass "Row 41: omni-cluster zero-loss fanout/failover (${cluster_count:-0} integration tests)"
+else
+  fail "Row 41: omni-cluster distributed execution"
+  tail -20 "$OUT/cluster.log"
+fi
+
 printf 'Shared library... '
 if cargo build -p omni-ffi >"$OUT/build.log" 2>&1; then
   lib="$ROOT/target/debug/$(case "$OSTYPE" in
@@ -364,6 +630,15 @@ if have node; then
   if [[ ! -d sdks/nodejs/node_modules/koffi ]]; then
     skip "Node SDK" "run: cd sdks/nodejs && npm install koffi"
   else
+    # A gitignored bundle in native/<platform> shadows the fresh target/debug
+    # artifact; refresh it so an ABI bump cannot make every Node row fail on a
+    # stale copy.
+    bundle_dir="sdks/nodejs/native/$(host_platform)"
+    if [[ -d "$bundle_dir" && -f target/debug/omni.dll ]]; then
+      cp -f target/debug/omni.dll "$bundle_dir/" 2>/dev/null || true
+    elif [[ -d "$bundle_dir" && -f target/debug/libomni.so ]]; then
+      cp -f target/debug/libomni.so "$bundle_dir/" 2>/dev/null || true
+    fi
     node_out=$(cd sdks/nodejs && node -e '
       const { Engine } = require("./index.js");
       const e = new Engine();
@@ -1105,18 +1380,6 @@ sha_of() {
 # updater. The exclusion is per-command, so nothing else in this script changes.
 update_cmd() {
   MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "$@"
-}
-
-host_platform() {
-  local machine
-  machine=$(uname -m 2>/dev/null || echo unknown)
-  case "$OSTYPE" in
-    msys*|cygwin*|win32*) echo win32-x64 ;;
-    darwin*)
-      case "$machine" in arm64|aarch64) echo darwin-arm64 ;; *) echo darwin-x64 ;; esac ;;
-    *)
-      case "$machine" in aarch64|arm64) echo linux-arm64 ;; *) echo linux-x64 ;; esac ;;
-  esac
 }
 
 as_url() {
