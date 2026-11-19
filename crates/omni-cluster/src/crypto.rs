@@ -173,7 +173,8 @@ fn chacha20_block(key: &[u8; 32], nonce: &[u8; 12], counter: u32) -> [u8; 64] {
     let mut state = [0u32; 16];
     state[..4].copy_from_slice(&[0x6170_7865, 0x3320_646e, 0x7962_2d32, 0x6b20_6574]);
     for i in 0..8 {
-        state[4 + i] = u32::from_le_bytes([key[i * 4], key[i * 4 + 1], key[i * 4 + 2], key[i * 4 + 3]]);
+        state[4 + i] =
+            u32::from_le_bytes([key[i * 4], key[i * 4 + 1], key[i * 4 + 2], key[i * 4 + 3]]);
     }
     state[12] = counter;
     for i in 0..3 {
@@ -428,7 +429,11 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// Derive the two directional record keys from a PSK and the handshake
 /// nonces. The layout is TLS-1.3-PSK-shaped: extract with an empty salt, one
 /// expand with a transcript-shaped info string, 64 bytes split c2s / s2c.
-pub(crate) fn channel_keys(psk: &[u8; 32], client_nonce: &[u8; 12], server_nonce: &[u8; 12]) -> ([u8; 32], [u8; 32]) {
+pub(crate) fn channel_keys(
+    psk: &[u8; 32],
+    client_nonce: &[u8; 12],
+    server_nonce: &[u8; 12],
+) -> ([u8; 32], [u8; 32]) {
     let prk = hkdf_extract(psk, &[]);
     let mut info = Vec::with_capacity(24 + 24);
     info.extend_from_slice(b"omni-cluster channel v1");
@@ -475,7 +480,9 @@ mod tests {
         }
         let _ = base;
         assert_eq!(
-            hex_encode(&sha256(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")),
+            hex_encode(&sha256(
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+            )),
             "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
         );
     }
@@ -526,8 +533,15 @@ mod tests {
         let nonce = hex("070000004041424344454647");
         let aad = hex("50515253c0c1c2c3c4c5c6c7");
         let plaintext = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
-        let sealed = aead_seal(key[..32].try_into().unwrap(), nonce[..12].try_into().unwrap(), &aad, plaintext);
-        let expect_ct = hex("d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b6116");
+        let sealed = aead_seal(
+            key[..32].try_into().unwrap(),
+            nonce[..12].try_into().unwrap(),
+            &aad,
+            plaintext,
+        );
+        let expect_ct = hex(
+            "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b6116",
+        );
         assert_eq!(sealed[16..], expect_ct[..]);
         assert_eq!(
             hex_encode(&sealed[..16]),

@@ -43,9 +43,9 @@ static COUNTED: counted::Counting = counted::Counting;
 pub use arena::{Arena, Mark};
 pub use bytecode::{OPCODE_COUNT, opcode_name};
 pub use engine::{
-    BatchItem, DEFAULT_STEP_LIMIT, Engine, ErrorKind, HostCall, HostError, HostOutcome, MAX_ARGS,
-    MAX_CALL_DEPTH, MAX_IDENTIFIER_LEN, MAX_MODULE_DEPTH, MAX_NESTING, MAX_STACK_DEPTH, OmniError,
-    Profile, Stats,
+    BatchItem, CPU_LIMIT_MESSAGE, DEFAULT_STEP_LIMIT, Engine, ErrorKind, HostCall, HostError,
+    HostOutcome, MAX_ARGS, MAX_CALL_DEPTH, MAX_IDENTIFIER_LEN, MAX_MODULE_DEPTH, MAX_NESTING,
+    MAX_STACK_DEPTH, MEMORY_LIMIT_MESSAGE, OmniError, Profile, Stats,
 };
 pub use lexer::{BinOp, LexError, MAX_SOURCE_LEN, Token, TokenKind, lex, lex_into};
 pub use object::{MAX_STRING_LEN, StrRef};

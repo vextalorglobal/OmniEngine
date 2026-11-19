@@ -1,491 +1,184 @@
 # OmniEngine
 
-OmniEngine is Vextalor Global's high-performance execution engine for local,
-self-hosted, and managed cloud workloads.
+OmniEngine is a Rust-based execution platform from Vextalor Global. It includes
+a compact language engine and CLI, C FFI and local SDKs, a TLS REST gateway for
+policy-bounded remote execution, and a localhost Execution Studio.
 
-A custom programming language and the ecosystem around it: a Rust core with no
-garbage collector, a C ABI that Python, Node, and C can call directly, and a
-CLI that runs `.omni` files.
+The project supports two deployment models:
 
-This is a **runnable engine**, not a toy skeleton. `let answer = 40 + 2`
-evaluates to `42`, and `"hello, " + "world"` evaluates to `hello, world`, through
-the same code path from four hosts — Rust, C, Python, and Node — and a script can
-call *back* into whichever host embeds it. One crossing can carry several
-programs at once (`run_many` / `runMany` / `omni_exec_many`), and on a multi-core
-host that crossing can be spread over worker engines (`run_parallel` /
-`runParallel` / `omni_exec_parallel`). The performance
-numbers in this repository are measured runs, not promises: `scripts/bench.sh`
-prints them for this machine. Every claim below is covered by a test that has
-been run on this machine.
+- **Local / self-hosted:** execute on the user's device or server through the
+  CLI, C ABI, or Python and Node.js SDKs. Execution does not send source or
+  results to an OmniEngine service and is not subject to the gateway's API
+  quota.
+- **Managed API:** send a request to the HTTPS gateway. Only the data included
+  in that request is processed remotely. The gateway authenticates the request,
+  applies tier and sandbox limits, and can dispatch supported work to a
+  configured worker pool.
 
-## Deployment model
+## Features
 
-OmniEngine supports two deployment modes:
+- **OmniEngine runtime:** a Rust lexer, compiler, bytecode VM, and native
+  execution paths, accessible from Rust, the CLI, C, Python, and Node.js.
+- **Gateway:** `omni-gateway` serves TLS REST on port `8443` by default, with
+  bearer-token authentication for execution, health and language discovery
+  endpoints, durable quota/rate state, and structured JSON errors.
+- **Sandbox policy:** the managed Free Tier defaults to 50ms CPU, 128MiB
+  sandbox memory, 100,000 requests per month, and 10 concurrent requests per
+  key. Source and output are size-limited. Filesystem, network, imports, and
+  host functions are disabled by default.
+- **Worker cluster:** the gateway can dispatch OmniEngine work over
+  certificate-verified TLS with separate cluster credentials. Deterministic
+  verification requires a configured worker quorum; it does not silently
+  substitute a single result.
+- **Execution Studio:** the local dashboard at `http://localhost:3000` includes
+  Arithmetic, Gas limit, Memory load, and Unicode text presets; round-trip,
+  sandbox-usage, quota, and health telemetry; execution history; and a
+  structured result/error inspector.
+- **Languages and Unicode:** `omni` is the default runtime; embedded Lua 5.4 is
+  also available in the gateway. JavaScript, Python, and WebAssembly are listed
+  for discovery but are not currently executable by the gateway. Source,
+  comments, string literals, inputs, and outputs support UTF-8, including
+  Bengali and other scripts. Identifiers remain ASCII-only.
 
-- **Self-hosted / local SDKs** are free and unrestricted by OmniEngine API
-  quotas. Execution stays on the user's device or server, adds no network
-  latency, and keeps submitted data local. The host operator remains responsible
-  for local CPU, memory, and filesystem policy.
-- **Managed Cloud / SaaS** executes source received through a remote API
-  request in an isolated sandbox. Cloud execution processes only the source,
-  configuration, and response data included in that request; it does not receive
-  unrelated local files or data.
+See [docs/HYBRID-DEPLOYMENT.md](docs/HYBRID-DEPLOYMENT.md) for deployment
+guidance and [docs/CLOUD-API.md](docs/CLOUD-API.md) for the API contract,
+limits, and runtime availability.
 
-The architecture, gateway contract, and default usage tiers are specified in
-[`docs/HYBRID-DEPLOYMENT.md`](docs/HYBRID-DEPLOYMENT.md),
-[`docs/CLOUD-API.md`](docs/CLOUD-API.md), and
-[`policies/usage-tiers.toml`](policies/usage-tiers.toml).
+## Quick start on Windows
 
-## Get started in 60 seconds
+Requirements: Rust/Cargo and Node.js on `PATH`. From the repository root, run:
 
-Every path ends at the same engine and the same bytes.
-
-**Python** — standard library only; release wheels carry the engine.
-
-```bash
-pip install omniengine
-python -c "import omni; print(omni.Engine().evaluate('40 + 2'))"   # 42.0
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev-up.ps1
 ```
 
-**Node** — one native dependency (`koffi`); the package carries the engine.
+The bootstrap builds the gateway and its native certificate helper, creates
+the local TLS certificate and key, writes `.dev\gateway.toml`, creates a
+random local API key, then starts the gateway and dashboard bridge. It opens
+the Studio in your browser at <http://localhost:3000>. Press `Ctrl+C` in that
+PowerShell session to stop both services.
 
-```bash
-npm install omniengine koffi
-node -e "const {Engine}=require('omniengine'); const e=new Engine(); console.log(e.evaluate('40 + 2')); e.close()"
+The local gateway listens on `https://127.0.0.1:8443`. The development bridge
+proxies requests from the browser, so the browser does not need to handle the
+self-signed gateway certificate directly. The bootstrap wires the local API
+key into the dashboard session. You can also generate a key in the Studio's
+**API Key Generator** panel and select **Use in Studio**.
+
+All local certificates, keys, quota state, and logs live under `.dev\`. That
+directory is gitignored and must remain local; do not commit its contents.
+`config\cloud-api.example.toml` is a deployment template, not a local
+certificate bundle. The bootstrap derives its local configuration from that
+template and binds only to loopback.
+
+### Run a sample execution
+
+In the Studio, leave **OmniEngine** selected, use the **Arithmetic** preset,
+and press **Run Execution** (or `Ctrl+Enter`). The result should be `42`.
+Choose **Lua 5.4** to try its language-specific presets, including the
+multi-script Unicode example.
+
+You can also exercise the bridge from another PowerShell window:
+
+```powershell
+$config = Invoke-RestMethod http://127.0.0.1:3000/api/config
+Invoke-RestMethod http://127.0.0.1:3000/api/health
+Invoke-RestMethod http://127.0.0.1:3000/api/execute `
+  -Method Post `
+  -Headers @{ Authorization = "Bearer $($config.api_key)" } `
+  -ContentType 'application/json' `
+  -Body '{"source":"40 + 2"}'
 ```
 
-**C** — download the archive for your platform from the
-[releases page](https://github.com/fahim5536/OmniEngine/releases), then:
+The API key is returned only by the loopback development bridge and should not
+be copied into logs, source control, or shared terminals.
 
-```bash
-# Windows archive: MSVC import library
-cl /std:c11 /I include examples\c\embed.c lib\omni.dll.lib
-set PATH=%CD%\lib;%PATH% && embed.exe      # all embedding checks pass
+## Gateway API
 
-# Linux / macOS archive: link the shared library directly
-cc -std=c11 -I include examples/c/embed.c -L lib -lomni \
-   -Wl,-rpath,'$ORIGIN/lib' -o embed
-./embed
+The main routes are:
+
+| Method | Route | Authentication | Purpose |
+| --- | --- | --- | --- |
+| `POST` | `/v1/execute` | Bearer token | Execute source under gateway policy |
+| `GET` | `/v1/health` | None | Aggregate gateway health and metrics |
+| `GET` | `/v1/languages` | None | Runtime availability, capabilities, and limits |
+
+Example request:
+
+```json
+{
+  "language": "omni",
+  "source": "40 + 2",
+  "gas_limit": 50000,
+  "timeout_ms": 50
+}
 ```
 
-The Windows archive is built with MSVC, so its import library is
-`lib\omni.dll.lib`. This machine builds with the GNU toolchain, where the same
-example links against `lib\libomni.dll.a` — that is the C path tested in the
-checkout (`examples/c/embed.c`).
+The `language` field is optional; omitting it preserves compatibility and
+selects `omni`. Use `language: "lua"` with standard Lua `return` syntax for the
+embedded Lua 5.4 runtime. Lua exposes only base and math libraries and has
+instruction, time, and VM memory limits. It does not support worker-cluster
+dispatch or deterministic quorum verification. The gateway returns
+`503 runtime_unavailable` for recognized but unavailable runtimes rather than
+launching a host interpreter.
 
-**Rust / CLI** — the workspace is the source of truth:
+Gateway configuration is read from `OMNI_GATEWAY_CONFIG` and
+`OMNI_USAGE_POLICY`; the API key source is configured in TOML and supplied
+through `OMNI_API_KEYS` as comma-separated `tenant:key` entries. The gateway
+binary has no command-line flags. `omni serve` is a separate command for
+starting a cluster worker, not the REST gateway.
 
-```bash
-cargo build -p omni-ffi
-cargo run -p omni-cli -- run examples/hello.omni    # -> 42
-cargo run -p omni-cli -- eval '"omni" + " " + "engine"'  # -> omni engine
+## Troubleshooting
 
-cargo install --path crates/omni-cli                # `omni` and `omniup` on PATH
-omni --version                                      # omni 0.1.0 (language v2, ABI 5)
-omni run examples/hello.omni                        # -> 42
+- **Gateway offline:** confirm the bootstrap is still running, then inspect
+  `.dev\gateway.stderr.log`, `.dev\gateway.stdout.log`, and
+  `.dev\ui.stderr.log`. The bootstrap reports conflicts on ports `8443` and
+  `3000`; it leaves existing listeners untouched.
+- **TLS/configuration errors:** use the generated `.dev\gateway.toml` and
+  certificate/key pair together. The example configuration points to
+  deployment secret paths and is not directly usable for local TLS.
+- **`401 unauthorized`:** enter a key accepted by the gateway. In the local
+  Studio, use a generated key with **Use in Studio**. For direct gateway
+  configuration, verify `OMNI_API_KEYS` uses the configured `tenant:key`
+  format.
+- **`422 unsupported_language` / `422 runtime_error`:** check the language ID
+  in `GET /v1/languages` and inspect the structured error body. Source
+  compilation errors and unsupported language IDs have distinct diagnostics.
+- **`503 runtime_unavailable` / `503 workers_unavailable`:** the selected
+  language is unavailable, or the configured worker pool cannot satisfy the
+  request. Check runtime discovery, worker TLS/PSK settings, quorum, and
+  gateway logs.
+- **`429`:** the request exceeded a rate/quota or execution resource limit
+  such as CPU, gas, or memory. Check the configured tier policy and the
+  `Retry-After` header when present.
+- **`409`:** deterministic worker results disagreed. The gateway rejects the
+  result rather than returning an unverified value.
+
+Useful local checks:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:3000/api/health
+Invoke-RestMethod http://127.0.0.1:3000/api/languages
+cargo test -p omni-core -p omni-gateway
+cargo check --workspace
 ```
 
-> The first `v0.1.0` release is built by
-> [`.github/workflows/release.yml`](.github/workflows/release.yml) but has not
-> been published yet. Until it is, use the checkout commands under
-> [Verify the checkout](#verify-the-checkout); both SDKs also install from their
-> directories with `pip install sdks/python` and `npm install ./sdks/nodejs`.
+## Repository layout
 
-## What is here
-
-| Path | What it is |
+| Path | Contents |
 | --- | --- |
-| `crates/omni-core` | NaN-boxed 8-byte scalars, length-delimited strings, a lexer, an AST-to-bytecode compiler, and a stack virtual machine. Zero dependencies. |
-| `crates/omni-core/fuzz` | Four cargo-fuzz targets (lexer, parser, lowering, VM decoder) and a seed corpus. Separate workspace; nightly only. |
-| `crates/omni-ffi` | The C ABI: `omni.dll` / `libomni.so`, `include/omni.h`, and contract tests written as an external caller. |
-| `crates/omni-cli` | `omni run <file>`, `omni eval <expr>`, `omni check-update`, `omni update`, and the standalone `omniup`. Hand-rolled args, no clap. |
-| `crates/omni-wasm` | Scaffolded wasm surface, mirroring the C ABI shape. Not built by default. |
-| `sdks/python` | `omni` package on `ctypes` only — no pip dependencies at all. |
-| `sdks/nodejs` | `omniengine` package on `koffi`. |
-| `examples/` | `.omni` programs and `c/embed.c`. |
-| `scripts/package.py` | One native archive per platform: library, import library, header, example, docs. |
-| `scripts/cli-binaries.py` | Stages `omni` and `omniup` per platform with checksums; `scripts/make-manifest.py` turns those into `omni-update.json`. |
-| `.github/workflows/release.yml` | Tag-driven build of five platforms, platform wheels, npm tarball, PyPI and GitHub Release. |
-| `docs/GUIDE.md` | The initialization and execution guide, with measured numbers. |
-| `docs/RELEASING.md` | The release runbook: versions, secrets, artefacts, rollback. |
-| `docs/RELEASE-0.1.0.md` | The 0.1.0 release notes: what was verified, and the license. |
-| `docs/superpowers/` | The approved design specs and the implementation plan. |
-
-## Verify the checkout
-
-```bash
-# Rust
-cargo test --workspace                                  # 329 tests
-cargo run -p omni-cli -- eval '"omni" + " " + "engine"'  # -> omni engine
-cargo run --release -p omni-core --example bench         # the engine, measured
-
-# C, against the hand-written header — built beside the library it loads
-gcc -std=c11 -Wall -Wextra -I crates/omni-ffi/include \
-    examples/c/embed.c target/debug/libomni.dll.a -o target/debug/embed
-cd target/debug && ./embed           # all checks pass
-
-# Python (stdlib only)
-PYTHONPATH=sdks/python python -c "import omni; print(omni.Engine().string('\"omni engine\"'))"
-# -> omni engine      (evaluate('40 + 2') gives 42.0)
-
-# Node
-cd sdks/nodejs && npm install koffi && node -e \
-  "const {Engine}=require('./index.js'); const e=new Engine(); console.log(e.string('\"omni engine\"')); e.close()"
-```
-
-Or run everything at once:
-
-```bash
-./scripts/verify-all.sh   # the same bytes from every host, ABI, memory, batch, updates, fuzzing
-./scripts/fuzz.sh         # libFuzzer when nightly is present, deterministic harness otherwise
-./scripts/bench.sh        # ns/exec, crossing cost, batch speed-up -- measured
-python scripts/check-versions.py   # one version, one ABI across every surface
-python scripts/package.py          # a clean native archive for this platform
-```
-
-It checks that the same bytes come out of the same program on every host, that
-all four surfaces agree on the ABI level, that string results do not grow memory
-over 2,000 executions, that a host function called from a script answers
-identically in Python and Node, that a batch crossing answers, fails, counts,
-and refuses identically in both, and that the updater refuses a wrong checksum,
-does not fetch during a dry run, and replaces a binary only with verified bytes.
-It also checks the DevPack surface across hosts:
-the math, string and type builtins, a second-line error rendered as
-`[Line 2, Col 13]`, `eval_str` / `eval` returning native values, and a non-zero
-`last_exec_micros`. The second row runs the deterministic fuzz harness:
-1,200 mutated inputs through the lexer, parser, lowering pass, VM, and raw
-instruction decoder, requiring zero panics, identical results across two runs,
-and a valid position on every error. Tools that are missing are reported as
-`SKIP`, not as a pass.
-
-## The standard toolkit
-
-Twenty-one builtins need no host registration. Math: `abs`, `min`, `max`,
-`clamp`, `floor`, `ceil`, `round`, `pow`, `sqrt`. Text: `len`, `trim`,
-`upper`, `lower`, `contains`, `replace`, `slice`. Inspection: `type_of`.
-Sandboxed I/O and data: `fs.read_text`, `fs.write_text`, `json.parse`,
-`json.stringify`.
-
-```python
-from omni import Engine
-
-with Engine() as engine:
-    engine.eval_str("clamp(12, 0, 10) + min(1, 2) + max(3, 4)")  # 15
-    engine.eval('upper(trim("  omni  "))')                        # 'OMNI'
-    engine.eval('replace("a-b-a", "-", "+")')                     # 'a+b+a'
-    engine.eval('slice("héllo", 1, 3)')                           # 'él'
-    engine.eval('type_of(2)')                                     # 'number'
-    engine.eval_str('len("héllo")')                               # 6, bytes
-    engine.stats().last_exec_micros                               # microseconds
-```
-
-```js
-const engine = new Engine();
-engine.eval('clamp(12, 0, 10) + min(1, 2) + max(3, 4)');  // 15
-engine.eval('upper(trim("  omni  "))');                    // 'OMNI'
-engine.eval('pow(2, 10) + sqrt(16)');                      // 1028
-engine.eval('contains("omni engine", "engine")');          // true
-engine.eval('1 == 1');                                     // true
-engine.stats().lastExecMicros;                             // microseconds
-```
-
-`eval_str` / `eval` hand back native primitives rather than a wrapper: Python
-gets `int` for an integral number and `float` otherwise; Node gets `number`,
-`string`, `boolean`, or `null`. A runtime failure raises `OmniError` / throws,
-and the message carries the position — `[Line 2, Col 13]: type mismatch: cannot
-add string to number: "x" + 2` — with a byte column that is identical in every
-host. A wrong argument count names the call the same way:
-`[Line 1, Col 1]: Mismatched arity in call 'clamp': takes 3 arguments, got 2`.
-
-`slice` takes character offsets so it can never cut a UTF-8 character in half;
-`len` still counts bytes, because bytes are what a caller allocates for.
-`contains` and `replace` work on bytes, and an empty needle is contained in
-every string while an empty `replace` needle changes nothing. `sqrt` of a
-negative number and a `pow` that overflows fail with a positioned error rather
-than returning `NaN` or infinity. `type_of` answers `"number"`, `"string"`,
-`"boolean"`, or `"null"` — `null` is reachable through a host callback, since
-the grammar has no literal for it yet. Neither SDK unwraps into `list` or `dict`:
-ABI 5 has no collection type for a program to produce.
-
-`json.parse` and `json.stringify` cover exactly the four kinds that fit a
-16-byte `OmniValue` — number, string, boolean, `null`. An array or object is a
-deliberate error (`json.parse: arrays and objects are not supported at ABI 5`)
-rather than a string-shaped stand-in. `fs` fails closed: with no permission
-roots both builtins report that they are disabled. The CLI grants none, so a
-script cannot touch the disk by default; a Rust embedder opts in with
-`Engine::allow_fs_read(path)` and `Engine::allow_fs_write(path)` — and, since
-ABI 5, so can a Python or Node host through `engine.allow_fs_read(path)` /
-`engine.allowFsRead(path)` and their write and module-root companions — and a
-target outside those roots is refused before the OS is asked.
-
-## How a program runs
-
-Source is lexed into a token buffer, parsed into a flat AST, lowered into
-bytecode, and executed by a stack VM. The FFI surface did not move for this:
-`omni_exec` and `omni_exec_many` still cross the same 16-byte value, because the
-VM replaced the fused evaluator *behind* them.
-
-The lowering pass emits one instruction per operator and never recurses, so a
-left-deep spine — `1 + 1 + … + 1` thousands of terms long — costs heap, not
-thread stack. `Chunk`, the AST, the VM stack, and the lowering work stack all
-live on the engine and are cleared rather than freed, so a warm program still
-allocates nothing. Operand ordering, positions, and error text are the fused
-evaluator's, which is what keeps ABI 5 byte-identical.
-
-## Staying safe by default
-
-The engine assumes a program may be hostile. Every bound is a positioned error,
-never a panic, an abort, or a hang:
-
-| Bound | Limit |
-| --- | --- |
-| VM instructions per top-level execution | 16,777,216, shared with every module imported |
-| VM stack values | 65,536 (512 KiB) |
-| Parser expression nesting | 128 |
-| Call nesting | 64 |
-| Module import depth | 16 |
-
-A backward jump or runaway recursion fails with
-`execution exceeded the step limit of N instructions` at the instruction that
-would have run. `0` disables the check for a trusted batch. The budget is a Rust
-policy (`Engine::set_step_limit`) rather than an ABI field, so every SDK runs
-under the same default and ABI 4 did not move.
-
-`fs` writes fail closed: a missing path is resolved through its parent, an
-existing entry must canonicalize inside a granted root, and a dangling symlink is
-refused rather than followed. With no roots granted — the CLI's default — both
-`fs` builtins report that they are disabled.
-
-Fuzzing has two drivers. `crates/omni-core/fuzz` holds four cargo-fuzz targets
-for the lexer, parser, lowering pass, and instruction decoder; they need a
-nightly toolchain and `cargo-fuzz`, and are deliberately a separate workspace so
-neither becomes a dependency of the engine. `scripts/fuzz.sh` uses them when
-available and otherwise runs the deterministic harness that `verify-all.sh`
-runs: a fixed corpus mutated 1,200 ways, each input through all four stages and
-the raw decoder, twice, asserting no panic, identical results, and a real
-`Line`/`Col` on every error.
-
-## Modules
-
-Language version 2 adds one statement:
-
-```omni
-import "lib/math"
-math.answer
-```
-
-The operand resolves to `<module_root>/lib/math.omni`, is canonicalized, and
-must stay inside the module root; absolute paths, `..`, and symlink escapes are
-refused by that one check. The namespace is the file stem, and the module runs
-in a fresh child engine: it sees builtins, not the embedder's globals or host
-functions, so an import cannot call a callback it was not given. Top-level
-`let` names export unless they start with `_`; imported names are dotted and are
-not re-exported. Strings are copied into the importing execution's arena before
-the child engine is reclaimed. Cycles, a 16-deep import limit, and a missing
-module root all fail with positioned errors that name the module. Importing is
-opt-in from Rust via `Engine::set_module_root`, and there is no cache: a second
-import executes the module again.
-
-## Calling back into the host
-
-A script's `name(args)` call enters foreign code. The host binds it by name, with
-an arity the engine checks before the callback is ever entered:
-
-```python
-engine.register_function("shout", lambda s: s.upper() + "!", arity=1)
-engine.string('"say: " + shout("hey")')      # say: HEY!
-```
-
-```js
-engine.registerFunction('shout', (s) => s.toUpperCase() + '!', { arity: 1 });
-engine.string('"say: " + shout("hey")');     // say: HEY!
-```
-
-Numbers, booleans, strings and `nil` cross in both directions. A Python exception
-or a JavaScript `throw` becomes `[Line 1, Col 1]: host function 'shout' failed:
-<message>`, because an exception unwinding through the Rust frames that
-called it is undefined behaviour — the same reason a callback that calls back into
-its own engine gets `OMNI_ERR_REENTRANT` instead of a second mutable reference.
-See [docs/GUIDE.md](docs/GUIDE.md#47-host-callbacks-the-bridge-running-backwards)
-and `examples/c/embed.c` for the C surface.
-
-## Batching: several programs, one crossing
-
-A loop of `run` pays the FFI crossing and the arena reclamation once per program;
-a batch pays both once for the whole list:
-
-```python
-engine.run_many(["1 + 1", '"two"', "shout('hey')"])
-# [Result(2.0), Result('two'), Result('HEY!')]
-```
-
-```js
-engine.runMany(['1 + 1', '"two"', "shout('hey')"]);
-// [{ tag: 'number', value: 2 }, { tag: 'string', value: 'two' }, ...]
-```
-
-Each item is an independent program — item *N* cannot read item *N−1*'s `let` —
-and a failing item does not stop the rest: `try_run_many` / `tryRunMany` return
-one `(status, result, message)` per item, with the engine's text for exactly that
-item. All N string results stay readable until the next execution, so a batch's
-egress is bounded by its total demand, not one item's.
-
-The measured usage guidance: a batch of one is strictly a loss, and the win
-saturates fast — the crossing itself costs ~240 ns through ctypes and ~36 ns
-through koffi, while one wrapped execution costs several microseconds, so a batch
-can only amortise the smaller term. On this machine, batches earned 1.2–1.4× per
-item at their best N in Python and Node, and in Rust the win is unconditional but
-in allocations: 0.00 per execution, 0.004 per *item* inside a 256-batch. Run
-`./scripts/bench.sh` for the machine you are on.
-
-## Running in parallel
-
-`run_parallel` / `runParallel` / `omni_exec_parallel` dispatch one batch across
-a worker group instead of evaluating it in order. The answers are the same and
-stay in source order; only where each item ran changes:
-
-```python
-engine.run_parallel(["1 + 1", '"two"', "shout('hey')"], max_threads=4)
-```
-
-```js
-engine.runParallel(['1 + 1', '"two"', "shout('hey')"], 4);
-```
-
-Workers are forked engines, each with its own arena, egress block, gas meter,
-and `let` bindings. They inherit configuration — module root, filesystem roots,
-step limit, host globals and callbacks, and cached module sources — and nothing
-a previous item executed. The call is synchronous: when it returns every item
-has a status, the return value is the first failure, and all string results are
-readable together until the next execution. `0` asks for the automatic worker
-count; `1` takes the sequential path.
-
-Rust's `Engine` is `Send + Sync`: a reference may be read from any thread and an
-owned engine may move between them. The C handle is still one borrow at a time —
-`omni_exec_parallel` is the supported way to use several cores through one
-handle, not a licence to call two exports on it concurrently. Host callbacks may
-run on workers, so what their `user_data` addresses must be thread-safe. Node is
-the exception at the SDK layer: koffi marshals a JavaScript callback to the main
-thread, which is blocked inside the synchronous call, so `runParallel` falls back
-to sequential whenever a host function is registered. Python's ctypes callbacks
-do run on the workers.
-
-## Staying current
-
-`omni update` reads one manifest, picks the asset for this platform, verifies its
-SHA-256, and replaces the binary only if the bytes match:
-
-```bash
-omni --version                    # omni 0.1.0 (language v2, ABI 5)
-omni check-update                 # 0 current, 10 newer, 11 different ABI
-omni update --dry-run             # 10: an update would apply; nothing fetched
-omni update --yes                 # download, verify, install
-omniup update --target ./omni -y  # update a binary that is not this process
-```
-
-Plain `http://` is refused unless `OMNI_ALLOW_INSECURE=1` is set, because an
-unauthenticated manifest is an unauthenticated binary. Replacement is
-rename-based: a failure part-way restores the old file, and a running Windows
-image is kept beside the new one as `omni.exe.bak`. Both SDKs can report the
-same answer without installing anything:
-
-```python
-import omni
-omni.check_updates().available
-```
-
-```js
-const { checkUpdates } = require('omniengine');
-(await checkUpdates()).available;
-```
-
-The check is opt-in and notify-only — neither SDK replaces the engine under a
-running process. Set `OMNI_UPDATE_CHECK=1` (or `Engine(background_check=True)` /
-`new Engine({ updateCheck: true })`) for a check that never blocks startup,
-never throws, and never prints. The engine itself only parses the manifest
-(`omni_check_update`); fetching stays in the CLI and the SDKs, so the core keeps
-zero dependencies. See
-[docs/GUIDE.md](docs/GUIDE.md#65-staying-current-the-updater).
-
-## How it stays fast and small
-
-- **No GC, ever.** Scalars are NaN-boxed into 8 bytes; everything the engine
-  allocates goes into a bump arena that is bulk-freed at the start of each
-  evaluation. `reset()` is O(chunks), not O(objects), and a batch reclaims
-  back to a checkpoint instead of back to the beginning.
-- **A warm engine lexes without allocating.** The token vector is reused across
-  executions — measured, 0.00 allocations per execution in every benchmark
-  scenario, and 0.004 per item inside a 256-batch.
-- **The compiler does not recurse.** Post-order lowering walks an explicit work
-  stack owned by the engine, so the depth of an expression is bounded by memory
-  rather than by the host thread's stack; 100,000 chained `+` operators lower
-  and run in a test.
-- **Reservations are flat by construction.** The arena cursor walks chunks it
-  already mapped instead of asking the system for new ones, so 100,000
-  executions reserve exactly what the first one did — checked by the harness,
-  not just by the claim.
-- **Three lifetimes, three blocks.** The exec arena is freed every evaluation.
-  Strings handed to a host live in a separate egress block that *rewinds*
-  instead of freeing, so a stale pointer reads the newest bytes rather than
-  unmapped memory. Host-supplied strings sit in their own allocation, owned by
-  the engine and unchanged by any evaluation.
-- **Nothing leaves the engine as a pointer a host must trust.** The result struct
-  is written into storage the caller owns, and its payload arm is an integer no
-  host dereferences. `omni_str_copy` fills a buffer you passed in and validates
-  the address against the engine's own registry, so a fabricated or superseded
-  pointer copies zero bytes instead of reading somebody else's heap.
-- **A callback cannot alias the engine.** The handle holds its state in a
-  `RefCell` and every entry point opens it with `try_borrow_mut()`, so a host
-  function that calls back into the engine that called it gets
-  `OMNI_ERR_REENTRANT` — a defined status — where the unchecked shape would be
-  two mutable references and a crash blamed on the host.
-- **Zero dependencies in the core.** The compile graph stays small, and building
-  this workspace fetched nothing into `~/.cargo` — the only file it touched is
-  cargo's own metadata.
-- **`debug = "line-tables-only"`.** Cuts multi-gigabyte MSVC PDBs on a drive
-  with 6.5 GB free, while keeping stack traces readable.
-- **`unsafe` is four files, and they are named.** In the core it is `arena.rs`
-  (the bump pointer), `object.rs` (one `write_at`, the only place a string block
-  is written), and `counted.rs` (the `GlobalAlloc` trait requires it); the fourth
-  is the FFI. Everything else is safe Rust by construction.
-
-## Language status
-
-The engine understands numbers, arithmetic with precedence, parentheses,
-`let` bindings scoped to one execution, `import` of a local module with a
-namespace, line comments, and twenty-one builtins (`abs`, `min`, `max`, `clamp`,
-`floor`, `ceil`, `round`, `pow`, `sqrt`, `len`, `trim`, `upper`, `lower`,
-`contains`, `replace`, `slice`, `type_of`, `fs.read_text`, `fs.write_text`,
-`json.parse`, `json.stringify`). Strings are length-delimited: literals with
-`\n`, `\r`, `\t`, `\"`, `\\` and `\u{…}` escapes, `+` concatenation that refuses
-a mixed-type program by naming both operands, and `==` / `!=` by content. A host
-can define a string global from outside the language, and can bind functions a
-script calls by name — up to 16 arguments, up to 64 calls deep.
-
-Errors report a 1-based line and byte column — `[Line 2, Col 13]: …` — and that
-position survives the FFI boundary into C, Python, and Node. `stats()` reports
-the last execution's wall-clock time in microseconds.
-
-What is still missing: indexing, slicing, string methods and interpolation;
-ordering comparisons on strings; boolean, `nil`, and `undefined` literals;
-user-defined functions, control flow, and collections. The module loader, the
-bytecode compiler, and the call machinery that make those cheap are already in
-place — the syntax is the next increment.
-
-## File extensions
-
-`.omni` and `.ox`. See [docs/GUIDE.md](docs/GUIDE.md#5-phase-4--github-linguist-and-file-extensions)
-for what GitHub shows today and what it takes to get a custom language name.
+| `crates/omni-core` | Language engine, lexer, compiler, bytecode VM, and value model |
+| `crates/omni-cli` | `omni run`, `omni eval`, updater commands, and `omni serve` worker |
+| `crates/omni-ffi` | C ABI used by native hosts and the Python/Node.js SDKs |
+| `crates/omni-cluster` | TLS worker protocol, client, node, and dispatch logic |
+| `crates/omni-gateway` | HTTPS REST gateway, policy enforcement, language runners, and dev certificate helper |
+| `crates/omni-jit` | Cranelift JIT integration |
+| `crates/omni-wasm` | WebAssembly binding scaffold; not a general untrusted Wasm host |
+| `sdks/` | Python and Node.js local SDKs |
+| `config/` and `policies/` | Gateway configuration template and usage-tier policy |
+| `docs/` | Deployment, API, cluster, and release documentation |
+| `scripts/dev-up.ps1` and `ui/` | Windows local bootstrap and browser dashboard/bridge |
 
 ## License
 
-Vextalor Global Public & Integration License (VGPIL) 1.0 — see [LICENSE](LICENSE).
-
-OmniEngine is owned by Tamjid Abdur Rahman and was engineered by Vextalor
-Global. You may integrate, run, and embed it — including in commercial
-applications and inside Python, Node, and C packages — free of charge. You may
-not sell or re-license the raw source or core binary as a standalone or
-rebranded product, and attribution and this license must stay intact.
-
-Code published before this license was applied (through commit `9aab27b`) was
-released under MIT; those grants are not retroactively withdrawn.
+OmniEngine is distributed under the Vextalor Global Public & Integration
+License (VGPIL) 1.0. See [LICENSE](LICENSE).

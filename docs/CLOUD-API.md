@@ -2,7 +2,7 @@
 
 ## Base Contract
 
-The managed API uses HTTPS and a TLS-enabled gRPC gateway. The REST shape is:
+The current gateway exposes the managed API over HTTPS. The REST shape is:
 
 ```text
 POST /v1/execute
@@ -38,9 +38,10 @@ Example REST success:
 }
 ```
 
-## gRPC Contract
+## Planned gRPC Contract
 
-The equivalent gRPC service shape is:
+An equivalent gRPC service is a planned API surface; it is not implemented by
+the current `omni-gateway` crate:
 
 ```text
 service OmniExecution {
@@ -85,6 +86,13 @@ The gateway applies both quota and concurrency controls:
 - queue depth and rejection policy; and
 - retry-after metadata for throttled or capacity-rejected requests.
 
+Monthly quota and rolling-window updates are serialized across gateway
+processes sharing the same state path by an OS-backed sibling lock file; the
+snapshot is reloaded while locked before each admission and replaced atomically.
+The lock is released by the operating system if a process exits. Active-request
+concurrency permits remain process-local and are reset on restart, so use an
+external coordinator if the concurrency ceiling must span multiple replicas.
+
 Recommended HTTP responses:
 
 | Status | Meaning |
@@ -92,6 +100,7 @@ Recommended HTTP responses:
 | `401` | Missing or invalid token |
 | `403` | Token lacks endpoint or tenant capability |
 | `429` | Per-key rate or monthly quota exceeded |
+| `409` | Deterministic worker results disagree |
 | `503` | No healthy worker or insufficient queue capacity |
 | `400` | Invalid source or resource configuration |
 | `413` | Request or source exceeds gateway size limits |
@@ -126,15 +135,29 @@ from internal execution numbers but included in end-to-end latency.
 
 ## Health and Deterministic Verification
 
-Gateway workers expose health only to the control plane:
+When cluster dispatch is enabled, the gateway checks configured workers before
+dispatch. Worker connections require certificate-verified TLS and a separate
+32-byte cluster PSK; the customer API token is never forwarded to workers.
+Configure a CA bundle and expected worker DNS name, and provision the PSK through
+the gateway's secret environment. Worker-side filesystem roots and resource
+ceilings remain operator-controlled.
 
-```text
-GET /v1/health
-grpc OmniExecution.Health
-```
+The configured health endpoint (default `/v1/health`) serves unauthenticated
+aggregate gateway status over HTTPS. Its JSON response includes request
+success/failure, quota/rate/concurrency rejection, worker dispatch, and
+deterministic quorum counters, plus cluster enablement and configured worker
+count. It contains no tenant identifiers or API-key material. Health reads are
+excluded from request counters. Worker health checks separately use the
+authenticated cluster `Ping` protocol over the configured TLS connection.
 
-The public execute route should support deterministic verification by dispatching
-eligible tasks to multiple workers and comparing status, value tag, numeric
-value, and rendered text. A mismatch rejects the result rather than selecting a
-majority silently. Unhealthy workers are retried or removed according to the
-cluster fault policy.
+For requests with `"verification": "deterministic"`, the gateway dispatches to
+the configured quorum of distinct healthy workers and compares status, value
+tag, numeric value, and rendered text. A mismatch returns `409` and rejects the
+result; an unavailable quorum returns `503`. The gateway never silently accepts
+a single-worker result for a verification request. Local fallback, when enabled,
+applies only to transient errors on non-verification requests.
+
+CPU deadlines are checked between VM instructions, with elapsed-time checks
+after execution. The memory ceiling accounts for engine arena and result
+reservations; it does not cap all parser or Rust process heap allocations.
+Operators should still isolate worker processes with OS/container limits.

@@ -31,6 +31,8 @@
 use std::alloc::{Layout, alloc as sys_alloc, dealloc as sys_dealloc};
 use std::mem;
 use std::ptr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Every chunk is allocated at this alignment, which is the largest alignment
 /// any value OmniEngine boxes requires today.
@@ -39,6 +41,49 @@ const CHUNK_ALIGN: usize = 16;
 const DEFAULT_CHUNK: usize = 64 * 1024;
 
 const MIN_CHUNK: usize = 4096;
+pub(crate) const MEMORY_LIMIT_PANIC: &str = "omni-core: sandbox memory limit exceeded";
+
+pub(crate) struct MemoryBudget {
+    limit: usize,
+    reserved: AtomicUsize,
+}
+
+impl MemoryBudget {
+    pub(crate) fn new(limit: usize, reserved: usize) -> Option<Arc<Self>> {
+        (reserved <= limit).then(|| {
+            Arc::new(Self {
+                limit,
+                reserved: AtomicUsize::new(reserved),
+            })
+        })
+    }
+
+    fn reserve(&self, bytes: usize) -> bool {
+        let mut current = self.reserved.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current
+                .checked_add(bytes)
+                .filter(|next| *next <= self.limit)
+            else {
+                return false;
+            };
+            match self.reserved.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn release(&self, bytes: usize) {
+        let previous = self.reserved.fetch_sub(bytes, Ordering::AcqRel);
+        debug_assert!(previous >= bytes, "arena memory budget underflow");
+    }
+}
 
 /// A single block. Held as a raw allocation rather than a `Box<[u8]>` on
 /// purpose: reconstructing a `Box<[u8]>` from a 16-aligned allocation makes its
@@ -133,6 +178,7 @@ pub struct Arena {
     oversize_live: usize,
     allocations: usize,
     high_water: usize,
+    memory_budget: Option<Arc<MemoryBudget>>,
 }
 
 impl Arena {
@@ -159,15 +205,32 @@ impl Arena {
             oversize_live: 0,
             allocations: 0,
             high_water: 0,
+            memory_budget: None,
         }
     }
 
+    pub(crate) fn set_memory_budget(&mut self, budget: Option<Arc<MemoryBudget>>) {
+        self.memory_budget = budget;
+    }
+
     fn push_chunk(&mut self) {
+        if self
+            .memory_budget
+            .as_ref()
+            .is_some_and(|budget| !budget.reserve(self.chunk_size))
+        {
+            std::panic::panic_any(MEMORY_LIMIT_PANIC);
+        }
         let layout =
             Layout::from_size_align(self.chunk_size, CHUNK_ALIGN).expect("valid chunk layout");
         // Safety: a nonzero size with a power-of-two alignment is a valid layout.
         let ptr = unsafe { sys_alloc(layout) };
-        assert!(!ptr.is_null(), "arena chunk allocation failed");
+        if ptr.is_null() {
+            if let Some(budget) = &self.memory_budget {
+                budget.release(self.chunk_size);
+            }
+            panic!("arena chunk allocation failed");
+        }
         self.chunks.push(Chunk {
             ptr,
             layout,
@@ -252,9 +315,21 @@ impl Arena {
         }
         let layout = Layout::from_size_align(rounded, CHUNK_ALIGN.max(align))
             .expect("oversize layout is valid: nonzero and power-of-two aligned");
+        if self
+            .memory_budget
+            .as_ref()
+            .is_some_and(|budget| !budget.reserve(rounded))
+        {
+            std::panic::panic_any(MEMORY_LIMIT_PANIC);
+        }
         // Safety: a nonzero size with a power-of-two alignment is a valid layout.
         let ptr = unsafe { sys_alloc(layout) };
-        assert!(!ptr.is_null(), "arena oversize allocation failed");
+        if ptr.is_null() {
+            if let Some(budget) = &self.memory_budget {
+                budget.release(rounded);
+            }
+            panic!("arena oversize allocation failed");
+        }
         self.oversize.push(Chunk {
             ptr,
             layout,
@@ -315,7 +390,18 @@ impl Arena {
     /// `reset` it leaves [`Arena::high_water`] alone: the watermark describes the
     /// largest cycle ever run, not this one.
     pub fn reset_to(&mut self, mark: Mark) {
-        self.chunks.truncate(mark.chunks.min(self.chunks.len()));
+        let keep_chunks = mark.chunks.min(self.chunks.len());
+        let released = self
+            .chunks
+            .iter()
+            .skip(keep_chunks)
+            .map(Chunk::size)
+            .sum::<usize>()
+            .saturating_add(self.oversize_held);
+        if let Some(budget) = &self.memory_budget {
+            budget.release(released);
+        }
+        self.chunks.truncate(keep_chunks);
         self.oversize.clear();
         self.oversize_held = 0;
         self.oversize_live = 0;
@@ -450,6 +536,14 @@ impl Arena {
     /// by: not by how many executions ran, but by the largest one.
     pub fn high_water(&self) -> usize {
         self.high_water
+    }
+}
+
+impl Drop for Arena {
+    fn drop(&mut self) {
+        if let Some(budget) = &self.memory_budget {
+            budget.release(self.bytes_reserved());
+        }
     }
 }
 

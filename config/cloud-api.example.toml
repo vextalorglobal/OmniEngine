@@ -5,6 +5,9 @@
 bind = "0.0.0.0:8443"
 tls_cert = "/run/secrets/tls/cert.pem"
 tls_key = "/run/secrets/tls/key.pem"
+# Durable quota/rate state; override with OMNI_GATEWAY_STATE.
+# Default: OS user state directory; falls back to ./omni-gateway-state.json.
+# A sibling .lock file coordinates durable updates across gateway processes.
 allowed_origins = []
 execute_endpoint = "/v1/execute"
 health_endpoint = "/v1/health"
@@ -12,8 +15,23 @@ health_endpoint = "/v1/health"
 [auth]
 mode = "bearer"
 token_header = "Authorization"
-token_secret_source = "env:OMNI_API_TOKEN_SIGNING_KEY"
+token_secret_source = "env:OMNI_API_KEYS"
 token_secret_required = true
+
+[gateway.cluster]
+# When enabled, require worker_endpoints, a TLS CA bundle/name, and a 64-hex
+# cluster PSK supplied by the environment source below.
+enabled = false
+worker_endpoints = []
+psk_source = "env:OMNI_CLUSTER_PSK_HEX"
+tls_ca_file = "/run/secrets/cluster/ca.pem"
+tls_server_name = "omni-worker.internal"
+# Deterministic requests require at least two workers. No local fallback is
+# performed for deterministic verification requests.
+quorum = 2
+retries = 1
+timeout_ms = 5000
+fallback_to_local = false
 
 [gateway.rate_limit]
 free_requests_per_month = 100000

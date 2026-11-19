@@ -20,10 +20,7 @@ pub mod wire;
 
 pub use client::{ClusterClient, RemoteError, TaskReply};
 pub use node::{WorkerConfig, WorkerNode};
-pub use wire::{ErrorCode, TaskStatus, ValueTag, MAX_CLUSTER_TASK};
-
-
-
+pub use wire::{ErrorCode, MAX_CLUSTER_TASK, TaskStatus, ValueTag};
 
 /// OS random bytes for wire nonces. Unix reads `/dev/urandom`; Windows calls
 /// `BCryptGenRandom` through a fixed import table (the system bcrypt DLL is

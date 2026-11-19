@@ -7,6 +7,7 @@ members = [
     "crates/omni-wasm",
     "crates/omni-jit",
     "crates/omni-cluster",
+    "crates/omni-gateway",
     "crates/omni-plugin-fixture",
 ]
 
@@ -23,6 +24,7 @@ default-members = [
     "crates/omni-cli",
     "crates/omni-jit",
     "crates/omni-cluster",
+    "crates/omni-gateway",
     "crates/omni-plugin-fixture",
 ]
 
@@ -40,6 +42,10 @@ description = "OmniEngine: a high-performance custom language with a zero-depend
 [workspace.dependencies]
 omni-core = { path = "crates/omni-core", version = "0.1.0" }
 omni-cluster = { path = "crates/omni-cluster", version = "0.1.0" }
+omni-gateway = { path = "crates/omni-gateway", version = "0.1.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
 
 # Dev is tuned for two things at once: compile speed, and the fact that C: has
 # 7.5 GB free and holds CARGO_HOME. Full debug info on MSVC emits a multi-GB PDB
