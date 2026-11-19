@@ -186,8 +186,21 @@ extern "C" {
  * Phase 9 is additive inside version 4, exactly as the DevPack timer and the
  * parallel entry point were: OmniProfile is a new struct, and the three
  * profiling exports change no existing signature or layout, so a host that
- * only calls the older functions remains correct. */
-#define OMNI_ABI_VERSION 4u
+ * only calls the older functions remains correct.
+ *
+ * Version 5 is the permission increment: omni_engine_allow_fs_read,
+ * omni_engine_allow_fs_write and omni_engine_set_module_root make the
+ * sandbox configurable through the ABI. Every existing export keeps its
+ * exact signature and layout; the bump says the permission surface is part
+ * of the contract by name, so a v5 host refuses an engine that cannot
+ * configure a sandbox rather than silently running with none. */
+#define OMNI_ABI_VERSION 6u
+
+/* The longest path, in bytes, the permission exports accept. A sandbox
+ * configuration longer than this is a configuration bug, not a path; the
+ * ceiling is the same one plugin load paths get, and it keeps the
+ * canonicalization work bounded. Mirrors OMNI_MAX_PATH in omni_ffi. */
+#define OMNI_MAX_PATH 4096u
 
 /* ---- status codes: the u32 returned by every call ---- */
 
@@ -198,6 +211,7 @@ extern "C" {
 #define OMNI_ERR_ARG       4u /* null pointer, bad length, or bad UTF-8   */
 #define OMNI_ERR_HOST      5u /* a host function returned OMNI_HOST_ERR   */
 #define OMNI_ERR_REENTRANT 6u /* from a callback, on this same handle     */
+#define OMNI_ERR_CLUSTER   12u /* transport, protocol, or worker-pool failure */
 
 /* There is deliberately no OMNI_ERR_MEMORY. A program that builds too long a
  * string is the program's fault (OMNI_ERR_RUNTIME); a host that passes too long
@@ -266,9 +280,9 @@ typedef struct OmniValue {
  *
  * `last_exec_micros` occupies bytes the compiler already padded after `size`, so
  * adding it kept the struct at 72 bytes and every other field at its v4 offset.
- * That is why this is still ABI 4: a host compiled against the original header
- * reads the same size and the same fields, and only sees a counter it did not
- * ask for in bytes it was already skipping. */
+ * That is why the stats struct stayed put through version 4: a host compiled
+ * against the original header reads the same size and the same fields, and only
+ * sees a counter it did not ask for in bytes it was already skipping. */
 typedef struct OmniStats {
   uint32_t size;                /* sizeof(OmniStats), written by the callee */
   uint32_t last_exec_micros;    /* wall-clock us the last execution spent in
@@ -457,7 +471,7 @@ OMNI_API const char *OMNI_CALL omni_version(void);
  *
  * The document is JSON with three required parts and one optional one:
  *
- *   { "version": "0.2.0", "abi": 4, "notes": "https://…",   // notes optional
+ *   { "version": "0.2.0", "abi": 5, "notes": "https://…",   // notes optional
  *     "assets": { "win32-x64": { "url": "https://…", "sha256": "<64 hex>" } } }
  *
  * A manifest entry is chosen by platform key: win32-x64, linux-x64,
@@ -519,6 +533,24 @@ OMNI_API uint32_t OMNI_CALL omni_exec(OmniEngine *engine,
                                       const char *src,
                                       size_t len,
                                       OmniValue *out);
+
+/* Execute a source task on a distributed worker pool. nodes is a caller-owned
+ * array of node_count C strings (host:port). psk must point to exactly 32 bytes.
+ * The call retries transport faults, writes task errors as OMNI_ERR_COMPILE or
+ * OMNI_ERR_RUNTIME, and returns OMNI_ERR_CLUSTER for pool/protocol failures.
+ * The optional error buffer receives a NUL-terminated diagnostic. */
+OMNI_API uint32_t OMNI_CALL omni_exec_remote(OmniEngine *engine,
+                                             const char *const *nodes,
+                                             size_t node_count,
+                                             const uint8_t *psk,
+                                             size_t psk_len,
+                                             const char *src,
+                                             size_t len,
+                                             uint64_t gas,
+                                             uint32_t retries,
+                                             OmniValue *out,
+                                             char *error,
+                                             size_t error_cap);
 
 /* Evaluate and require a numeric result.
  * Returns OMNI_ERR_RUNTIME if the program produced a non-number -- including
@@ -708,6 +740,37 @@ OMNI_API uint32_t OMNI_CALL omni_engine_load_plugin(OmniEngine *engine,
 /* How many plugins this engine has loaded. Returns 0 for a NULL engine. The
  * zero-count check after teardown proves no foreign code is still mapped. */
 OMNI_API size_t OMNI_CALL omni_plugin_count(const OmniEngine *engine);
+
+/* Allow fs.read_text to read files under path on this engine.
+ *
+ * The root is canonicalized once, here, so every later containment check
+ * compares a canonical path to a canonical root; granting an existing root
+ * again is a no-op. Returns OMNI_OK, or OMNI_ERR_ARG for a NULL engine or
+ * path, an empty or over-OMNI_MAX_PATH path, non-UTF-8 bytes, or a path
+ * that cannot be canonicalized -- the engine records only roots it could
+ * resolve, which is the fail-closed half of the sandbox. OMNI_ERR_REENTRANT
+ * applies as it does to every engine call. The path is length-prefixed, so
+ * it may contain any UTF-8 the host platform allows in a path; no NUL
+ * terminator is required or consulted. */
+OMNI_API uint32_t OMNI_CALL omni_engine_allow_fs_read(OmniEngine *engine,
+                                                      const char *path,
+                                                      size_t path_len);
+
+/* Allow fs.write_text to write files under path on this engine.
+ *
+ * The same contract as omni_engine_allow_fs_read, for the write root set:
+ * canonicalized once, deduplicated, refused when unresolvable. */
+OMNI_API uint32_t OMNI_CALL omni_engine_allow_fs_write(OmniEngine *engine,
+                                                       const char *path,
+                                                       size_t path_len);
+
+/* Set the directory `import` resolves modules under, replacing any previous
+ * module root. Returns OMNI_OK, or OMNI_ERR_ARG as
+ * omni_engine_allow_fs_read does, and OMNI_ERR_REENTRANT from inside a
+ * callback on the same handle. */
+OMNI_API uint32_t OMNI_CALL omni_engine_set_module_root(OmniEngine *engine,
+                                                        const char *path,
+                                                        size_t path_len);
 
 /* Fill *out with the engine's counters and OMNI_OK, or return OMNI_ERR_ARG if
  * engine or out is NULL.

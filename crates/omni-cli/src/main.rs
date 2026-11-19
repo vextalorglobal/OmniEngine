@@ -7,6 +7,7 @@
 use std::io::{Read, Write};
 use std::process::ExitCode;
 
+use omni_cli::serve;
 use omni_cli::updater::{self, ABI_VERSION, EXIT_ABI_MISMATCH, UpdateError, UpdateOptions};
 use omni_core::Engine;
 
@@ -20,6 +21,7 @@ USAGE:
                              (also --check-update)
     omni update              Download, verify, and install a newer omni
                              (also --update)
+    omni serve               Run as a cluster worker (see omni serve --help)
     omni --version           Print the engine version
     omni --help              Show this message
 
@@ -48,6 +50,7 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("check-update" | "--check-update") => return check_update_command(&args[1..]),
         Some("update" | "--update") => return update_command(&args[1..]),
+        Some("serve") => return serve_command(&args[1..]),
         _ => {}
     }
     dispatch_exit(&args)
@@ -156,6 +159,25 @@ fn set_manifest(flags: &mut UpdateFlags, value: &str) -> Result<(), UpdateError>
     }
     flags.source = value.to_string();
     Ok(())
+}
+
+/// `omni serve`: its own dispatch, because it parses its own flag set and then
+/// blocks — it never returns through `dispatch`.
+fn serve_command(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("--help" | "-h") => {
+            print!("{}", serve::SERVE_USAGE);
+            ExitCode::SUCCESS
+        }
+        _ => match serve::parse_serve_flags(args) {
+            Ok(flags) => serve::run_serve(flags),
+            Err(message) => {
+                let mut stderr = std::io::stderr();
+                let _ = writeln!(stderr, "omni: {message}");
+                ExitCode::from(EXIT_USAGE)
+            }
+        },
+    }
 }
 
 fn check_update_command(args: &[String]) -> ExitCode {

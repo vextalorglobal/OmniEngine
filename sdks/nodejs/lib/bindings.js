@@ -44,6 +44,7 @@ const STATUS = Object.freeze({
   ERR_ARG: 4,
   ERR_HOST: 5,
   ERR_REENTRANT: 6,
+  ERR_CLUSTER: 12,
 });
 
 const STATUS_NAMES = Object.freeze({
@@ -54,6 +55,7 @@ const STATUS_NAMES = Object.freeze({
   4: 'argument',
   5: 'host',
   6: 'reentrant',
+  12: 'cluster',
 });
 
 /** Value tags on OmniValue. */
@@ -90,13 +92,23 @@ const TAG_NAMES = Object.freeze({
  * `OmniStats.execs` now counts batch items as well as single calls -- a v3 host
  * reading it as "number of omni_exec calls" would draw a wrong conclusion from a
  * correct number.
+ *
+ * Version 5 is the permission increment: `omni_engine_allow_fs_read`,
+ * `omni_engine_allow_fs_write` and `omni_engine_set_module_root` make the
+ * sandbox configurable through the ABI. Every existing signature is unchanged,
+ * so the bump is what a host checks before promising callers it can configure
+ * a sandbox.
  */
-const ABI_VERSION = 4;
+const ABI_VERSION = 6;
 
 /** The ABI rejects any length above these, before reading a single byte. */
 const MAX_SOURCE_LEN = 2 ** 28;
 const MAX_STRING_LEN = 16 * 1024 * 1024;
 const MAX_IDENTIFIER_LEN = 32;
+
+/** Longest path (in bytes) the permission exports accept. Mirrors
+ * `OMNI_MAX_PATH` in `omni.h`. */
+const MAX_PATH = 4096;
 
 /** How many arguments a host function may take, and how deep calls may nest. */
 const MAX_ARGS = 16;
@@ -354,6 +366,30 @@ function declare(koffi, lib, resolvedPath) {
     opcodeName = null;
   }
 
+  // The ABI 5 permission exports. A library built before them still serves
+  // every other call; Engine.allowFsRead() and friends turn the missing symbol
+  // into one clear error at the moment a grant is asked for, not at load time.
+  // Each path crosses as `const void *` plus an explicit length: the ABI reads
+  // no NUL and validates UTF-8 itself.
+  let allowFsRead = null;
+  try {
+    allowFsRead = lib.func('uint32_t omni_engine_allow_fs_read(void *engine, const void *path, size_t pathLen)');
+  } catch {
+    allowFsRead = null;
+  }
+  let allowFsWrite = null;
+  try {
+    allowFsWrite = lib.func('uint32_t omni_engine_allow_fs_write(void *engine, const void *path, size_t pathLen)');
+  } catch {
+    allowFsWrite = null;
+  }
+  let setModuleRoot = null;
+  try {
+    setModuleRoot = lib.func('uint32_t omni_engine_set_module_root(void *engine, const void *path, size_t pathLen)');
+  } catch {
+    setModuleRoot = null;
+  }
+
   const bindings = {
     koffi,
     lib,
@@ -375,6 +411,7 @@ function declare(koffi, lib, resolvedPath) {
     MAX_CALL_DEPTH,
     MAX_BATCH,
     MAX_OPCODES,
+    MAX_PATH,
     HOST_OK,
     HOST_ERR,
     UPDATE,
@@ -386,6 +423,7 @@ function declare(koffi, lib, resolvedPath) {
     engineNew: lib.func('void *omni_engine_new()'),
     engineFree: lib.func('void omni_engine_free(void *engine)'),
     exec: lib.func('uint32_t omni_exec(void *engine, const void *src, size_t len, OmniValue *out)'),
+    execRemote: lib.func('uint32_t omni_exec_remote(void *engine, const void *nodes, size_t nodeCount, const void *psk, size_t pskLen, const void *src, size_t len, uint64_t gas, uint32_t retries, OmniValue *out, char *error, size_t errorCap)'),
     execNumber: lib.func('uint32_t omni_exec_number(void *engine, const void *src, size_t len, double *out)'),
     // Batch: four caller-owned arrays, so every parameter is `void *` and this
     // SDK does the marshalling. Declaring `OmniValue *` or `uint32_t *` would
@@ -401,6 +439,9 @@ function declare(koffi, lib, resolvedPath) {
     setProfiling,
     profile,
     opcodeName,
+    allowFsRead,
+    allowFsWrite,
+    setModuleRoot,
     // `char *` for the destination: koffi needs to know it is writable, and a
     // Buffer is what the caller owns. The ABI writes no NUL and reads no NUL --
     // `cap` and the return value are the whole contract.

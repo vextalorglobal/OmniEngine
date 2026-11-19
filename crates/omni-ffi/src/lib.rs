@@ -54,11 +54,12 @@
 //! SDKs therefore catch before Rust ever sees the failure.
 
 use std::cell::{Ref, RefCell, RefMut};
-use std::ffi::{c_char, c_double, c_void};
+use std::ffi::{CStr, c_char, c_double, c_void};
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::slice;
+use omni_cluster::ClusterClient;
 
 use omni_core::{Engine, ErrorKind, HostError, HostOutcome, OmniError, Value};
 
@@ -93,6 +94,8 @@ pub const OMNI_ERR_HOST: u32 = 5;
 /// it. Only reachable from a host function that calls back into the engine that
 /// is calling it — see the module doc's third rule.
 pub const OMNI_ERR_REENTRANT: u32 = 6;
+/// A cluster transport or worker protocol failure was not a program error.
+pub const OMNI_ERR_CLUSTER: u32 = 12;
 
 pub const OMNI_NUMBER: u32 = 0;
 pub const OMNI_NIL: u32 = 1;
@@ -109,6 +112,13 @@ pub const OMNI_STRING: u32 = 4;
 /// stale `omni.dll` turns into one clear error at import instead of a wrong
 /// number ten thousand calls later.
 ///
+/// Version 5 is the permission increment: [`omni_engine_allow_fs_read`],
+/// [`omni_engine_allow_fs_write`], and [`omni_engine_set_module_root`] make
+/// the sandbox configurable through the C ABI. Every existing export keeps
+/// its exact signature — the bump says the *permission surface* is now part
+/// of the contract by name, so a host built against v5 refuses an engine
+/// that cannot configure a sandbox rather than silently running with none.
+///
 /// Version 4 is the batch increment, and like version 3 it changed no layout:
 /// `OmniValue` is still 16 bytes at the same offsets and `OmniStats` is still 72.
 /// The bump is for [`omni_exec_many`] and [`omni_batch_error`], which a v3 host
@@ -118,7 +128,13 @@ pub const OMNI_STRING: u32 = 4;
 ///
 /// Version 3 was the callback increment: [`omni_host_fn`], [`OMNI_ERR_HOST`] and
 /// [`OMNI_ERR_REENTRANT`], none of which a v2 host could declare or recognise.
-pub const OMNI_ABI_VERSION: u32 = 4;
+pub const OMNI_ABI_VERSION: u32 = 6;
+
+/// The longest path (in bytes) the permission exports accept. A sandbox
+/// configuration longer than this is a configuration bug, not a path; the
+/// ceiling is the same one plugin load paths get, and it keeps the
+/// canonicalization work bounded. Mirrors `OMNI_MAX_PATH` in `omni.h`.
+pub const OMNI_MAX_PATH: usize = 4096;
 
 /// The payload of an [`OmniValue`]: whichever arm its tag says is live.
 ///
@@ -852,6 +868,119 @@ pub unsafe extern "C" fn omni_exec(
             Err(error) => status_for(error.kind),
         }
     })
+}
+
+/// Execute a source task on a distributed worker pool.
+///
+/// `nodes` is an array of C strings containing TCP addresses. `psk` must point
+/// to exactly 32 bytes. The call is synchronous, rotates through healthy
+/// workers, retries transport failures, and rewinds/reuses the engine egress
+/// block for remote string results exactly like `omni_exec`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn omni_exec_remote(
+    engine: *mut OmniEngine,
+    nodes: *const *const c_char,
+    node_count: usize,
+    psk: *const u8,
+    psk_len: usize,
+    src: *const c_char,
+    len: usize,
+    gas: u64,
+    retries: u32,
+    out: *mut OmniValue,
+    error: *mut c_char,
+    error_cap: usize,
+) -> u32 {
+    if engine.is_null()
+        || nodes.is_null()
+        || node_count == 0
+        || psk.is_null()
+        || psk_len != 32
+        || out.is_null()
+        || len > MAX_SOURCE_LEN
+        || (src.is_null() && len != 0)
+    {
+        return OMNI_ERR_ARG;
+    }
+    let source = if len == 0 {
+        ""
+    } else {
+        let bytes = unsafe { slice::from_raw_parts(src.cast::<u8>(), len) };
+        match std::str::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(_) => return OMNI_ERR_ARG,
+        }
+    };
+    let psk_bytes = unsafe { slice::from_raw_parts(psk, 32) };
+    let mut key = [0u8; 32];
+    key.copy_from_slice(psk_bytes);
+    let ptrs = unsafe { slice::from_raw_parts(nodes, node_count) };
+    let mut addrs = Vec::with_capacity(node_count);
+    for ptr in ptrs {
+        if ptr.is_null() {
+            return OMNI_ERR_ARG;
+        }
+        let addr = match unsafe { CStr::from_ptr(*ptr) }.to_str() {
+            Ok(text) => text,
+            Err(_) => return OMNI_ERR_ARG,
+        };
+        addrs.push(addr.to_string());
+    }
+    let handle = unsafe { &*engine };
+    let mut engine = match borrow_mut(handle) {
+        Ok(engine) => engine,
+        Err(code) => return code,
+    };
+    guarded(|| {
+        engine.egress_rewind();
+        let client = ClusterClient::new(addrs, key);
+        match client.run_remote(source, gas, retries) {
+            Ok(reply) => match reply.status {
+                omni_cluster::TaskStatus::Compile => {
+                    write_remote_error(error, error_cap, &reply.text);
+                    OMNI_ERR_COMPILE
+                }
+                omni_cluster::TaskStatus::Runtime => {
+                    write_remote_error(error, error_cap, &reply.text);
+                    OMNI_ERR_RUNTIME
+                }
+                omni_cluster::TaskStatus::Ok => {
+                    write_remote_error(error, error_cap, "");
+                    let value = match reply.kind {
+                        omni_cluster::ValueTag::Number => Value::from_f64(reply.num),
+                        omni_cluster::ValueTag::Bool => Value::bool(reply.num != 0.0),
+                        omni_cluster::ValueTag::String => match engine.promote_external_string(reply.text.as_bytes()) {
+                            Some(value) => value,
+                            None => Value::UNDEF,
+                        },
+                        omni_cluster::ValueTag::Nil => Value::NIL,
+                        omni_cluster::ValueTag::Undef => Value::UNDEF,
+                    };
+                    unsafe { *out = encode(&engine, value) };
+                    OMNI_OK
+                }
+            },
+            Err(err) => {
+                let text = err.to_string();
+                write_remote_error(error, error_cap, &text);
+                OMNI_ERR_CLUSTER
+            }
+        }
+    })
+}
+
+fn write_remote_error(error: *mut c_char, cap: usize, text: &str) {
+    if error.is_null() || cap == 0 {
+        return;
+    }
+    let mut bytes = text.as_bytes();
+    if bytes.len() >= cap {
+        bytes = &bytes[..cap - 1];
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(bytes.as_ptr(), error.cast::<u8>(), bytes.len());
+        *error.add(bytes.len()).cast::<u8>() = 0;
+    }
 }
 
 /// Read and validate `count` sources from caller-owned arrays.
@@ -1703,6 +1832,113 @@ pub unsafe extern "C" fn omni_plugin_count(engine: *const OmniEngine) -> usize {
     guarded_len(|| handle.plugins.borrow().len())
 }
 
+/// The shared front door of the three permission exports: handle and path
+/// checks, UTF-8 validation, the borrow guard, then `grant` runs inside it.
+///
+/// The path is length-prefixed, so it may contain any UTF-8 the host
+/// platform allows in a path; no NUL terminator is required or consulted.
+/// A path that cannot be canonicalized is refused with [`OMNI_ERR_ARG`]:
+/// the engine records only roots it could resolve, which is the fail-closed
+/// half of the sandbox.
+fn grant_path(
+    engine: *mut OmniEngine,
+    path: *const c_char,
+    path_len: usize,
+    grant: impl FnOnce(&mut Engine, &str) -> u32,
+) -> u32 {
+    if engine.is_null() || path.is_null() || path_len == 0 || path_len > OMNI_MAX_PATH {
+        return OMNI_ERR_ARG;
+    }
+    // Safety: bounded length, and the caller guarantees `path` is readable for it.
+    let bytes = unsafe { slice::from_raw_parts(path.cast::<u8>(), path_len) };
+    let Ok(path) = std::str::from_utf8(bytes) else {
+        return OMNI_ERR_ARG;
+    };
+    // Safety: the null check above ran, and the caller guarantees the handle
+    // is live.
+    let mut engine = match borrow_mut(unsafe { &*engine }) {
+        Ok(engine) => engine,
+        Err(code) => return code,
+    };
+    guarded(|| grant(&mut engine, path))
+}
+
+/// Allow `fs.read_text` to read files under `path` on this engine.
+///
+/// The root is canonicalized once, here, so every later containment check
+/// compares a canonical path to a canonical root; re-granting an existing
+/// root is a no-op. Returns [`OMNI_OK`], or [`OMNI_ERR_ARG`] for a null
+/// engine or path, an empty or over-`OMNI_MAX_PATH` path, non-UTF-8 bytes,
+/// or a path that cannot be canonicalized, and [`OMNI_ERR_REENTRANT`] from
+/// inside a callback on the same handle.
+///
+/// # Safety
+///
+/// `engine` must come from [`omni_engine_new`]; `path` must be readable for
+/// `path_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn omni_engine_allow_fs_read(
+    engine: *mut OmniEngine,
+    path: *const c_char,
+    path_len: usize,
+) -> u32 {
+    grant_path(engine, path, path_len, |engine, path| {
+        match engine.allow_fs_read(path) {
+            Ok(()) => OMNI_OK,
+            Err(_) => OMNI_ERR_ARG,
+        }
+    })
+}
+
+/// Allow `fs.write_text` to write files under `path` on this engine.
+///
+/// The same contract as [`omni_engine_allow_fs_read`], for the write root
+/// set: canonicalized once, deduplicated, refused when unresolvable.
+///
+/// # Safety
+///
+/// `engine` must come from [`omni_engine_new`]; `path` must be readable for
+/// `path_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn omni_engine_allow_fs_write(
+    engine: *mut OmniEngine,
+    path: *const c_char,
+    path_len: usize,
+) -> u32 {
+    grant_path(engine, path, path_len, |engine, path| {
+        match engine.allow_fs_write(path) {
+            Ok(()) => OMNI_OK,
+            Err(_) => OMNI_ERR_ARG,
+        }
+    })
+}
+
+/// Set the directory `import` resolves modules under, replacing any previous
+/// module root.
+///
+/// Returns [`OMNI_OK`], or [`OMNI_ERR_ARG`] for a null engine or path, an
+/// empty or over-`OMNI_MAX_PATH` path, non-UTF-8 bytes, or a path that
+/// cannot be canonicalized, and [`OMNI_ERR_REENTRANT`] from inside a
+/// callback on the same handle.
+///
+/// # Safety
+///
+/// `engine` must come from [`omni_engine_new`]; `path` must be readable for
+/// `path_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn omni_engine_set_module_root(
+    engine: *mut OmniEngine,
+    path: *const c_char,
+    path_len: usize,
+) -> u32 {
+    grant_path(engine, path, path_len, |engine, path| {
+        match engine.set_module_root(path) {
+            Ok(()) => OMNI_OK,
+            Err(_) => OMNI_ERR_ARG,
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1725,10 +1961,10 @@ mod tests {
     }
 
     #[test]
-    fn the_abi_reports_four_and_the_header_agrees() {
+    fn the_abi_reports_five_and_the_header_agrees() {
         assert_eq!(omni_abi_version(), OMNI_ABI_VERSION);
         assert_eq!(
-            OMNI_ABI_VERSION, 4,
+            OMNI_ABI_VERSION, 5,
             "the header and both SDKs hard-code this"
         );
     }

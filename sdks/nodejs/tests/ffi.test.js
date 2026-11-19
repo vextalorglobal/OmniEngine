@@ -364,9 +364,9 @@ test('the OmniStats layout matches omni.h', () => {
 test('the ABI level is read from the library, not assumed', () => {
   const engine = new Engine();
   try {
-    assert.equal(engine.abiVersion, 4);
+    assert.equal(engine.abiVersion, 5);
     assert.equal(engine.abiVersion, bindings.ABI_VERSION);
-    assert.equal(omni.ABI_VERSION, 4);
+    assert.equal(omni.ABI_VERSION, 5);
   } finally {
     engine.close();
   }

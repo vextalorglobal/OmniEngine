@@ -71,6 +71,7 @@ from ._ffi import (
     MAX_STRING_LEN,
     OMNI_MAX_OPCODES,
     OMNI_ABI_VERSION,
+    OMNI_ERR_CLUSTER,
     OMNI_ERR_REENTRANT,
     OMNI_ERR_RUNTIME,
     OMNI_OK,
@@ -94,6 +95,7 @@ from ._ffi import check_update as _ffi_check_update
 
 __all__ = [
     "Engine",
+    "Cluster",
     "Result",
     "Stats",
     "Profile",
@@ -583,7 +585,7 @@ class Engine:
         ``int``, everything else stays ``float``, and strings and booleans come
         back as ``str`` and ``bool``.
 
-        ``list`` and ``dict`` are not in that list because ABI 4 has no collection
+        ``list`` and ``dict`` are not in that list because ABI 5 has no collection
         type for a program to produce yet; there is nothing to unwrap into them.
         When the language grows one, the conversion belongs in
         :attr:`Result.value`, which this method and ``eval_str`` both read.
@@ -827,6 +829,46 @@ class Engine:
         """
         return self._require().profile()
 
+    def allow_fs_read(self, path: str | os.PathLike) -> None:
+        """Allow ``fs.read_text`` to read files under ``path`` on this engine.
+
+        The path is canonicalized once, now; the grant applies only to this
+        engine instance. Forks made later snapshot it, sibling engines never
+        see it, and a program that reads outside every granted root fails
+        closed with a positioned error naming the request.
+
+        Raises:
+            OmniLibraryError: the loaded library predates the permission exports.
+            OmniError: the engine refused the call (bad path, or re-entrant).
+        """
+        self._require().allow_fs_read(os.fspath(path))
+
+    def allow_fs_write(self, path: str | os.PathLike) -> None:
+        """Allow ``fs.write_text`` to write files under ``path`` on this engine.
+
+        The path is canonicalized once, now; the grant applies only to this
+        engine instance, with the same fork-snapshot and sibling-isolation
+        rules as :meth:`allow_fs_read`.
+
+        Raises:
+            OmniLibraryError: the loaded library predates the permission exports.
+            OmniError: the engine refused the call (bad path, or re-entrant).
+        """
+        self._require().allow_fs_write(os.fspath(path))
+
+    def set_module_root(self, path: str | os.PathLike) -> None:
+        """Point this engine's ``import "name"`` at the modules under ``path``.
+
+        The path is canonicalized once, now; the grant applies only to this
+        engine instance, with the same fork-snapshot and sibling-isolation
+        rules as :meth:`allow_fs_read`.
+
+        Raises:
+            OmniLibraryError: the loaded library predates the permission exports.
+            OmniError: the engine refused the call (bad path, or re-entrant).
+        """
+        self._require().set_module_root(os.fspath(path))
+
     def close(self) -> None:
         """Release the engine, and every host function registered on it.
 
@@ -874,3 +916,55 @@ class Engine:
     def __repr__(self) -> str:
         state = "closed" if self._raw is None else f"v{self._raw.version()}"
         return f"<omni.Engine {state}>"
+
+    def run_remote(
+        self,
+        nodes: Sequence[str],
+        psk: bytes,
+        source: str | bytes,
+        gas: int = 0,
+        retries: int = 0,
+    ) -> Result:
+        """Route one task to a distributed worker pool."""
+        raw = self._require()
+        status, value, diagnostic = raw.exec_remote(nodes, psk, source, gas, retries)
+        self._last_status = status
+        if status != OMNI_OK:
+            raise OmniError(status, diagnostic or status_name(status))
+        text = raw.read_string(value)
+        return _convert(value, text)
+
+
+class Cluster:
+    """A remote OmniEngine pool using the same FFI value and error contract."""
+
+    def __init__(
+        self,
+        nodes: Sequence[str],
+        psk: bytes,
+        *,
+        library: ctypes.CDLL | None = None,
+    ) -> None:
+        self.nodes = tuple(nodes)
+        if len(psk) != 32:
+            raise ValueError("cluster PSK must be exactly 32 bytes")
+        self.psk = bytes(psk)
+        self.engine = Engine(library)
+
+    def run_remote(
+        self,
+        source: str | bytes,
+        gas: int = 0,
+        retries: int = 0,
+    ) -> Result:
+        return self.engine.run_remote(self.nodes, self.psk, source, gas, retries)
+
+    def close(self) -> None:
+        self.engine.close()
+
+    def __enter__(self) -> "Cluster":
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        self.close()
+        return False

@@ -102,6 +102,7 @@ OMNI_ERR_PANIC = 3
 OMNI_ERR_ARG = 4
 OMNI_ERR_HOST = 5
 OMNI_ERR_REENTRANT = 6
+OMNI_ERR_CLUSTER = 12
 
 STATUS = {
     OMNI_OK: "ok",
@@ -111,6 +112,7 @@ STATUS = {
     OMNI_ERR_ARG: "argument",
     OMNI_ERR_HOST: "host",
     OMNI_ERR_REENTRANT: "reentrant",
+    OMNI_ERR_CLUSTER: "cluster",
 }
 
 OMNI_NUMBER = 0
@@ -155,7 +157,11 @@ MAX_MANIFEST_LEN = 1 << 20
 
 #: Wire format of the value struct this module reads. Checked against the
 #: library at load; see the module docstring's rule 3.
-OMNI_ABI_VERSION = 4
+OMNI_ABI_VERSION = 6
+
+#: Longest path (in bytes) the permission exports accept. Mirrors
+#: ``OMNI_MAX_PATH`` in ``omni.h``; a longer path is an argument error.
+OMNI_MAX_PATH = 4096
 
 #: The ABI rejects any source ``len`` above this, so a huge value is an argument
 #: error rather than an out-of-bounds read.
@@ -571,6 +577,22 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
 
     lib.omni_exec.argtypes = [c_void_p, c_char_p, c_size_t, POINTER(OmniValue)]
     lib.omni_exec.restype = c_uint32
+    if hasattr(lib, "omni_exec_remote"):
+        lib.omni_exec_remote.argtypes = [
+            c_void_p,
+            POINTER(c_char_p),
+            c_size_t,
+            c_void_p,
+            c_size_t,
+            c_char_p,
+            c_size_t,
+            c_uint64,
+            c_uint32,
+            POINTER(OmniValue),
+            c_char_p,
+            c_size_t,
+        ]
+        lib.omni_exec_remote.restype = c_uint32
 
     lib.omni_exec_number.argtypes = [c_void_p, c_char_p, c_size_t, POINTER(c_double)]
     lib.omni_exec_number.restype = c_uint32
@@ -663,6 +685,19 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     if hasattr(lib, "omni_opcode_name"):
         lib.omni_opcode_name.argtypes = [c_uint32, POINTER(ctypes.c_char), c_size_t]
         lib.omni_opcode_name.restype = c_size_t
+
+    # The ABI 5 permission exports. A library built before them still serves
+    # every other call; RawEngine.allow_fs_read() and friends turn the missing
+    # symbol into one clear error at the moment a grant is asked for.
+    for name in (
+        "omni_engine_allow_fs_read",
+        "omni_engine_allow_fs_write",
+        "omni_engine_set_module_root",
+    ):
+        if hasattr(lib, name):
+            function = getattr(lib, name)
+            function.argtypes = [c_void_p, c_char_p, c_size_t]
+            function.restype = c_uint32
     return lib
 
 
@@ -899,6 +934,46 @@ class RawEngine:
         out = OmniValue()
         status = self._lib.omni_exec(self._handle, data, len(data), byref(out))
         return status, out
+
+    def exec_remote(
+        self,
+        nodes: Sequence[str],
+        psk: bytes,
+        source: str | bytes,
+        gas: int = 0,
+        retries: int = 0,
+    ) -> tuple[int, OmniValue, str]:
+        """Dispatch one task through the native cluster pool."""
+        fn = getattr(self._lib, "omni_exec_remote", None)
+        if fn is None:
+            raise OmniLibraryError(
+                "the loaded library predates omni_exec_remote; rebuild omni-ffi"
+            )
+        if len(psk) != 32:
+            raise ValueError("cluster PSK must be exactly 32 bytes")
+        data = self._encode(source)
+        node_bytes = [node.encode("utf-8") for node in nodes]
+        if not node_bytes:
+            raise ValueError("cluster pool must contain at least one node")
+        ptr_array = (c_char_p * len(node_bytes))(*node_bytes)
+        key = (ctypes.c_char * 32).from_buffer_copy(psk)
+        out = OmniValue()
+        err = ctypes.create_string_buffer(4096)
+        status = fn(
+            self._handle,
+            ptr_array,
+            len(node_bytes),
+            key,
+            32,
+            data,
+            len(data),
+            c_uint64(gas),
+            c_uint32(retries),
+            byref(out),
+            err,
+            len(err),
+        )
+        return status, out, err.value.decode("utf-8", "replace")
 
     def exec_number(self, source: str | bytes) -> tuple[int, float]:
         data = self._encode(source)
@@ -1238,6 +1313,71 @@ class RawEngine:
             opcode_calls=calls,
             opcode_ns=nanos,
         )
+
+    def allow_fs_read(self, path: str | bytes) -> None:
+        """Allow ``fs.read_text`` to read files under ``path`` on this engine.
+
+        The path is canonicalized once, now; the grant applies only to this
+        engine instance. Forks made later snapshot it, sibling engines never
+        see it, and a program that reads outside every granted root fails
+        closed with a positioned error naming the request.
+
+        Raises:
+            OmniLibraryError: the loaded library predates the permission exports.
+            OmniError: the engine refused the call (bad path, or re-entrant).
+        """
+        self._grant("omni_engine_allow_fs_read", path)
+
+    def allow_fs_write(self, path: str | bytes) -> None:
+        """Allow ``fs.write_text`` to write files under ``path`` on this engine.
+
+        The path is canonicalized once, now; the grant applies only to this
+        engine instance, with the same fork-snapshot and sibling-isolation
+        rules as :meth:`allow_fs_read`.
+
+        Raises:
+            OmniLibraryError: the loaded library predates the permission exports.
+            OmniError: the engine refused the call (bad path, or re-entrant).
+        """
+        self._grant("omni_engine_allow_fs_write", path)
+
+    def set_module_root(self, path: str | bytes) -> None:
+        """Point this engine's ``import "name"`` at the modules under ``path``.
+
+        The path is canonicalized once, now; the grant applies only to this
+        engine instance, with the same fork-snapshot and sibling-isolation
+        rules as :meth:`allow_fs_read`.
+
+        Raises:
+            OmniLibraryError: the loaded library predates the permission exports.
+            OmniError: the engine refused the call (bad path, or re-entrant).
+        """
+        self._grant("omni_engine_set_module_root", path)
+
+    def _grant(self, symbol: str, path: str | bytes) -> None:
+        """The shared front door of the three permission methods.
+
+        Checks the host-side misuse first — a missing export, an empty or
+        over-long path — so a Python caller gets a deterministic Python error,
+        then hands the validated bytes to the engine.
+        """
+        function = getattr(self._lib, symbol, None)
+        if function is None:
+            raise OmniLibraryError(
+                f"the loaded OmniEngine library predates the permission exports "
+                f"({symbol}). Rebuild it with:\n    cargo build -p omni-ffi"
+            )
+        data = path.encode("utf-8") if isinstance(path, str) else bytes(path)
+        if not data:
+            raise OmniError(OMNI_ERR_ARG, "a permission path must not be empty")
+        if len(data) > OMNI_MAX_PATH:
+            raise OmniError(
+                OMNI_ERR_ARG,
+                f"path is {len(data)} bytes; the ABI accepts at most {OMNI_MAX_PATH}",
+            )
+        status = function(self._handle, data, len(data))
+        if status != OMNI_OK:
+            raise OmniError(status, self.last_error())
 
     def last_error(self, cap: int = 4096) -> str:
         buf = ctypes.create_string_buffer(cap)

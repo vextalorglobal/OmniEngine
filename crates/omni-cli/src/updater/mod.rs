@@ -44,7 +44,7 @@ pub const ALLOW_INSECURE_ENV: &str = "OMNI_ALLOW_INSECURE";
 
 /// The ABI this build speaks. Kept next to the engine's constant by
 /// `scripts/check-versions.py` so a release cannot ship two answers.
-pub const ABI_VERSION: u32 = 4;
+pub const ABI_VERSION: u32 = 5;
 
 /// The version of the running binary, and the reference a manifest is compared
 /// against. `omni` and `omniup` are built from this crate and released

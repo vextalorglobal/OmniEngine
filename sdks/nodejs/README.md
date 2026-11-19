@@ -98,12 +98,21 @@ returns the language value as a native JS primitive: `number`, `string`,
 in microseconds. `setProfiling(true)` turns on the per-opcode nanosecond split,
 and `profile()` returns the most recent execution's cost: `totalInstructions`,
 `elapsedNs`, `peakBytes`, and `opcodeCalls` / `opcodeNs` as objects keyed by
-opcode mnemonic. `json.parse` and `json.stringify` cover the scalar kinds ABI 4
+opcode mnemonic. `json.parse` and `json.stringify` cover the scalar kinds ABI 5
 can carry and refuse arrays and objects. The two `fs` builtins fail closed
-through this SDK: permission roots are granted by a Rust embedder, and ABI 4 has
-no export that adds one, so a script gets
+until you grant a root, so a script gets
 `fs.read_text is disabled: this engine has no filesystem read permission`
-rather than disk access. `text` is a `Buffer` with the
+rather than disk access:
+
+```js
+engine.allowFsRead('/srv/app-data');               // fs.read_text opens this root
+engine.allowFsWrite('/srv/app-data');              // fs.write_text opens it too
+engine.setModuleRoot('/srv/omni-modules');         // import "name" loads name.omni
+```
+
+Each grant is canonicalized once, applies only to that engine instance, and
+never leaks into sibling engines or the workers behind `runParallel()`. `text`
+is a `Buffer` with the
 exact bytes of a string result — NULs included, because OmniEngine strings are
 length-delimited rather than C strings — and `value` is those bytes decoded as
 UTF-8. `number` is `0` for a string, on purpose: those eight payload bytes are

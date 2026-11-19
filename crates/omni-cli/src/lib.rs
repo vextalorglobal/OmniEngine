@@ -5,4 +5,5 @@
 //! it. Fetching, checksum verification and the atomic replacement itself live
 //! here so the two paths cannot drift.
 
+pub mod serve;
 pub mod updater;

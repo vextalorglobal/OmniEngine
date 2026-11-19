@@ -1,0 +1,16 @@
+[package]
+name = "omni-cluster"
+description = "Phase 13 distributed cluster execution: a PSK-authenticated, AEAD-encrypted worker protocol over std::net, with gas-bounded, permission-fail-closed remote task execution."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+omni-core.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

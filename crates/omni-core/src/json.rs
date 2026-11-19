@@ -1,4 +1,4 @@
-//! JSON for the scalar values ABI 4 can carry, and a clear refusal for the rest.
+//! JSON for the scalar values ABI 5 can carry, and a clear refusal for the rest.
 //!
 //! There is no array and no object in [`crate::Value`]: the ABI hands a host a
 //! sixteen-byte struct, and a collection would need a second representation,
@@ -23,7 +23,7 @@ pub(crate) enum Scalar {
 /// The message a caller sees for a JSON collection. Kept here so the parser and
 /// the engine's error formatting cannot drift apart.
 pub(crate) const COLLECTION: &str =
-    "arrays and objects are not supported at ABI 4; OmniEngine has no collection value";
+    "arrays and objects are not supported at ABI 5; OmniEngine has no collection value";
 
 pub(crate) fn parse(input: &str) -> Result<Scalar, String> {
     let mut parser = Parser {

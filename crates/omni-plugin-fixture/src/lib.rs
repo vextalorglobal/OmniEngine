@@ -34,7 +34,7 @@ const OMNI_HOST_ERR: i32 = 1;
 /// ABI copy of the loader's constants; the loader refuses any mismatch.
 const MAGIC: u32 = 0x4F4D_4E49;
 const PLUGIN_ABI_VERSION: u32 = 1;
-const OMNI_ABI_VERSION: u32 = 4;
+const OMNI_ABI_VERSION: u32 = 5;
 
 /// ABI copy of the loader's `OmniPluginFn` and `OmniPluginManifest`.
 #[repr(C)]

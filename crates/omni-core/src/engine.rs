@@ -934,6 +934,21 @@ impl Engine {
         Value::from_ptr(p)
     }
 
+    /// Put host-owned remote text in the engine's host-facing egress block.
+    ///
+    /// Remote execution crosses text without executing a synthetic Omni
+    /// program. This entry point rewinds egress, copies the text once, and
+    /// returns the same NaN-boxed string shape that local execution exposes.
+    pub fn promote_external_string(&mut self, bytes: &[u8]) -> Option<Value> {
+        if bytes.is_empty() {
+            return None;
+        }
+        self.egress.rewind();
+        let p = object::build(&mut self.egress, bytes);
+        self.strings_built += 1;
+        Some(Value::from_ptr(p))
+    }
+
     /// The most recent failure, if the last `exec` failed.
     pub fn last_error(&self) -> Option<&OmniError> {
         self.last_error.as_ref()
@@ -952,6 +967,11 @@ impl Engine {
     /// Read-only view of the host-facing egress block.
     pub fn egress(&self) -> &Arena {
         &self.egress
+    }
+
+    /// Reclaim only the host-facing remote-result buffer for a cluster call.
+    pub fn egress_rewind(&mut self) {
+        self.egress.rewind();
     }
 
     /// Inject a binding that survives across executions. This is how a host
@@ -1156,7 +1176,7 @@ impl Engine {
     ///
     /// The budget is deterministic: the same program stops at the same
     /// instruction and reports the same position on every host. It is a Rust
-    /// policy, not part of ABI 4, so the SDKs cannot set it yet.
+    /// policy, not part of the C ABI, so the SDKs cannot set it yet.
     pub fn set_step_limit(&mut self, steps: u64) {
         self.step_limit = steps;
     }
@@ -4669,6 +4689,86 @@ mod tests {
         );
         std::fs::remove_file(&outside).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_fork_snapshots_permissions_and_later_grants_stay_local() {
+        let root_a = temp_root("fork-grant-a");
+        let root_b = temp_root("fork-grant-b");
+        std::fs::write(root_a.join("a.txt"), "from a").unwrap();
+        std::fs::write(root_b.join("b.txt"), "from b").unwrap();
+
+        let mut parent = Engine::new();
+        parent.allow_fs_read(&root_a).unwrap();
+        let mut child = parent.fork();
+        // A grant recorded after the fork must not leak into the child.
+        parent.allow_fs_read(&root_b).unwrap();
+
+        let read_b = format!("fs.read_text({:?})", root_b.join("b.txt"));
+        let got = parent.exec(&read_b).unwrap();
+        assert_eq!(parent.render(got), "from b");
+        let denied = child.exec(&read_b).unwrap_err();
+        assert!(
+            denied
+                .message
+                .ends_with("is outside the allowed read roots"),
+            "{denied}"
+        );
+        let read_a = format!("fs.read_text({:?})", root_a.join("a.txt"));
+        let got = child.exec(&read_a).unwrap();
+        assert_eq!(child.render(got), "from a");
+        std::fs::remove_dir_all(&root_a).unwrap();
+        std::fs::remove_dir_all(&root_b).unwrap();
+    }
+
+    #[test]
+    fn parallel_workers_inherit_the_parents_grants_and_strangers_stay_denied() {
+        let root = temp_root("fork-parallel");
+        std::fs::write(root.join("n.txt"), "7").unwrap();
+        let mut e = Engine::new();
+        e.allow_fs_read(&root).unwrap();
+        let program = format!("fs.read_text({:?})", root.join("n.txt"));
+
+        let items = e.exec_parallel(&[&program, &program], 2);
+        assert_eq!(items.len(), 2);
+        for item in items {
+            assert!(item.error.is_none());
+            assert_eq!(e.render(item.value), "7");
+        }
+        // A sibling engine without the grant answers the same program with
+        // the fail-closed default: no roots, no reads.
+        let mut stranger = Engine::new();
+        let denied = stranger.exec(&program).unwrap_err();
+        assert_eq!(
+            denied.message,
+            "fs.read_text is disabled: this engine has no filesystem read permission"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_fork_snapshots_the_module_root() {
+        let root_a = temp_root("fork-mod-a");
+        let root_b = temp_root("fork-mod-b");
+        write_module(&root_a, "helper", "let answer = 40 + 2");
+        write_module(&root_b, "other", "let answer = 1");
+
+        let mut parent = Engine::new();
+        parent.set_module_root(&root_a).unwrap();
+        let mut child = parent.fork();
+        parent.set_module_root(&root_b).unwrap();
+
+        let got = child.exec("import \"helper\"\nhelper.answer").unwrap();
+        assert_eq!(child.render(got), "42");
+        let denied = child.exec("import \"other\"").unwrap_err();
+        assert!(
+            denied
+                .message
+                .starts_with("cannot import 'other': no such module"),
+            "{denied}"
+        );
+        std::fs::remove_dir_all(&root_a).unwrap();
+        std::fs::remove_dir_all(&root_b).unwrap();
     }
 
     #[cfg(unix)]

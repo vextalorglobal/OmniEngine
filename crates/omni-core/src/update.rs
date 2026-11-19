@@ -10,7 +10,7 @@
 //! ```json
 //! {
 //!   "version": "0.2.0",
-//!   "abi": 4,
+//!   "abi": 5,
 //!   "assets": {
 //!     "win32-x64": { "url": "https://…/omni-win32-x64.exe", "sha256": "…" }
 //!   }

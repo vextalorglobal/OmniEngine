@@ -228,6 +228,40 @@ class Engine {
     return toResult(raw, this._copyString(raw));
   }
 
+  /** Dispatch one task to a distributed worker pool. */
+  runRemote(nodes, psk, source, gas = 0, retries = 0) {
+    const b = this._require();
+    if (!b.execRemote) throw new OmniLibraryError('the loaded library predates omni_exec_remote');
+    if (!Array.isArray(nodes) || nodes.length === 0) throw new OmniError(STATUS.ERR_ARG, 'cluster pool must contain at least one node');
+    if (!Buffer.isBuffer(psk) || psk.length !== 32) throw new OmniError(STATUS.ERR_ARG, 'cluster PSK must be exactly 32 bytes');
+    const nodeBuffers = nodes.map((node) => Buffer.from(String(node) + '\0', 'utf8'));
+    const nodeAddrs = new BigUint64Array(nodeBuffers.length);
+    for (let i = 0; i < nodeBuffers.length; i++) nodeAddrs[i] = BigInt(b.koffi.address(nodeBuffers[i]));
+    const src = encode(source);
+    const diagnostic = Buffer.alloc(4096);
+    const status = Number(b.execRemote(
+      this._handle,
+      nodeAddrs,
+      nodeBuffers.length,
+      psk,
+      32,
+      src,
+      src.length,
+      BigInt(gas),
+      retries,
+      this._valueOut,
+      diagnostic,
+      diagnostic.length
+    ));
+    this._lastStatus = status;
+    if (status !== STATUS.OK) {
+      const text = diagnostic.toString('utf8').split('\0', 1)[0];
+      throw new OmniError(status, text || statusName(status));
+    }
+    const raw = b.koffi.decode(this._valueOut, b.OmniValue);
+    return toResult(raw, this._copyString(raw));
+  }
+
   /**
    * Evaluate `source` requiring a number.
    *
@@ -772,6 +806,81 @@ class Engine {
   }
 
   /**
+   * Allow `fs.read_text` to read files under `path` on this engine.
+   *
+   * The path is canonicalized once, now; the grant applies only to this engine
+   * instance. Forks made later snapshot it, sibling engines never see it, and a
+   * program that reads outside every granted root fails closed with a positioned
+   * error naming the request.
+   *
+   * @param {string | Buffer} path
+   * @throws {TypeError} if the path is a string containing a NUL byte
+   * @throws {OmniLibraryError} if the loaded library predates the permission exports
+   */
+  allowFsRead(path) {
+    this._grant('allowFsRead', 'omni_engine_allow_fs_read', path);
+  }
+
+  /**
+   * Allow `fs.write_text` to write files under `path` on this engine.
+   *
+   * The path is canonicalized once, now; the grant applies only to this engine
+   * instance, with the same fork-snapshot and sibling-isolation rules as
+   * {@link Engine#allowFsRead}.
+   *
+   * @param {string | Buffer} path
+   * @throws {TypeError} if the path is a string containing a NUL byte
+   * @throws {OmniLibraryError} if the loaded library predates the permission exports
+   */
+  allowFsWrite(path) {
+    this._grant('allowFsWrite', 'omni_engine_allow_fs_write', path);
+  }
+
+  /**
+   * Point this engine's `import "name"` at the modules under `path`.
+   *
+   * The path is canonicalized once, now; the grant applies only to this engine
+   * instance, with the same fork-snapshot and sibling-isolation rules as
+   * {@link Engine#allowFsRead}.
+   *
+   * @param {string | Buffer} path
+   * @throws {TypeError} if the path is a string containing a NUL byte
+   * @throws {OmniLibraryError} if the loaded library predates the permission exports
+   */
+  setModuleRoot(path) {
+    this._grant('setModuleRoot', 'omni_engine_set_module_root', path);
+  }
+
+  /**
+   * The shared front door of the three permission methods: presence of the
+   * export, NUL and length checks, then the validated bytes to the engine.
+   *
+   * @param {string} bindingKey  the key on the bindings object
+   * @param {string} abiName     the export name, for the library error
+   * @param {string | Buffer} path
+   */
+  _grant(bindingKey, abiName, path) {
+    const b = this._require();
+    const fn = b[bindingKey];
+    if (!fn) {
+      throw new OmniLibraryError(
+        `the loaded OmniEngine library predates the permission exports (${abiName}). Rebuild it with:\n` +
+          '    cargo build -p omni-ffi'
+      );
+    }
+    if (typeof path === 'string' && path.includes('\0')) {
+      throw new TypeError('a permission path must not contain a NUL byte');
+    }
+    const bytes = encodeBytes(path, b.MAX_PATH, 'path');
+    if (bytes.length === 0) {
+      throw new OmniError(STATUS.ERR_ARG, 'a permission path must not be empty');
+    }
+    const status = fn(this._handle, bytes, bytes.length);
+    this._lastStatus = status;
+    if (status !== STATUS.OK) throw new OmniError(status, this._error(b, status));
+  }
+
+  /**
    * Deliberately panic inside the engine and report the status.
    * Proves from a host that a Rust panic cannot unwind into the process.
    * Not part of the language; named after the ABI's test hook.
@@ -1237,8 +1346,27 @@ function envWantsCheck() {
   return ['1', 'true', 'yes'].includes(String(process.env[UPDATE_CHECK_ENV] || '').toLowerCase());
 }
 
+/** Transparent cluster routing backed by omni_exec_remote. */
+class Cluster {
+  constructor(nodes, psk, options = {}) {
+    this.nodes = Array.from(nodes);
+    this.psk = Buffer.isBuffer(psk) ? psk : Buffer.from(psk);
+    if (this.psk.length !== 32) throw new OmniError(STATUS.ERR_ARG, 'cluster PSK must be exactly 32 bytes');
+    this.engine = new Engine(options);
+  }
+
+  runRemote(source, gas = 0, retries = 0) {
+    return this.engine.runRemote(this.nodes, this.psk, source, gas, retries);
+  }
+
+  close() {
+    this.engine.close();
+  }
+}
+
 module.exports = {
   Engine,
+  Cluster,
   UpdateCheck,
   checkUpdates,
   platformKey,

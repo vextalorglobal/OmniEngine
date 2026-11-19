@@ -47,7 +47,7 @@ class VerticalSlice(unittest.TestCase):
         # The SDK refused to hand back a library whose layout this file cannot
         # read, so by the time an Engine exists the level is known.
         self.assertEqual(engine.abi_version, _ffi.OMNI_ABI_VERSION)
-        self.assertEqual(engine.abi_version, 4)
+        self.assertEqual(engine.abi_version, 5)
 
     def test_arithmetic_precedence_and_parentheses(self) -> None:
         engine = omni.Engine()
