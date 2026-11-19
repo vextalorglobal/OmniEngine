@@ -1,0 +1,4 @@
+.local/
+cloud-api.local.toml
+omni-gateway-state.json
+omni-gateway-state.json.lock

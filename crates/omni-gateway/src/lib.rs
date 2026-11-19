@@ -3,10 +3,13 @@
 use fs2::FileExt;
 use omni_cluster::wire::{ErrorCode, TaskStatus, ValueTag};
 use omni_cluster::{ClusterClient, RemoteError, TaskReply};
-use omni_core::{
-    CPU_LIMIT_MESSAGE, DEFAULT_STEP_LIMIT, Engine, ErrorKind, MEMORY_LIMIT_MESSAGE, Value,
-};
+use omni_core::DEFAULT_STEP_LIMIT;
 use ring::digest::{SHA256, digest};
+mod runners;
+use runners::{
+    ExecutionLimits, ExecutionRunner, LanguageDescriptor, RunnerError, RunnerOutput,
+    RunnerRegistry, RunnerResolutionError,
+};
 use rustls::ServerConfig;
 use rustls::pki_types::PrivateKeyDer;
 use rustls_pemfile::{certs, private_key};
@@ -25,6 +28,9 @@ const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_OVERHEAD: usize = 4096;
 const DEFAULT_STATE_PATH: &str = "omni-gateway-state.json";
 const STATE_PATH_ENV: &str = "OMNI_GATEWAY_STATE";
+const OMNI_LANGUAGE_ID: &str = "omni";
+const OMNI_LANGUAGE_NAME: &str = "OmniEngine";
+const OMNI_RUNTIME_NAME: &str = "omni-core";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TierPolicy {
@@ -406,6 +412,7 @@ impl HttpResponse {
 #[serde(deny_unknown_fields)]
 struct ExecuteRequest {
     source: String,
+    language: Option<String>,
     gas_limit: Option<u64>,
     timeout_ms: Option<u64>,
     verification: Option<String>,
@@ -464,6 +471,7 @@ pub struct Gateway {
     usage: Arc<Mutex<UsageState>>,
     next_request: AtomicU64,
     metrics: GatewayMetrics,
+    runners: RunnerRegistry,
 }
 
 impl Gateway {
@@ -532,6 +540,7 @@ impl Gateway {
             usage: Arc::new(Mutex::new(usage)),
             next_request: AtomicU64::new(1),
             metrics: GatewayMetrics::default(),
+            runners: RunnerRegistry::default(),
         })
     }
 
@@ -552,6 +561,9 @@ impl Gateway {
     ) -> HttpResponse {
         if path == self.settings.config.health_endpoint && method == "GET" {
             return self.health_response();
+        }
+        if path == "/v1/languages" && method == "GET" {
+            return self.languages_response();
         }
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         let is_execute = path == self.settings.config.execute_endpoint && method == "POST";
@@ -583,6 +595,32 @@ impl Gateway {
                     "enabled":self.settings.config.cluster.enabled,
                     "configured_workers":self.settings.config.cluster.worker_endpoints.len(),
                     "quorum":self.settings.config.cluster.quorum
+                }
+            })
+            .to_string(),
+            retry_after_seconds: None,
+        }
+    }
+
+    fn languages_response(&self) -> HttpResponse {
+        HttpResponse {
+            status: 200,
+            body: json!({
+                "languages":self.runners.languages(),
+                "limits":{
+                    "cpu_ms_per_request":self.settings.config.resource_limits.cpu_ms_per_request,
+                    "request_timeout_ms":self.settings.config.resource_limits.request_timeout_ms,
+                    "sandbox_memory_mib":self.settings.config.resource_limits.sandbox_memory_mib,
+                    "max_source_bytes":self.settings.config.resource_limits.max_source_bytes,
+                    "max_output_bytes":self.settings.config.resource_limits.max_output_bytes
+                },
+                "sandbox":{
+                    "filesystem_reads":self.settings.config.sandbox.filesystem_reads,
+                    "filesystem_writes":self.settings.config.sandbox.filesystem_writes,
+                    "module_imports":self.settings.config.sandbox.module_imports,
+                    "host_functions":self.settings.config.sandbox.host_functions,
+                    "network_access":self.settings.config.sandbox.network_access,
+                    "deterministic_verification":self.settings.config.sandbox.deterministic_verification
                 }
             })
             .to_string(),
@@ -658,6 +696,22 @@ impl Gateway {
                 None,
             );
         }
+        let requested_language = request.language.as_deref().unwrap_or("omni");
+        let runner = match self.runners.resolve(requested_language) {
+            Ok(runner) => runner,
+            Err(RunnerResolutionError::Unavailable(descriptor)) => {
+                return runtime_unavailable_response(request_id, descriptor);
+            }
+            Err(RunnerResolutionError::Unsupported(language)) => {
+                return HttpResponse::error(
+                    422,
+                    "unsupported_language",
+                    &format!("unsupported language '{language}'"),
+                    None,
+                );
+            }
+        };
+        let descriptor = runner.descriptor();
         let deterministic = match request.verification.as_deref() {
             Some("deterministic") => true,
             Some(_) => {
@@ -670,6 +724,15 @@ impl Gateway {
             }
             None => false,
         };
+        if deterministic && !runner.supports_deterministic_verification() {
+            return runtime_error_response(
+                request_id,
+                descriptor,
+                501,
+                "verification_unavailable",
+                "deterministic verification is not supported by this language runtime",
+            );
+        }
         if deterministic
             && (!self.settings.config.sandbox.deterministic_verification || self.cluster.is_none())
         {
@@ -713,6 +776,15 @@ impl Gateway {
                 "invalid_request",
                 "gas_limit must be greater than zero",
                 None,
+            );
+        }
+        if self.cluster.is_some() && !runner.supports_cluster_dispatch() {
+            return runtime_error_response(
+                request_id,
+                descriptor,
+                503,
+                "language_dispatch_unavailable",
+                "the configured worker protocol does not support this language runtime",
             );
         }
         let permit = match self.admit(&key) {
@@ -800,6 +872,7 @@ impl Gateway {
         self.execute_local(
             request_id,
             &key,
+            runner,
             &request.source,
             max_steps,
             timeout,
@@ -811,6 +884,7 @@ impl Gateway {
         &self,
         request_id: u64,
         key: &KeyState,
+        runner: &dyn ExecutionRunner,
         source: &str,
         max_steps: u64,
         cpu_ms: u64,
@@ -818,72 +892,15 @@ impl Gateway {
     ) -> HttpResponse {
         let memory_bytes =
             usize::try_from(memory_mib.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX);
-        if memory_mib == 0 {
-            return HttpResponse::error(
-                429,
-                "memory_limit_exceeded",
-                "execution has no sandbox memory budget",
-                None,
-            );
-        }
-        let mut engine = Engine::new();
-        engine.set_step_limit(max_steps);
-        engine.set_time_limit(Some(Duration::from_millis(cpu_ms)));
-        if !engine.set_memory_limit(memory_bytes) {
-            return HttpResponse::error(
-                429,
-                "memory_limit_exceeded",
-                "sandbox memory budget is smaller than the engine's existing allocations",
-                None,
-            );
-        }
-        let started = Instant::now();
-        let execution = engine.exec(source);
-        let elapsed = started.elapsed();
-        let stats = engine.stats();
-        let peak_memory = stats
-            .arena_bytes_reserved
-            .saturating_add(stats.egress_bytes_reserved);
-        if elapsed >= Duration::from_millis(cpu_ms) {
-            return HttpResponse::error(
-                429,
-                "cpu_limit_exceeded",
-                "execution exceeded the request CPU budget",
-                None,
-            );
-        }
-        if peak_memory > memory_mib.saturating_mul(1024 * 1024) {
-            return HttpResponse::error(
-                429,
-                "memory_limit_exceeded",
-                "execution exceeded the sandbox memory budget",
-                None,
-            );
-        }
-        match execution {
-            Ok(value) => self.success(request_id, &key, &engine, value, elapsed, peak_memory),
-            Err(error) => {
-                if error.message == CPU_LIMIT_MESSAGE {
-                    return HttpResponse::error(429, "cpu_limit_exceeded", &error.message, None);
-                }
-                if error.message == MEMORY_LIMIT_MESSAGE {
-                    return HttpResponse::error(429, "memory_limit_exceeded", &error.message, None);
-                }
-                let (status, code) = match error.kind {
-                    ErrorKind::Lex | ErrorKind::Parse => (400, "compile_error"),
-                    _ => (422, "runtime_error"),
-                };
-                HttpResponse {
-                    status,
-                    body: json!({
-                        "request_id": format!("req_{request_id}"),
-                        "status": "error",
-                        "error": {"code":code,"message":error.to_string()}
-                    })
-                    .to_string(),
-                    retry_after_seconds: None,
-                }
-            }
+        let limits = ExecutionLimits {
+            gas_limit: max_steps,
+            cpu_limit: Duration::from_millis(cpu_ms),
+            memory_limit_bytes: memory_bytes,
+            max_output_bytes: self.settings.config.resource_limits.max_output_bytes,
+        };
+        match runner.execute(source, limits) {
+            Ok(output) => self.success(request_id, key, runner.descriptor(), output),
+            Err(error) => runner_error_response(request_id, runner.descriptor(), error),
         }
     }
 
@@ -909,7 +926,15 @@ impl Gateway {
                     .fetch_add(1, Ordering::Relaxed);
             }
             if fallback {
-                return self.execute_local(request_id, key, source, gas, cpu_ms, memory_mib);
+                return self.execute_local(
+                    request_id,
+                    key,
+                    self.runners.omni(),
+                    source,
+                    gas,
+                    cpu_ms,
+                    memory_mib,
+                );
             }
             return HttpResponse::error(
                 503,
@@ -958,9 +983,15 @@ impl Gateway {
         }
         match result {
             Ok(reply) => self.remote_result(request_id, key, reply, elapsed),
-            Err(error) if fallback && is_transient_worker_error(&error) => {
-                self.execute_local(request_id, key, source, gas, cpu_ms, memory_mib)
-            }
+            Err(error) if fallback && is_transient_worker_error(&error) => self.execute_local(
+                request_id,
+                key,
+                self.runners.omni(),
+                source,
+                gas,
+                cpu_ms,
+                memory_mib,
+            ),
             Err(error) => remote_error_response(error),
         }
     }
@@ -992,6 +1023,12 @@ impl Gateway {
                     "request_id":format!("req_{request_id}"),
                     "tenant_id":key.tenant_id,
                     "status":"error",
+                    "runtime":{
+                        "language":OMNI_LANGUAGE_ID,
+                        "name":OMNI_LANGUAGE_NAME,
+                        "runtime":OMNI_RUNTIME_NAME,
+                        "available":true
+                    },
                     "error":{"code":code,"message":reply.text}
                 })
                 .to_string(),
@@ -1013,6 +1050,12 @@ impl Gateway {
                 "request_id":format!("req_{request_id}"),
                 "tenant_id":key.tenant_id,
                 "status":"ok",
+                "runtime":{
+                    "language":OMNI_LANGUAGE_ID,
+                    "name":OMNI_LANGUAGE_NAME,
+                    "runtime":OMNI_RUNTIME_NAME,
+                    "available":true
+                },
                 "value":value,
                 "usage":{
                     "cpu_ms":null,
@@ -1029,24 +1072,16 @@ impl Gateway {
         &self,
         request_id: u64,
         key: &KeyState,
-        engine: &Engine,
-        value: Value,
-        elapsed: Duration,
-        peak_memory: u64,
+        descriptor: LanguageDescriptor,
+        output: RunnerOutput,
     ) -> HttpResponse {
-        let rendered = engine.render(value);
-        if rendered.len() > self.settings.config.resource_limits.max_output_bytes {
-            return HttpResponse::error(
-                413,
-                "output_too_large",
-                "result exceeds configured output limit",
-                None,
-            );
-        }
-        let mut value_json = json!({"tag": value_tag(value), "text": rendered});
-        if let Some(number) = value.as_f64() {
+        let mut value_json = json!({
+            "tag":output.value.tag,
+            "text":output.value.text
+        });
+        if let Some(number) = output.value.number {
             value_json["number"] = json!(number);
-        } else if let Some(boolean) = value.as_bool() {
+        } else if let Some(boolean) = output.value.boolean {
             value_json["boolean"] = json!(boolean);
         }
         HttpResponse {
@@ -1055,10 +1090,16 @@ impl Gateway {
                 "request_id":format!("req_{request_id}"),
                 "tenant_id":key.tenant_id,
                 "status":"ok",
+                "runtime":{
+                    "language":descriptor.id,
+                    "name":descriptor.name,
+                    "runtime":descriptor.runtime,
+                    "available":descriptor.available
+                },
                 "value":value_json,
                 "usage":{
-                    "cpu_ms":elapsed.as_millis(),
-                    "peak_memory_bytes":peak_memory
+                    "cpu_ms":output.cpu_ms,
+                    "peak_memory_bytes":output.memory_bytes
                 }
             })
             .to_string(),
@@ -1134,11 +1175,34 @@ impl Gateway {
                 "gateway requires TLS",
             ));
         }
-        let tls = Arc::new(load_tls_config(
-            &self.settings.config.tls_cert,
-            &self.settings.config.tls_key,
-        )?);
-        let listener = TcpListener::bind(&self.settings.config.bind)?;
+        let tls = Arc::new(
+            load_tls_config(
+                &self.settings.config.tls_cert,
+                &self.settings.config.tls_key,
+            )
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "{error}. For local development, run .\\scripts\\dev-up.ps1 to generate valid PEM certificate and key files."
+                    ),
+                )
+            })?,
+        );
+        let listener = TcpListener::bind(&self.settings.config.bind).map_err(|error| {
+            let action = if error.kind() == io::ErrorKind::AddrInUse {
+                "the port is already in use; stop the existing listener or free this address"
+            } else {
+                "check that this address is valid and available"
+            };
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot bind gateway on {}: {action} ({error})",
+                    self.settings.config.bind
+                ),
+            )
+        })?;
         serve_tls_listener(listener, tls, self, None)
     }
 }
@@ -1229,6 +1293,71 @@ fn remote_error_response(error: RemoteError) -> HttpResponse {
         ),
     };
     HttpResponse::error(status, code, message, Some(1))
+}
+
+fn runtime_unavailable_response(request_id: u64, descriptor: LanguageDescriptor) -> HttpResponse {
+    let message = descriptor
+        .unavailable_reason
+        .unwrap_or("the selected runtime is not available");
+    runtime_error_response(request_id, descriptor, 503, "runtime_unavailable", message)
+}
+
+fn runtime_error_response(
+    request_id: u64,
+    descriptor: LanguageDescriptor,
+    status: u16,
+    code: &str,
+    message: &str,
+) -> HttpResponse {
+    HttpResponse {
+        status,
+        body: json!({
+            "request_id":format!("req_{request_id}"),
+            "status":"error",
+            "runtime":{
+                "language":descriptor.id,
+                "name":descriptor.name,
+                "runtime":descriptor.runtime,
+                "available":descriptor.available
+            },
+            "error":{"code":code,"message":message}
+        })
+        .to_string(),
+        retry_after_seconds: None,
+    }
+}
+
+fn runner_error_response(
+    request_id: u64,
+    descriptor: LanguageDescriptor,
+    error: RunnerError,
+) -> HttpResponse {
+    let (status, code, message) = match error {
+        RunnerError::Compile(message) => (400, "compile_error", message),
+        RunnerError::Runtime(message) => (422, "runtime_error", message),
+        RunnerError::GasLimit => (
+            429,
+            "gas_limit_exceeded",
+            "execution exceeded the configured instruction budget".to_string(),
+        ),
+        RunnerError::CpuLimit => (
+            429,
+            "cpu_limit_exceeded",
+            "execution exceeded the request CPU budget".to_string(),
+        ),
+        RunnerError::MemoryLimit => (
+            429,
+            "memory_limit_exceeded",
+            "execution exceeded the sandbox memory budget".to_string(),
+        ),
+        RunnerError::OutputLimit => (
+            413,
+            "output_too_large",
+            "result exceeds configured output limit".to_string(),
+        ),
+        RunnerError::UnsupportedResult(message) => (422, "unsupported_result", message),
+    };
+    runtime_error_response(request_id, descriptor, status, code, &message)
 }
 
 fn value_tag_name(tag: ValueTag) -> &'static str {
@@ -1441,44 +1570,74 @@ fn current_month() -> i64 {
     year * 12 + month
 }
 
-fn value_tag(value: Value) -> &'static str {
-    if value.is_string() {
-        "string"
-    } else if value.as_f64().is_some() {
-        "number"
-    } else if value.as_bool().is_some() {
-        "boolean"
-    } else if value == Value::UNDEF {
-        "undefined"
-    } else {
-        "null"
-    }
-}
-
 fn load_tls_config(cert_path: &Path, key_path: &Path) -> io::Result<ServerConfig> {
-    let mut cert_reader = BufReader::new(File::open(cert_path)?);
+    let mut cert_reader = BufReader::new(File::open(cert_path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot open TLS certificate {}: {error}",
+                cert_path.display()
+            ),
+        )
+    })?);
     let certificates = certs(&mut cert_reader)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid TLS certificate PEM in {}: {error}",
+                    cert_path.display()
+                ),
+            )
+        })?;
     if certificates.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "TLS certificate file is empty",
+            format!("TLS certificate file {} is empty", cert_path.display()),
         ));
     }
-    let mut key_reader = BufReader::new(File::open(key_path)?);
+    let mut key_reader = BufReader::new(File::open(key_path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot open TLS private key {}: {error}",
+                key_path.display()
+            ),
+        )
+    })?);
     let key: PrivateKeyDer<'static> = private_key(&mut key_reader)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid TLS private-key PEM in {}: {error}",
+                    key_path.display()
+                ),
+            )
+        })?
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                "TLS key file contains no private key",
+                format!(
+                    "TLS private-key file {} contains no private key",
+                    key_path.display()
+                ),
             )
         })?;
     ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certificates, key)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "TLS certificate {} and private key {} are incompatible: {error}",
+                    cert_path.display(),
+                    key_path.display()
+                ),
+            )
+        })
 }
 
 fn serve_tls_connection(
@@ -1912,6 +2071,31 @@ mod tests {
         GatewaySettings::parse(POLICY, CONFIG).unwrap()
     }
 
+    #[test]
+    fn gateway_startup_tls_errors_name_the_path_and_local_bootstrap() {
+        let directory = TestDirectory::new();
+        let certificate_path = directory.0.join("missing-cert.pem");
+        let private_key_path = directory.0.join("missing-key.pem");
+        let mut settings = settings();
+        settings.config.tls_cert = certificate_path.clone();
+        settings.config.tls_key = private_key_path;
+        let tier = settings.free_tier.clone();
+        let gateway = Arc::new(
+            Gateway::new_with_state_path(
+                settings,
+                vec![ApiKey::new(TOKEN, "tls-test", tier).unwrap()],
+                directory.state_path(),
+            )
+            .unwrap(),
+        );
+
+        let error = gateway.serve().unwrap_err().to_string();
+
+        assert!(error.contains(&certificate_path.display().to_string()));
+        assert!(error.contains("cannot open TLS certificate"));
+        assert!(error.contains(".\\scripts\\dev-up.ps1"));
+    }
+
     fn numeric_chain(count: usize) -> String {
         let mut source = String::from("let x0 = 1;");
         for index in 1..count {
@@ -1932,6 +2116,19 @@ mod tests {
         request_body(gateway, auth, &json!({"source":source}).to_string())
     }
 
+    fn request_language(
+        gateway: &Gateway,
+        auth: Option<&str>,
+        language: &str,
+        source: &str,
+    ) -> HttpResponse {
+        request_body(
+            gateway,
+            auth,
+            &json!({"language":language,"source":source}).to_string(),
+        )
+    }
+
     fn request_body(gateway: &Gateway, auth: Option<&str>, body: &str) -> HttpResponse {
         let mut headers = HashMap::new();
         headers.insert("Content-Type".to_string(), "application/json".to_string());
@@ -1939,6 +2136,197 @@ mod tests {
             headers.insert("Authorization".to_string(), auth.to_string());
         }
         gateway.handle("POST", "/v1/execute", &headers, body.as_bytes())
+    }
+
+    #[test]
+    fn execute_preserves_utf8_json_source_and_output() {
+        let settings = settings();
+        let test_dir = TestDirectory::new();
+        let gateway = Gateway::new_with_state_path(
+            settings.clone(),
+            vec![ApiKey::new(TOKEN, "unicode-tenant", settings.free_tier).unwrap()],
+            test_dir.state_path(),
+        )
+        .unwrap();
+        let expected = "বাংলা — हिन्दी — 日本語 — العربية — Ελληνικά — 😀";
+        let source = format!("// বাংলা — हिन्दी — 日本語 — العربية — Ελληνικά — 😀\n\"{expected}\"");
+
+        let response = request(&gateway, Some(&format!("Bearer {TOKEN}")), &source);
+
+        assert_eq!(response.status, 200, "{}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(body["value"]["text"], expected);
+        assert_eq!(body["runtime"]["language"], "omni");
+        assert!(response.body.contains(expected));
+    }
+
+    #[test]
+    fn execute_selects_lua_and_reports_the_runtime() {
+        let settings = settings();
+        let test_dir = TestDirectory::new();
+        let gateway = Gateway::new_with_state_path(
+            settings.clone(),
+            vec![ApiKey::new(TOKEN, "lua-tenant", settings.free_tier).unwrap()],
+            test_dir.state_path(),
+        )
+        .unwrap();
+
+        let response = request_language(
+            &gateway,
+            Some(&format!("Bearer {TOKEN}")),
+            "lua",
+            "return \"বাংলা — 日本語 — 😀\"",
+        );
+
+        assert_eq!(response.status, 200, "{}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(body["runtime"]["language"], "lua");
+        assert_eq!(body["runtime"]["runtime"], "mlua / Lua 5.4");
+        assert_eq!(body["value"]["tag"], "string");
+        assert_eq!(body["value"]["text"], "বাংলা — 日本語 — 😀");
+
+        let verification = request_body(
+            &gateway,
+            Some(&format!("Bearer {TOKEN}")),
+            &json!({
+                "language":"lua",
+                "source":"return 42",
+                "verification":"deterministic"
+            })
+            .to_string(),
+        );
+        assert_eq!(verification.status, 501);
+        let body: serde_json::Value = serde_json::from_str(&verification.body).unwrap();
+        assert_eq!(body["error"]["code"], "verification_unavailable");
+    }
+
+    #[test]
+    fn unsupported_and_unavailable_languages_have_distinct_errors() {
+        let settings = settings();
+        let test_dir = TestDirectory::new();
+        let gateway = Gateway::new_with_state_path(
+            settings.clone(),
+            vec![ApiKey::new(TOKEN, "language-errors", settings.free_tier).unwrap()],
+            test_dir.state_path(),
+        )
+        .unwrap();
+        let auth = format!("Bearer {TOKEN}");
+        let unavailable = request_language(&gateway, Some(&auth), "javascript", "return 1");
+        assert_eq!(unavailable.status, 503);
+        let body: serde_json::Value = serde_json::from_str(&unavailable.body).unwrap();
+        assert_eq!(body["error"]["code"], "runtime_unavailable");
+        assert_eq!(body["runtime"]["available"], false);
+
+        let unsupported = request_language(&gateway, Some(&auth), "ruby", "puts 1");
+        assert_eq!(unsupported.status, 422);
+        let body: serde_json::Value = serde_json::from_str(&unsupported.body).unwrap();
+        assert_eq!(body["error"]["code"], "unsupported_language");
+    }
+
+    #[test]
+    fn language_discovery_reports_runtime_status_and_sandbox_policy() {
+        let settings = settings();
+        let tier = settings.free_tier.clone();
+        let test_dir = TestDirectory::new();
+        let gateway = Gateway::new_with_state_path(
+            settings,
+            vec![ApiKey::new(TOKEN, "language-discovery", tier).unwrap()],
+            test_dir.state_path(),
+        )
+        .unwrap();
+
+        let response = gateway.handle("GET", "/v1/languages", &HashMap::new(), &[]);
+
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        let languages = body["languages"].as_array().unwrap();
+        assert!(
+            languages
+                .iter()
+                .any(|language| language["id"] == "lua" && language["available"] == true)
+        );
+        assert!(
+            languages
+                .iter()
+                .any(|language| language["id"] == "python" && language["available"] == false)
+        );
+        let lua = languages
+            .iter()
+            .find(|language| language["id"] == "lua")
+            .unwrap();
+        assert_eq!(lua["standard_libraries"], json!(["base", "math"]));
+        assert_eq!(lua["capabilities"]["filesystem_reads"], false);
+        assert_eq!(lua["capabilities"]["filesystem_writes"], false);
+        assert_eq!(lua["capabilities"]["module_imports"], false);
+        assert_eq!(lua["capabilities"]["host_functions"], false);
+        assert_eq!(lua["capabilities"]["network_access"], false);
+        assert_eq!(lua["capabilities"]["cluster_dispatch"], false);
+        assert_eq!(lua["capabilities"]["memory_limit"], true);
+        assert_eq!(body["sandbox"]["filesystem_reads"], false);
+        assert_eq!(body["sandbox"]["filesystem_writes"], false);
+        assert_eq!(body["sandbox"]["module_imports"], false);
+        assert_eq!(body["sandbox"]["host_functions"], false);
+        assert_eq!(body["sandbox"]["network_access"], false);
+        assert_eq!(body["sandbox"]["deterministic_verification"], true);
+        assert_eq!(body["limits"]["sandbox_memory_mib"], 128);
+    }
+
+    #[test]
+    fn lua_execution_obeys_gateway_cpu_and_instruction_limits() {
+        let settings = settings();
+        let test_dir = TestDirectory::new();
+        let gateway = Gateway::new_with_state_path(
+            settings.clone(),
+            vec![ApiKey::new(TOKEN, "lua-limits", settings.free_tier).unwrap()],
+            test_dir.state_path(),
+        )
+        .unwrap();
+        let auth = format!("Bearer {TOKEN}");
+        let gas_limited = request_body(
+            &gateway,
+            Some(&auth),
+            &json!({"language":"lua","source":"while true do end","gas_limit":200}).to_string(),
+        );
+        assert_eq!(gas_limited.status, 429);
+        let body: serde_json::Value = serde_json::from_str(&gas_limited.body).unwrap();
+        assert_eq!(body["error"]["code"], "gas_limit_exceeded");
+
+        let cpu_limited = request_body(
+            &gateway,
+            Some(&auth),
+            &json!({
+                "language":"lua",
+                "source":"while true do end",
+                "gas_limit":1000000000,
+                "timeout_ms":1
+            })
+            .to_string(),
+        );
+        assert_eq!(cpu_limited.status, 429);
+        let body: serde_json::Value = serde_json::from_str(&cpu_limited.body).unwrap();
+        assert_eq!(body["error"]["code"], "cpu_limit_exceeded");
+    }
+
+    #[test]
+    fn execute_enforces_source_limit_in_utf8_bytes() {
+        let settings = settings();
+        let max_source_bytes = settings.config.resource_limits.max_source_bytes;
+        let test_dir = TestDirectory::new();
+        let gateway = Gateway::new_with_state_path(
+            settings.clone(),
+            vec![ApiKey::new(TOKEN, "unicode-limit-tenant", settings.free_tier).unwrap()],
+            test_dir.state_path(),
+        )
+        .unwrap();
+        let source = format!("\"{}\"", "ক".repeat(max_source_bytes / "ক".len() + 1));
+        assert!(source.chars().count() < max_source_bytes);
+        assert!(source.len() > max_source_bytes);
+
+        let response = request(&gateway, Some(&format!("Bearer {TOKEN}")), &source);
+
+        assert_eq!(response.status, 413);
+        let body: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(body["error"]["code"], "source_too_large");
     }
 
     fn health(gateway: &Gateway) -> HttpResponse {
@@ -2631,6 +3019,25 @@ mod tests {
         let (status, body) = server.request(Some(&format!("Bearer {TOKEN}")), "40 + 2");
         assert_eq!(status, 200);
         assert!(body.contains("\"number\":42.0"));
+    }
+
+    #[test]
+    fn https_executes_selected_lua_runtime() {
+        let settings = settings();
+        let tier = settings.free_tier.clone();
+        let server = TestHttpsServer::start(settings, "tls-lua", tier);
+        let request = json!({
+            "language":"lua",
+            "source":"return \"বাংলা — 日本語 — 😀\""
+        })
+        .to_string();
+
+        let (status, body) = server.request_body(Some(&format!("Bearer {TOKEN}")), &request);
+
+        assert_eq!(status, 200, "{body}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["runtime"]["language"], "lua");
+        assert_eq!(body["value"]["text"], "বাংলা — 日本語 — 😀");
     }
 
     #[test]
