@@ -145,6 +145,15 @@ pub enum Message {
         gas: u64,
         source: Vec<u8>,
     },
+    /// Versioned task with per-request CPU and memory ceilings. Existing
+    /// `Task` framing remains unchanged for older clients and workers.
+    TaskWithLimits {
+        id: u64,
+        gas: u64,
+        cpu_ms: u64,
+        memory_mib: u64,
+        source: Vec<u8>,
+    },
     Result {
         id: u64,
         status: TaskStatus,
@@ -176,6 +185,7 @@ pub enum Message {
 //   Pong:    u8=3
 //   Error:   u8=4 | u64 id | u32 code
 //   Value:   u8=5 | u64 id | u32 tag | f64 num | u32 text_len | text
+//   TaskWithLimits: u8=6 | u64 id | u64 gas | u64 cpu_ms | u64 memory_mib | u32 src_len | src
 
 const TAG_TASK: u8 = 0;
 const TAG_RESULT: u8 = 1;
@@ -183,6 +193,7 @@ const TAG_PING: u8 = 2;
 const TAG_PONG: u8 = 3;
 const TAG_ERROR: u8 = 4;
 const TAG_VALUE: u8 = 5;
+const TAG_TASK_WITH_LIMITS: u8 = 6;
 
 impl Message {
     /// Encode to plaintext. The result is at most [`MAX_CLUSTER_TASK`] +
@@ -194,6 +205,21 @@ impl Message {
                 out.push(TAG_TASK);
                 out.extend_from_slice(&id.to_le_bytes());
                 out.extend_from_slice(&gas.to_le_bytes());
+                out.extend_from_slice(&(source.len() as u32).to_le_bytes());
+                out.extend_from_slice(source);
+            }
+            Message::TaskWithLimits {
+                id,
+                gas,
+                cpu_ms,
+                memory_mib,
+                source,
+            } => {
+                out.push(TAG_TASK_WITH_LIMITS);
+                out.extend_from_slice(&id.to_le_bytes());
+                out.extend_from_slice(&gas.to_le_bytes());
+                out.extend_from_slice(&cpu_ms.to_le_bytes());
+                out.extend_from_slice(&memory_mib.to_le_bytes());
                 out.extend_from_slice(&(source.len() as u32).to_le_bytes());
                 out.extend_from_slice(source);
             }
@@ -212,12 +238,7 @@ impl Message {
             }
             Message::Ping => out.push(TAG_PING),
             Message::Pong => out.push(TAG_PONG),
-            Message::Value {
-                id,
-                tag,
-                num,
-                text,
-            } => {
+            Message::Value { id, tag, num, text } => {
                 out.push(TAG_VALUE);
                 out.extend_from_slice(&id.to_le_bytes());
                 out.extend_from_slice(&tag.to_u32().to_le_bytes());
@@ -257,14 +278,34 @@ impl Message {
                     source: src.to_vec(),
                 })
             }
+            TAG_TASK_WITH_LIMITS => {
+                if rest.len() < 36 {
+                    return None;
+                }
+                let id = u64::from_le_bytes(rest[0..8].try_into().ok()?);
+                let gas = u64::from_le_bytes(rest[8..16].try_into().ok()?);
+                let cpu_ms = u64::from_le_bytes(rest[16..24].try_into().ok()?);
+                let memory_mib = u64::from_le_bytes(rest[24..32].try_into().ok()?);
+                let len = u32::from_le_bytes(rest[32..36].try_into().ok()?) as usize;
+                let source = rest.get(36..36usize.checked_add(len)?)?;
+                if source.len() != len {
+                    return None;
+                }
+                Some(Message::TaskWithLimits {
+                    id,
+                    gas,
+                    cpu_ms,
+                    memory_mib,
+                    source: source.to_vec(),
+                })
+            }
             TAG_RESULT => {
                 if rest.len() < 24 {
                     return None;
                 }
                 let id = u64::from_le_bytes(rest[0..8].try_into().ok()?);
-                let status = TaskStatus::from_u32(u32::from_le_bytes(
-                    rest[8..12].try_into().ok()?,
-                ))?;
+                let status =
+                    TaskStatus::from_u32(u32::from_le_bytes(rest[8..12].try_into().ok()?))?;
                 let num = f64::from_bits(u64::from_le_bytes(rest[12..20].try_into().ok()?));
                 let len = u32::from_le_bytes(rest[20..24].try_into().ok()?) as usize;
                 let text = rest.get(24..24usize.checked_add(len)?)?;
@@ -325,11 +366,7 @@ pub struct Channel {
 
 impl Channel {
     pub fn new(key: [u8; 32], nonce: [u8; WIRE_NONCE_LEN]) -> Self {
-        Channel {
-            key,
-            seq: 0,
-            nonce,
-        }
+        Channel { key, seq: 0, nonce }
     }
 
     fn record_nonce(&self) -> [u8; 12] {
@@ -377,12 +414,16 @@ impl Channel {
             ));
         }
         let aad = self.seq.to_le_bytes();
-        let plain = crypto::aead_open(&self.key, &self.record_nonce(), &aad, &frame[WIRE_NONCE_LEN..])
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "cluster: record auth failed"))?;
+        let plain = crypto::aead_open(
+            &self.key,
+            &self.record_nonce(),
+            &aad,
+            &frame[WIRE_NONCE_LEN..],
+        )
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "cluster: record auth failed"))?;
         self.seq = self.seq.wrapping_add(1);
-        Message::decode(&plain).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "cluster: malformed message")
-        })
+        Message::decode(&plain)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "cluster: malformed message"))
     }
 }
 
@@ -417,8 +458,16 @@ pub fn handshake(
         (mine, theirs)
     };
     let (c2s, s2c) = crypto::channel_keys(psk, &client_nonce, &server_nonce);
-    let read = if is_server { Channel::new(c2s, client_nonce) } else { Channel::new(s2c, server_nonce) };
-    let write = if is_server { Channel::new(s2c, server_nonce) } else { Channel::new(c2s, client_nonce) };
+    let read = if is_server {
+        Channel::new(c2s, client_nonce)
+    } else {
+        Channel::new(s2c, server_nonce)
+    };
+    let write = if is_server {
+        Channel::new(s2c, server_nonce)
+    } else {
+        Channel::new(c2s, client_nonce)
+    };
     Ok((read, write))
 }
 
@@ -509,8 +558,14 @@ mod tests {
 
     #[test]
     fn ping_pong_and_error_roundtrip() {
-        assert_eq!(Message::decode(&Message::Ping.encode()), Some(Message::Ping));
-        assert_eq!(Message::decode(&Message::Pong.encode()), Some(Message::Pong));
+        assert_eq!(
+            Message::decode(&Message::Ping.encode()),
+            Some(Message::Ping)
+        );
+        assert_eq!(
+            Message::decode(&Message::Pong.encode()),
+            Some(Message::Pong)
+        );
         let err = Message::Error {
             id: 9,
             code: ErrorCode::GasOverCap,

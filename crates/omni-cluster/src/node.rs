@@ -8,8 +8,12 @@
 //! the engine itself), and the gas ceiling is enforced per task via
 //! `set_step_limit`.
 
-use crate::wire::{self, ErrorCode, Message, TaskStatus, ValueTag, MAX_CLUSTER_TASK};
-use omni_core::{DEFAULT_STEP_LIMIT, Engine, ErrorKind, Value};
+use crate::wire::{self, ErrorCode, MAX_CLUSTER_TASK, Message, TaskStatus, ValueTag};
+use omni_core::{
+    CPU_LIMIT_MESSAGE, DEFAULT_STEP_LIMIT, Engine, ErrorKind, MEMORY_LIMIT_MESSAGE, Value,
+};
+use rustls::ServerConfig;
+use rustls_pemfile::{certs, private_key};
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -17,8 +21,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use rustls::ServerConfig;
-use rustls_pemfile::{certs, private_key};
 
 /// Everything a node operator chooses before the node accepts traffic.
 /// Nothing here is reachable from the wire: a task cannot grant itself a
@@ -86,7 +88,9 @@ impl WorkerNode {
                     "TLS requires both tls_cert_pem and tls_key_pem",
                 ));
             }
-            (Some(cert_path), Some(key_path)) => Some(Arc::new(load_tls_config(cert_path, key_path)?)),
+            (Some(cert_path), Some(key_path)) => {
+                Some(Arc::new(load_tls_config(cert_path, key_path)?))
+            }
         };
         let mut template = Engine::new();
         for root in &config.fs_read_roots {
@@ -116,7 +120,16 @@ impl WorkerNode {
                         // closed by then, which is the fault signal clients
                         // act on.
                         let _ = std::thread::spawn(move || {
-                            let _ = serve(stream, &psk, gas_cap, cpu_ms_cap, memory_mib_cap, &template, &tasks, tls.clone());
+                            let _ = serve(
+                                stream,
+                                &psk,
+                                gas_cap,
+                                cpu_ms_cap,
+                                memory_mib_cap,
+                                &template,
+                                &tasks,
+                                tls.clone(),
+                            );
                         });
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -177,10 +190,12 @@ fn load_tls_config(
     let mut key_reader = io::BufReader::new(std::fs::File::open(key_path)?);
     let key = private_key(&mut key_reader)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-        .ok_or_else(|| io::Error::new(
-            io::ErrorKind::InvalidData,
-            "TLS private-key PEM contains no supported key",
-        ))?;
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TLS private-key PEM contains no supported key",
+            )
+        })?;
     ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certificates, key)
@@ -197,15 +212,32 @@ fn serve(
     tasks: &AtomicU64,
     tls: Option<Arc<ServerConfig>>,
 ) -> io::Result<()> {
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     if let Some(config) = tls {
         let connection = rustls::ServerConnection::new(config)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let mut tls_stream = rustls::StreamOwned::new(connection, stream);
-        return serve_inner(&mut tls_stream, psk, gas_cap, cpu_ms_cap, memory_mib_cap, template, tasks);
+        return serve_inner(
+            &mut tls_stream,
+            psk,
+            gas_cap,
+            cpu_ms_cap,
+            memory_mib_cap,
+            template,
+            tasks,
+        );
     }
-    serve_inner(&mut stream, psk, gas_cap, cpu_ms_cap, memory_mib_cap, template, tasks)
+    serve_inner(
+        &mut stream,
+        psk,
+        gas_cap,
+        cpu_ms_cap,
+        memory_mib_cap,
+        template,
+        tasks,
+    )
 }
 
 fn serve_inner(
@@ -222,9 +254,34 @@ fn serve_inner(
     let request = read.recv(&mut stream)?;
     let reply = match request {
         Message::Ping => Message::Pong,
-        Message::Task { id, gas, source } => {
-            execute_task(id, gas, &source, gas_cap, cpu_ms_cap, memory_mib_cap, template, tasks)
-        }
+        Message::Task { id, gas, source } => execute_task(
+            id,
+            gas,
+            &source,
+            gas_cap,
+            cpu_ms_cap,
+            memory_mib_cap,
+            None,
+            template,
+            tasks,
+        ),
+        Message::TaskWithLimits {
+            id,
+            gas,
+            cpu_ms,
+            memory_mib,
+            source,
+        } => execute_task(
+            id,
+            gas,
+            &source,
+            gas_cap,
+            cpu_ms_cap,
+            memory_mib_cap,
+            Some((cpu_ms, memory_mib)),
+            template,
+            tasks,
+        ),
         _ => Message::Error {
             id: 0,
             code: ErrorCode::Malformed,
@@ -238,11 +295,15 @@ fn execute_task(
     gas: u64,
     source: &[u8],
     gas_cap: u64,
-    cpu_ms_cap: u64,
-    memory_mib_cap: u64,
+    configured_cpu_ms_cap: u64,
+    configured_memory_mib_cap: u64,
+    request_limits: Option<(u64, u64)>,
     template: &Mutex<Engine>,
     tasks: &AtomicU64,
 ) -> Message {
+    let (requested_cpu_ms, requested_memory_mib) = request_limits.unwrap_or((0, 0));
+    let cpu_ms_cap = stricter_limit(configured_cpu_ms_cap, requested_cpu_ms);
+    let memory_mib_cap = stricter_limit(configured_memory_mib_cap, requested_memory_mib);
     if source.len() > MAX_CLUSTER_TASK {
         return Message::Error {
             id,
@@ -262,7 +323,11 @@ fn execute_task(
         };
     };
     let effective_gas = if gas == 0 {
-        if gas_cap > 0 { gas_cap } else { DEFAULT_STEP_LIMIT }
+        if gas_cap > 0 {
+            gas_cap
+        } else {
+            DEFAULT_STEP_LIMIT
+        }
     } else {
         gas
     };
@@ -278,6 +343,22 @@ fn execute_task(
         }
     };
     engine.set_step_limit(effective_gas);
+    if cpu_ms_cap > 0 {
+        engine.set_time_limit(Some(Duration::from_millis(cpu_ms_cap)));
+    }
+    if memory_mib_cap > 0
+        && !engine.set_memory_limit(
+            memory_mib_cap
+                .saturating_mul(1024 * 1024)
+                .try_into()
+                .unwrap_or(usize::MAX),
+        )
+    {
+        return Message::Error {
+            id,
+            code: ErrorCode::MemoryLimit,
+        };
+    }
     tasks.fetch_add(1, Ordering::SeqCst);
     let started = Instant::now();
     let execution = engine.exec(source);
@@ -288,11 +369,10 @@ fn execute_task(
         };
     }
     let stats = engine.stats();
-    let bytes_reserved = stats.arena_bytes_reserved
+    let bytes_reserved = stats
+        .arena_bytes_reserved
         .saturating_add(stats.egress_bytes_reserved);
-    if memory_mib_cap > 0
-        && bytes_reserved > memory_mib_cap.saturating_mul(1024 * 1024)
-    {
+    if memory_mib_cap > 0 && bytes_reserved > memory_mib_cap.saturating_mul(1024 * 1024) {
         return Message::Error {
             id,
             code: ErrorCode::MemoryLimit,
@@ -314,6 +394,14 @@ fn execute_task(
                 text: text.into_bytes(),
             }
         }
+        Err(e) if e.message == CPU_LIMIT_MESSAGE => Message::Error {
+            id,
+            code: ErrorCode::CpuLimit,
+        },
+        Err(e) if e.message == MEMORY_LIMIT_MESSAGE => Message::Error {
+            id,
+            code: ErrorCode::MemoryLimit,
+        },
         Err(e) => {
             let status = match e.kind {
                 ErrorKind::Lex | ErrorKind::Parse => TaskStatus::Compile,
@@ -333,6 +421,13 @@ fn execute_task(
                 text: text.into_bytes(),
             }
         }
+    }
+}
+
+fn stricter_limit(configured: u64, requested: u64) -> u64 {
+    match (configured, requested) {
+        (0, limit) | (limit, 0) => limit,
+        (configured, requested) => configured.min(requested),
     }
 }
 

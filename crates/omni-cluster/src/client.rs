@@ -9,14 +9,14 @@
 //! all) is caught too.
 
 use crate::wire::{self, ErrorCode, Message, TaskStatus, ValueTag};
+use rustls::RootCertStore;
+use rustls::pki_types::ServerName;
 use std::fmt;
 use std::io;
 use std::io::Write;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
-use rustls::RootCertStore;
-use rustls::pki_types::ServerName;
 
 /// Default per-attempt socket timeout: connect, handshake, send, receive.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -55,8 +55,13 @@ pub enum RemoteError {
     Refused(ErrorCode),
     /// Every node and every retry was exhausted without an answer.
     ExhaustedRetries,
-    /// Fewer than `quorum` distinct nodes agreed on the result.
+    /// Two or more workers returned different deterministic results.
     Verification,
+    /// The requested quorum is zero or larger than the configured pool.
+    InvalidQuorum,
+    /// The configured quorum could not be reached because too few workers
+    /// returned a valid result.
+    QuorumUnavailable,
     /// The pool is empty or every node is marked unhealthy.
     NoHealthyNode,
 }
@@ -70,8 +75,17 @@ impl fmt::Display for RemoteError {
             RemoteError::Disconnected => write!(f, "cluster: worker disconnected mid-exchange"),
             RemoteError::Malformed => write!(f, "cluster: malformed protocol message"),
             RemoteError::Refused(code) => write!(f, "cluster: worker refused task ({code:?})"),
-            RemoteError::ExhaustedRetries => write!(f, "cluster: all workers and retries exhausted"),
+            RemoteError::ExhaustedRetries => {
+                write!(f, "cluster: all workers and retries exhausted")
+            }
             RemoteError::Verification => write!(f, "cluster: workers disagreed on the result"),
+            RemoteError::InvalidQuorum => write!(f, "cluster: requested quorum is invalid"),
+            RemoteError::QuorumUnavailable => {
+                write!(
+                    f,
+                    "cluster: not enough workers returned a result for quorum"
+                )
+            }
             RemoteError::NoHealthyNode => write!(f, "cluster: no healthy worker in the pool"),
         }
     }
@@ -88,9 +102,10 @@ fn classify_io(e: io::Error) -> RemoteError {
                 RemoteError::Malformed
             }
         }
-        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe => {
-            RemoteError::Disconnected
-        }
+        io::ErrorKind::UnexpectedEof
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::BrokenPipe => RemoteError::Disconnected,
         _ => RemoteError::Io(e.to_string()),
     }
 }
@@ -119,8 +134,12 @@ fn submit_once_inner(
         .ok_or_else(|| RemoteError::BadAddr(addr.to_string()))?;
     let mut stream = TcpStream::connect_timeout(&sock_addr, timeout)
         .map_err(|e| RemoteError::Io(e.to_string()))?;
-    stream.set_read_timeout(Some(timeout)).map_err(|e| RemoteError::Io(e.to_string()))?;
-    stream.set_write_timeout(Some(timeout)).map_err(|e| RemoteError::Io(e.to_string()))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| RemoteError::Io(e.to_string()))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|e| RemoteError::Io(e.to_string()))?;
     if let Some((ca_pem, server_name)) = tls {
         let mut roots = RootCertStore::empty();
         let mut reader = io::BufReader::new(ca_pem);
@@ -129,7 +148,9 @@ fn submit_once_inner(
             .map_err(|e| RemoteError::Io(e.to_string()))?;
         let (valid, _) = roots.add_parsable_certificates(certs);
         if valid == 0 {
-            return Err(RemoteError::Io("TLS CA bundle contained no valid certificates".to_string()));
+            return Err(RemoteError::Io(
+                "TLS CA bundle contained no valid certificates".to_string(),
+            ));
         }
         let config = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
@@ -151,8 +172,7 @@ fn submit_once_inner(
             other => Ok(other),
         };
     }
-    let (mut read, mut write) =
-        wire::handshake(&mut stream, psk, false).map_err(classify_io)?;
+    let (mut read, mut write) = wire::handshake(&mut stream, psk, false).map_err(classify_io)?;
     write.send(&mut stream, request).map_err(classify_io)?;
     let reply = read.recv(&mut stream).map_err(classify_io)?;
     match reply {
@@ -212,6 +232,29 @@ pub struct ClusterClient {
     tls_server_name: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+struct ResourceLimits {
+    cpu_ms: u64,
+    memory_mib: u64,
+}
+
+fn task_request(id: u64, source: &str, gas: u64, limits: Option<ResourceLimits>) -> Message {
+    match limits {
+        Some(limits) => Message::TaskWithLimits {
+            id,
+            gas,
+            cpu_ms: limits.cpu_ms,
+            memory_mib: limits.memory_mib,
+            source: source.as_bytes().to_vec(),
+        },
+        None => Message::Task {
+            id,
+            gas,
+            source: source.as_bytes().to_vec(),
+        },
+    }
+}
+
 impl ClusterClient {
     pub fn new(addrs: Vec<String>, psk: [u8; 32]) -> ClusterClient {
         ClusterClient {
@@ -246,7 +289,9 @@ impl ClusterClient {
 
     fn submit(&self, addr: &str, request: &Message) -> Result<Message, RemoteError> {
         match (&self.tls_roots_pem, &self.tls_server_name) {
-            (Some(ca), Some(name)) => submit_once_inner(addr, &self.psk, request, self.timeout, Some((ca, name))),
+            (Some(ca), Some(name)) => {
+                submit_once_inner(addr, &self.psk, request, self.timeout, Some((ca, name)))
+            }
             _ => submit_once(addr, &self.psk, request, self.timeout),
         }
     }
@@ -265,10 +310,8 @@ impl ClusterClient {
     pub fn health_check(&self) -> usize {
         let mut healthy = 0;
         for node in &self.nodes {
-            let up = matches!(
-                self.submit(&node.addr, &Message::Ping),
-                Ok(Message::Pong)
-            );
+            let result = self.submit(&node.addr, &Message::Ping);
+            let up = matches!(result, Ok(Message::Pong));
             node.healthy.store(up, Ordering::SeqCst);
             if up {
                 healthy += 1;
@@ -278,7 +321,10 @@ impl ClusterClient {
     }
 
     pub fn healthy_count(&self) -> usize {
-        self.nodes.iter().filter(|n| n.healthy.load(Ordering::SeqCst)).count()
+        self.nodes
+            .iter()
+            .filter(|n| n.healthy.load(Ordering::SeqCst))
+            .count()
     }
 
     /// Execute `source` on a healthy worker, failing over across the pool.
@@ -290,6 +336,37 @@ impl ClusterClient {
         gas: u64,
         retries: u32,
     ) -> Result<TaskReply, RemoteError> {
+        self.run_remote_inner(source, gas, retries, None)
+    }
+
+    /// Execute on a healthy worker while applying request-specific ceilings in
+    /// addition to each worker's stricter configured CPU/memory caps.
+    pub fn run_remote_with_limits(
+        &self,
+        source: &str,
+        gas: u64,
+        cpu_ms: u64,
+        memory_mib: u64,
+        retries: u32,
+    ) -> Result<TaskReply, RemoteError> {
+        self.run_remote_inner(
+            source,
+            gas,
+            retries,
+            Some(ResourceLimits { cpu_ms, memory_mib }),
+        )
+    }
+
+    fn run_remote_inner(
+        &self,
+        source: &str,
+        gas: u64,
+        retries: u32,
+        limits: Option<ResourceLimits>,
+    ) -> Result<TaskReply, RemoteError> {
+        if source.len() > wire::MAX_CLUSTER_TASK {
+            return Err(RemoteError::Refused(ErrorCode::TooLong));
+        }
         if self.nodes.is_empty() {
             return Err(RemoteError::NoHealthyNode);
         }
@@ -304,11 +381,7 @@ impl ClusterClient {
                 }
                 tried_any = true;
                 let id = self.next.fetch_add(1, Ordering::SeqCst);
-                let request = Message::Task {
-                    id,
-                    gas,
-                    source: source.as_bytes().to_vec(),
-                };
+                let request = task_request(id, source, gas, limits);
                 match self.submit(&node.addr, &request) {
                     Ok(reply) => match reply_for(id, reply) {
                         Some(task) => return Ok(task),
@@ -357,6 +430,7 @@ impl ClusterClient {
                         if let Some(task) = recovered {
                             return Ok(task);
                         }
+                        node.healthy.store(false, Ordering::SeqCst);
                         last_err = retry_err.unwrap_or(last_err);
                     }
                     Err(e) => {
@@ -366,7 +440,11 @@ impl ClusterClient {
                 }
             }
             if !tried_any {
-                return Err(RemoteError::NoHealthyNode);
+                return Err(if matches!(&last_err, RemoteError::NoHealthyNode) {
+                    RemoteError::NoHealthyNode
+                } else {
+                    last_err
+                });
             }
         }
         Err(match last_err {
@@ -385,8 +463,39 @@ impl ClusterClient {
         gas: u64,
         quorum: usize,
     ) -> Result<TaskReply, RemoteError> {
+        self.run_remote_verified_inner(source, gas, quorum, None)
+    }
+
+    /// Execute on a distinct-node quorum while enforcing request-specific
+    /// worker CPU and memory ceilings.
+    pub fn run_remote_verified_with_limits(
+        &self,
+        source: &str,
+        gas: u64,
+        quorum: usize,
+        cpu_ms: u64,
+        memory_mib: u64,
+    ) -> Result<TaskReply, RemoteError> {
+        self.run_remote_verified_inner(
+            source,
+            gas,
+            quorum,
+            Some(ResourceLimits { cpu_ms, memory_mib }),
+        )
+    }
+
+    fn run_remote_verified_inner(
+        &self,
+        source: &str,
+        gas: u64,
+        quorum: usize,
+        limits: Option<ResourceLimits>,
+    ) -> Result<TaskReply, RemoteError> {
+        if source.len() > wire::MAX_CLUSTER_TASK {
+            return Err(RemoteError::Refused(ErrorCode::TooLong));
+        }
         if quorum == 0 || quorum > self.nodes.len() {
-            return Err(RemoteError::Verification);
+            return Err(RemoteError::InvalidQuorum);
         }
         let start = self.next.fetch_add(1, Ordering::SeqCst) as usize;
         let mut replies: Vec<(usize, TaskReply)> = Vec::new();
@@ -397,11 +506,7 @@ impl ClusterClient {
                 continue;
             }
             let id = self.next.fetch_add(1, Ordering::SeqCst);
-            let request = Message::Task {
-                id,
-                gas,
-                source: source.as_bytes().to_vec(),
-            };
+            let request = task_request(id, source, gas, limits);
             match self.submit(&node.addr, &request) {
                 Ok(reply) => match reply_for(id, reply) {
                     Some(task) => replies.push((idx, task)),
@@ -415,7 +520,7 @@ impl ClusterClient {
             }
         }
         if replies.len() < quorum {
-            return Err(RemoteError::Verification);
+            return Err(RemoteError::QuorumUnavailable);
         }
         let first = &replies[0].1;
         for (idx, reply) in &replies[1..] {

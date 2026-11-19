@@ -2,7 +2,7 @@
 
 ## Base Contract
 
-The managed API uses HTTPS and a TLS-enabled gRPC gateway. The REST shape is:
+The current gateway exposes the managed API over HTTPS. The REST shape is:
 
 ```text
 POST /v1/execute
@@ -38,9 +38,10 @@ Example REST success:
 }
 ```
 
-## gRPC Contract
+## Planned gRPC Contract
 
-The equivalent gRPC service shape is:
+An equivalent gRPC service is a planned API surface; it is not implemented by
+the current `omni-gateway` crate:
 
 ```text
 service OmniExecution {
@@ -92,6 +93,7 @@ Recommended HTTP responses:
 | `401` | Missing or invalid token |
 | `403` | Token lacks endpoint or tenant capability |
 | `429` | Per-key rate or monthly quota exceeded |
+| `409` | Deterministic worker results disagree |
 | `503` | No healthy worker or insufficient queue capacity |
 | `400` | Invalid source or resource configuration |
 | `413` | Request or source exceeds gateway size limits |
@@ -126,15 +128,25 @@ from internal execution numbers but included in end-to-end latency.
 
 ## Health and Deterministic Verification
 
-Gateway workers expose health only to the control plane:
+When cluster dispatch is enabled, the gateway checks configured workers before
+dispatch. Worker connections require certificate-verified TLS and a separate
+32-byte cluster PSK; the customer API token is never forwarded to workers.
+Configure a CA bundle and expected worker DNS name, and provision the PSK through
+the gateway's secret environment. Worker-side filesystem roots and resource
+ceilings remain operator-controlled.
 
-```text
-GET /v1/health
-grpc OmniExecution.Health
-```
+Worker health checks use the authenticated cluster `Ping` protocol over the
+configured TLS connection; `/v1/health` is not currently served by the REST
+handler.
 
-The public execute route should support deterministic verification by dispatching
-eligible tasks to multiple workers and comparing status, value tag, numeric
-value, and rendered text. A mismatch rejects the result rather than selecting a
-majority silently. Unhealthy workers are retried or removed according to the
-cluster fault policy.
+For requests with `"verification": "deterministic"`, the gateway dispatches to
+the configured quorum of distinct healthy workers and compares status, value
+tag, numeric value, and rendered text. A mismatch returns `409` and rejects the
+result; an unavailable quorum returns `503`. The gateway never silently accepts
+a single-worker result for a verification request. Local fallback, when enabled,
+applies only to transient errors on non-verification requests.
+
+CPU deadlines are checked between VM instructions, with elapsed-time checks
+after execution. The memory ceiling accounts for engine arena and result
+reservations; it does not cap all parser or Rust process heap allocations.
+Operators should still isolate worker processes with OS/container limits.

@@ -41,14 +41,14 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::Value;
-use crate::arena::{Arena, Slot};
+use crate::arena::{Arena, MEMORY_LIMIT_PANIC, MemoryBudget, Slot};
 use crate::ast::Ast;
 use crate::bytecode::{Callable, Chunk, Instr, OpCode};
 use crate::json;
@@ -89,6 +89,8 @@ pub const MAX_MODULE_DEPTH: usize = 16;
 /// instructions) and small enough that a runaway loop stops promptly.
 /// [`Engine::set_step_limit`] changes it; `0` disables the check.
 pub const DEFAULT_STEP_LIMIT: u64 = 1 << 24;
+pub const CPU_LIMIT_MESSAGE: &str = "execution exceeded the CPU time limit";
+pub const MEMORY_LIMIT_MESSAGE: &str = "execution exceeded the sandbox memory limit";
 
 /// Deepest operand stack the VM will grow. A value is eight bytes, so the cap
 /// costs at most 512 KiB. Compiled programs stay far below it — arguments are
@@ -127,11 +129,16 @@ struct CachedModule {
 pub(crate) struct Budget {
     limit: u64,
     used: u64,
+    deadline: Option<Instant>,
 }
 
 impl Budget {
-    pub(crate) fn new(limit: u64) -> Budget {
-        Budget { limit, used: 0 }
+    pub(crate) fn new(limit: u64, deadline: Option<Instant>) -> Budget {
+        Budget {
+            limit,
+            used: 0,
+            deadline,
+        }
     }
 
     /// Charge one instruction, or report the limit at the instruction that
@@ -147,6 +154,12 @@ impl Budget {
                     if self.limit == 1 { "" } else { "s" }
                 ),
             ));
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(OmniError::new(ErrorKind::Runtime, at, CPU_LIMIT_MESSAGE));
         }
         self.used = self.used.saturating_add(1);
         Ok(())
@@ -540,6 +553,10 @@ pub struct Engine {
     fs_write_roots: Vec<PathBuf>,
     /// Instructions one top-level execution may run. See [`DEFAULT_STEP_LIMIT`].
     step_limit: u64,
+    /// Optional wall-clock deadline checked at each VM instruction.
+    time_limit: Option<Duration>,
+    /// Optional combined arena/egress reservation ceiling.
+    memory_limit: Option<usize>,
     /// Run the optimizer pass between lowering and execution. On by default:
     /// the pass is semantics-preserving (see [`crate::optimizer`]), so a host
     /// disables it only to compare streams or to reproduce a bug.
@@ -587,6 +604,8 @@ impl Engine {
             fs_read_roots: Vec::new(),
             fs_write_roots: Vec::new(),
             step_limit: DEFAULT_STEP_LIMIT,
+            time_limit: None,
+            memory_limit: None,
             optimize: true,
             profiling: false,
             profile: Profile::default(),
@@ -607,7 +626,10 @@ impl Engine {
     /// rather than frees. Everything else this function hands back is eight bytes
     /// with no memory behind it.
     pub fn exec(&mut self, source: &str) -> Result<Value, OmniError> {
-        let mut budget = Budget::new(self.step_limit);
+        let deadline = self
+            .time_limit
+            .and_then(|limit| Instant::now().checked_add(limit));
+        let mut budget = Budget::new(self.step_limit, deadline);
         self.exec_with_budget(source, &mut budget)
     }
 
@@ -623,9 +645,12 @@ impl Engine {
         let started = Instant::now();
         let result = self.run_with_budget(source, budget);
         self.last_exec_micros = elapsed_micros(started.elapsed());
+        let result = match result {
+            Ok(value) => self.promote_bounded(value),
+            Err(error) => Err(error),
+        };
         match result {
             Ok(v) => {
-                let v = self.promote(v);
                 self.last_value = v;
                 self.last_error = None;
                 Ok(v)
@@ -676,12 +701,18 @@ impl Engine {
             let started = Instant::now();
             // Each item is an independent execution, so each gets the whole
             // budget; modules still share it with the item that imported them.
-            let mut budget = Budget::new(self.step_limit);
+            let deadline = self
+                .time_limit
+                .and_then(|limit| Instant::now().checked_add(limit));
+            let mut budget = Budget::new(self.step_limit, deadline);
             let result = self.run_with_budget(source, &mut budget);
             self.last_exec_micros = elapsed_micros(started.elapsed());
+            let result = match result {
+                Ok(value) => self.promote_bounded(value),
+                Err(error) => Err(error),
+            };
             items.push(match result {
                 Ok(v) => {
-                    let v = self.promote(v);
                     self.last_value = v;
                     self.last_error = None;
                     BatchItem {
@@ -718,6 +749,10 @@ impl Engine {
         child.fs_read_roots = self.fs_read_roots.clone();
         child.fs_write_roots = self.fs_write_roots.clone();
         child.step_limit = self.step_limit;
+        child.time_limit = self.time_limit;
+        if let Some(memory_limit) = self.memory_limit {
+            let _ = child.set_memory_limit(memory_limit);
+        }
         child.optimize = self.optimize;
         child.profiling = self.profiling;
         child.module_cache = self.module_cache.clone();
@@ -848,7 +883,10 @@ impl Engine {
     fn eval_parallel_item(&mut self, source: &str) -> (Result<ParallelValue, OmniError>, u32) {
         let limit = self.step_limit;
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            let mut budget = Budget::new(limit);
+            let deadline = self
+                .time_limit
+                .and_then(|limit| Instant::now().checked_add(limit));
+            let mut budget = Budget::new(limit, deadline);
             self.exec_with_budget(source, &mut budget)
         }));
         match outcome {
@@ -932,6 +970,24 @@ impl Engine {
         let p = object::build(&mut self.egress, bytes);
         self.strings_built += 1;
         Value::from_ptr(p)
+    }
+
+    fn promote_bounded(&mut self, value: Value) -> Result<Value, OmniError> {
+        match catch_unwind(AssertUnwindSafe(|| self.promote(value))) {
+            Ok(value) => Ok(value),
+            Err(payload)
+                if payload
+                    .downcast_ref::<&'static str>()
+                    .is_some_and(|message| *message == MEMORY_LIMIT_PANIC) =>
+            {
+                Err(OmniError::new(
+                    ErrorKind::Runtime,
+                    Pos::default(),
+                    MEMORY_LIMIT_MESSAGE,
+                ))
+            }
+            Err(payload) => resume_unwind(payload),
+        }
     }
 
     /// Put host-owned remote text in the engine's host-facing egress block.
@@ -1181,6 +1237,36 @@ impl Engine {
         self.step_limit = steps;
     }
 
+    /// Bound VM execution time. The deadline is checked between instructions;
+    /// parsing and a single long-running instruction are still measured by the
+    /// caller after execution.
+    pub fn set_time_limit(&mut self, limit: Option<Duration>) {
+        self.time_limit = limit;
+    }
+
+    /// Bound the combined memory reserved by the execution and egress arenas.
+    /// Returns `false` without changing the existing budget if the engine has
+    /// already reserved more than the requested limit. Zero disables the cap.
+    pub fn set_memory_limit(&mut self, bytes: usize) -> bool {
+        if bytes == 0 {
+            self.arena.set_memory_budget(None);
+            self.egress.set_memory_budget(None);
+            self.memory_limit = None;
+            return true;
+        }
+        let reserved = self
+            .arena
+            .bytes_reserved()
+            .saturating_add(self.egress.bytes_reserved());
+        let Some(budget) = MemoryBudget::new(bytes, reserved) else {
+            return false;
+        };
+        self.arena.set_memory_budget(Some(Arc::clone(&budget)));
+        self.egress.set_memory_budget(Some(budget));
+        self.memory_limit = Some(bytes);
+        true
+    }
+
     /// Whether the optimizer pass runs between lowering and execution. On by
     /// default; `fork()` copies the setting.
     pub fn optimize(&self) -> bool {
@@ -1234,15 +1320,17 @@ impl Engine {
         let mut optimizer = std::mem::take(&mut self.optimizer);
         self.last_optimize = OptimizeStats::default();
 
-        let result = (|| -> Result<Value, OmniError> {
-            lex_into(source, &mut tokens)?;
-            ast.parse_into(source, &tokens)?;
-            crate::bytecode::compile(&ast, source, &*self, &mut chunk, &mut tasks)?;
-            if self.optimize {
-                self.last_optimize = optimizer.optimize(&mut chunk, source);
-            }
-            self.run_chunk(&chunk, source, &mut stack, budget)
-        })();
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            (|| -> Result<Value, OmniError> {
+                lex_into(source, &mut tokens)?;
+                ast.parse_into(source, &tokens)?;
+                crate::bytecode::compile(&ast, source, &*self, &mut chunk, &mut tasks)?;
+                if self.optimize {
+                    self.last_optimize = optimizer.optimize(&mut chunk, source);
+                }
+                self.run_chunk(&chunk, source, &mut stack, budget)
+            })()
+        }));
 
         self.tokens = tokens;
         self.ast = ast;
@@ -1250,7 +1338,21 @@ impl Engine {
         self.stack = stack;
         self.tasks = tasks;
         self.optimizer = optimizer;
-        result
+        match outcome {
+            Ok(result) => result,
+            Err(payload)
+                if payload
+                    .downcast_ref::<&'static str>()
+                    .is_some_and(|message| *message == MEMORY_LIMIT_PANIC) =>
+            {
+                Err(OmniError::new(
+                    ErrorKind::Runtime,
+                    Pos::default(),
+                    MEMORY_LIMIT_MESSAGE,
+                ))
+            }
+            Err(payload) => resume_unwind(payload),
+        }
     }
 
     /// Execute an already-compiled chunk on the VM.
@@ -1262,7 +1364,10 @@ impl Engine {
     /// errors it raises are the canonical ones, position included.
     pub fn run_compiled(&mut self, chunk: &Chunk, source: &str) -> Result<Value, OmniError> {
         let mut stack = std::mem::take(&mut self.stack);
-        let mut budget = Budget::new(self.step_limit);
+        let deadline = self
+            .time_limit
+            .and_then(|limit| Instant::now().checked_add(limit));
+        let mut budget = Budget::new(self.step_limit, deadline);
         let result = self.run_chunk(chunk, source, &mut stack, &mut budget);
         self.stack = stack;
         result
@@ -4331,6 +4436,23 @@ mod tests {
         assert_eq!(e.exec("1 + 1").unwrap().as_f64(), Some(2.0));
         let error = e.exec("1 / 0").unwrap_err();
         assert_eq!(error.message, "division by zero");
+    }
+
+    #[test]
+    fn execution_deadline_stops_vm_work() {
+        let mut engine = Engine::new();
+        engine.set_time_limit(Some(Duration::ZERO));
+        let error = engine.exec("1 + 2").unwrap_err();
+        assert_eq!(error.message, CPU_LIMIT_MESSAGE);
+    }
+
+    #[test]
+    fn combined_arena_memory_limit_returns_a_runtime_error() {
+        let mut engine = Engine::new();
+        assert!(engine.set_memory_limit(64 * 1024));
+        let error = engine.exec("\"a result string\"").unwrap_err();
+        assert_eq!(error.message, MEMORY_LIMIT_MESSAGE);
+        assert_eq!(engine.exec("1 + 2").unwrap().as_f64(), Some(3.0));
     }
 
     #[test]
