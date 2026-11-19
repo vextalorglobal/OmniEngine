@@ -12,7 +12,7 @@ health_endpoint = "/v1/health"
 [auth]
 mode = "bearer"
 token_header = "Authorization"
-token_secret_source = "env:OMNI_API_TOKEN_SIGNING_KEY"
+token_secret_source = "env:OMNI_API_KEYS"
 token_secret_required = true
 
 [gateway.rate_limit]
