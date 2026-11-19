@@ -1,5 +1,6 @@
 //! Managed REST API gateway for policy-bounded OmniEngine execution.
 
+use fs2::FileExt;
 use omni_cluster::wire::{ErrorCode, TaskStatus, ValueTag};
 use omni_cluster::{ClusterClient, RemoteError, TaskReply};
 use omni_core::{
@@ -342,6 +343,55 @@ pub struct HttpResponse {
     pub retry_after_seconds: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct GatewayMetricsSnapshot {
+    pub requests_total: u64,
+    pub requests_succeeded_total: u64,
+    pub requests_failed_total: u64,
+    pub executions_succeeded_total: u64,
+    pub quota_rejections_total: u64,
+    pub rate_limit_rejections_total: u64,
+    pub concurrency_rejections_total: u64,
+    pub worker_dispatches_total: u64,
+    pub worker_quorum_successes_total: u64,
+    pub worker_quorum_mismatches_total: u64,
+    pub worker_quorum_unavailable_total: u64,
+}
+
+#[derive(Default)]
+struct GatewayMetrics {
+    requests_total: AtomicU64,
+    requests_succeeded_total: AtomicU64,
+    requests_failed_total: AtomicU64,
+    executions_succeeded_total: AtomicU64,
+    quota_rejections_total: AtomicU64,
+    rate_limit_rejections_total: AtomicU64,
+    concurrency_rejections_total: AtomicU64,
+    worker_dispatches_total: AtomicU64,
+    worker_quorum_successes_total: AtomicU64,
+    worker_quorum_mismatches_total: AtomicU64,
+    worker_quorum_unavailable_total: AtomicU64,
+}
+
+impl GatewayMetrics {
+    fn snapshot(&self) -> GatewayMetricsSnapshot {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        GatewayMetricsSnapshot {
+            requests_total: load(&self.requests_total),
+            requests_succeeded_total: load(&self.requests_succeeded_total),
+            requests_failed_total: load(&self.requests_failed_total),
+            executions_succeeded_total: load(&self.executions_succeeded_total),
+            quota_rejections_total: load(&self.quota_rejections_total),
+            rate_limit_rejections_total: load(&self.rate_limit_rejections_total),
+            concurrency_rejections_total: load(&self.concurrency_rejections_total),
+            worker_dispatches_total: load(&self.worker_dispatches_total),
+            worker_quorum_successes_total: load(&self.worker_quorum_successes_total),
+            worker_quorum_mismatches_total: load(&self.worker_quorum_mismatches_total),
+            worker_quorum_unavailable_total: load(&self.worker_quorum_unavailable_total),
+        }
+    }
+}
+
 impl HttpResponse {
     fn error(status: u16, code: &str, message: &str, retry_after_seconds: Option<u64>) -> Self {
         Self {
@@ -413,6 +463,7 @@ pub struct Gateway {
     state_path: PathBuf,
     usage: Arc<Mutex<UsageState>>,
     next_request: AtomicU64,
+    metrics: GatewayMetrics,
 }
 
 impl Gateway {
@@ -480,11 +531,16 @@ impl Gateway {
             state_path,
             usage: Arc::new(Mutex::new(usage)),
             next_request: AtomicU64::new(1),
+            metrics: GatewayMetrics::default(),
         })
     }
 
     pub fn settings(&self) -> &GatewaySettings {
         &self.settings
+    }
+
+    pub fn metrics(&self) -> GatewayMetricsSnapshot {
+        self.metrics.snapshot()
     }
 
     pub fn handle(
@@ -494,7 +550,57 @@ impl Gateway {
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> HttpResponse {
+        if path == self.settings.config.health_endpoint && method == "GET" {
+            return self.health_response();
+        }
+        self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+        let is_execute = path == self.settings.config.execute_endpoint && method == "POST";
+        let response = self.handle_execute(method, path, headers, body);
+        if response.status < 400 {
+            self.metrics
+                .requests_succeeded_total
+                .fetch_add(1, Ordering::Relaxed);
+            if is_execute && response.status == 200 {
+                self.metrics
+                    .executions_succeeded_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        } else {
+            self.metrics
+                .requests_failed_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        response
+    }
+
+    fn health_response(&self) -> HttpResponse {
+        HttpResponse {
+            status: 200,
+            body: json!({
+                "status":"ok",
+                "metrics":self.metrics.snapshot(),
+                "cluster":{
+                    "enabled":self.settings.config.cluster.enabled,
+                    "configured_workers":self.settings.config.cluster.worker_endpoints.len(),
+                    "quorum":self.settings.config.cluster.quorum
+                }
+            })
+            .to_string(),
+            retry_after_seconds: None,
+        }
+    }
+
+    fn handle_execute(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> HttpResponse {
         let request_id = self.next_request.fetch_add(1, Ordering::Relaxed);
+        if path == self.settings.config.health_endpoint {
+            return HttpResponse::error(405, "method_not_allowed", "GET is required", None);
+        }
         if method != "POST" {
             return HttpResponse::error(405, "method_not_allowed", "POST is required", None);
         }
@@ -612,6 +718,9 @@ impl Gateway {
         let permit = match self.admit(&key) {
             Ok(permit) => permit,
             Err(AdmissionError::Quota) => {
+                self.metrics
+                    .quota_rejections_total
+                    .fetch_add(1, Ordering::Relaxed);
                 return HttpResponse::error(
                     429,
                     "monthly_quota_exceeded",
@@ -620,6 +729,9 @@ impl Gateway {
                 );
             }
             Err(AdmissionError::Rate) => {
+                self.metrics
+                    .rate_limit_rejections_total
+                    .fetch_add(1, Ordering::Relaxed);
                 let retry = self
                     .settings
                     .config
@@ -640,6 +752,9 @@ impl Gateway {
                 );
             }
             Err(AdmissionError::Concurrency) => {
+                self.metrics
+                    .concurrency_rejections_total
+                    .fetch_add(1, Ordering::Relaxed);
                 return HttpResponse::error(
                     429,
                     "concurrency_limit_exceeded",
@@ -784,7 +899,15 @@ impl Gateway {
         deterministic: bool,
     ) -> HttpResponse {
         let fallback = self.settings.config.cluster.fallback_to_local && !deterministic;
+        self.metrics
+            .worker_dispatches_total
+            .fetch_add(1, Ordering::Relaxed);
         if cluster.health_check() == 0 {
+            if deterministic {
+                self.metrics
+                    .worker_quorum_unavailable_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             if fallback {
                 return self.execute_local(request_id, key, source, gas, cpu_ms, memory_mib);
             }
@@ -814,6 +937,25 @@ impl Gateway {
             )
         };
         let elapsed = started.elapsed();
+        if deterministic {
+            match &result {
+                Ok(_) => {
+                    self.metrics
+                        .worker_quorum_successes_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(RemoteError::Verification) => {
+                    self.metrics
+                        .worker_quorum_mismatches_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    self.metrics
+                        .worker_quorum_unavailable_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
         match result {
             Ok(reply) => self.remote_result(request_id, key, reply, elapsed),
             Err(error) if fallback && is_transient_worker_error(&error) => {
@@ -926,7 +1068,11 @@ impl Gateway {
 
     fn admit(&self, key: &Arc<KeyState>) -> Result<Permit, AdmissionError> {
         let mut usage = self.usage.lock().map_err(|_| AdmissionError::Internal)?;
-        let mut next = usage.clone();
+        let _state_lock = lock_usage_state_file(&self.state_path)
+            .map_err(|error| AdmissionError::Persistence(error.to_string()))?;
+        let mut next =
+            load_usage_state_unlocked(&self.state_path).map_err(AdmissionError::Persistence)?;
+        next.active = usage.active.clone();
         let now = current_unix_millis();
         let month = current_month();
         let persistent = next
@@ -1127,6 +1273,16 @@ fn hex_digest(bytes: &[u8]) -> String {
 }
 
 fn load_usage_state(path: &Path) -> Result<UsageState, String> {
+    let _state_lock = lock_usage_state_file(path).map_err(|error| {
+        format!(
+            "cannot lock gateway usage state {}: {error}",
+            path.display()
+        )
+    })?;
+    load_usage_state_unlocked(path)
+}
+
+fn load_usage_state_unlocked(path: &Path) -> Result<UsageState, String> {
     let contents = match fs::read(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -1152,6 +1308,31 @@ fn load_usage_state(path: &Path) -> Result<UsageState, String> {
         keys: snapshot.keys,
         active: HashMap::new(),
     })
+}
+
+fn lock_usage_state_file(path: &Path) -> io::Result<File> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock_file = options.open(usage_lock_path(path))?;
+    FileExt::lock_exclusive(&lock_file)?;
+    Ok(lock_file)
+}
+
+fn usage_lock_path(path: &Path) -> PathBuf {
+    let mut lock_name = path.as_os_str().to_os_string();
+    lock_name.push(".lock");
+    PathBuf::from(lock_name)
 }
 
 fn default_state_path() -> PathBuf {
@@ -1666,6 +1847,20 @@ mod tests {
         }
 
         fn request_body(&self, auth: Option<&str>, body: &str) -> (u16, String) {
+            self.request_http("POST", "/v1/execute", auth, body)
+        }
+
+        fn health(&self) -> (u16, String) {
+            self.request_http("GET", "/v1/health", None, "")
+        }
+
+        fn request_http(
+            &self,
+            method: &str,
+            path: &str,
+            auth: Option<&str>,
+            body: &str,
+        ) -> (u16, String) {
             let server_name = ServerName::try_from("localhost").unwrap();
             let connection =
                 ClientConnection::new(Arc::clone(&self.client_config), server_name).unwrap();
@@ -1673,7 +1868,7 @@ mod tests {
             let mut stream = rustls::StreamOwned::new(connection, socket);
             write!(
                 stream,
-                "POST /v1/execute HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
+                "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
             )
             .unwrap();
             if let Some(auth) = auth {
@@ -1744,6 +1939,143 @@ mod tests {
             headers.insert("Authorization".to_string(), auth.to_string());
         }
         gateway.handle("POST", "/v1/execute", &headers, body.as_bytes())
+    }
+
+    fn health(gateway: &Gateway) -> HttpResponse {
+        gateway.handle("GET", "/v1/health", &HashMap::new(), &[])
+    }
+
+    #[test]
+    fn health_endpoint_reports_aggregate_request_and_quota_metrics() {
+        let mut settings = settings();
+        settings.config.rate_limit.free_max_requests_per_window = 0;
+        let mut tier = settings.free_tier.clone();
+        tier.api_requests_per_month = 1;
+        let test_dir = TestDirectory::new();
+        let gateway = Gateway::new_with_state_path(
+            settings,
+            vec![ApiKey::new(TOKEN, "metrics-tenant", tier).unwrap()],
+            test_dir.state_path(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            request(&gateway, Some(&format!("Bearer {TOKEN}")), "1").status,
+            200
+        );
+        assert_eq!(
+            request(&gateway, Some(&format!("Bearer {TOKEN}")), "1").status,
+            429
+        );
+        assert_eq!(
+            request(&gateway, Some("Bearer invalid-token"), "1").status,
+            401
+        );
+
+        let response = health(&gateway);
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["metrics"]["requests_total"], 3);
+        assert_eq!(body["metrics"]["requests_succeeded_total"], 1);
+        assert_eq!(body["metrics"]["requests_failed_total"], 2);
+        assert_eq!(body["metrics"]["executions_succeeded_total"], 1);
+        assert_eq!(body["metrics"]["quota_rejections_total"], 1);
+        assert_eq!(body["cluster"]["enabled"], false);
+        assert_eq!(body["cluster"]["configured_workers"], 0);
+    }
+
+    #[test]
+    fn state_file_lock_blocks_admission_until_released() {
+        let settings = settings();
+        let test_dir = TestDirectory::new();
+        let state_path = test_dir.state_path();
+        let gateway = Arc::new(
+            Gateway::new_with_state_path(
+                settings.clone(),
+                vec![ApiKey::new(TOKEN, "locked-state", settings.free_tier).unwrap()],
+                &state_path,
+            )
+            .unwrap(),
+        );
+        let state_lock = lock_usage_state_file(&state_path).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let request_gateway = Arc::clone(&gateway);
+        let request_thread = std::thread::spawn(move || {
+            let response = request(&request_gateway, Some(&format!("Bearer {TOKEN}")), "1");
+            sender.send(response.status).unwrap();
+        });
+
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(state_lock);
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(2)).unwrap(), 200);
+        request_thread.join().unwrap();
+    }
+
+    #[test]
+    fn concurrent_gateway_instances_preserve_shared_quota_updates() {
+        let mut settings = settings();
+        settings.config.rate_limit.free_max_requests_per_window = 0;
+        settings.config.rate_limit.free_max_concurrent = 0;
+        let mut tier = settings.free_tier.clone();
+        tier.api_requests_per_month = 19;
+        tier.max_concurrent_requests = 0;
+        let test_dir = TestDirectory::new();
+        let gateways = (0..4)
+            .map(|_| {
+                Arc::new(
+                    Gateway::new_with_state_path(
+                        settings.clone(),
+                        vec![ApiKey::new(TOKEN, "multi-instance", tier.clone()).unwrap()],
+                        test_dir.state_path(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let succeeded = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rejected = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let threads = gateways
+            .into_iter()
+            .map(|gateway| {
+                let succeeded = Arc::clone(&succeeded);
+                let rejected = Arc::clone(&rejected);
+                std::thread::spawn(move || {
+                    for _ in 0..8 {
+                        let response = request(&gateway, Some(&format!("Bearer {TOKEN}")), "1");
+                        if response.status == 200 {
+                            succeeded.fetch_add(1, Ordering::Relaxed);
+                        } else if response.status == 429
+                            && response.body.contains("monthly_quota_exceeded")
+                        {
+                            rejected.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            panic!("unexpected admission response: {}", response.body);
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        assert_eq!(succeeded.load(Ordering::Relaxed), 19);
+        assert_eq!(rejected.load(Ordering::Relaxed), 13);
+        let reloaded = Gateway::new_with_state_path(
+            settings,
+            vec![ApiKey::new(TOKEN, "multi-instance", tier).unwrap()],
+            test_dir.state_path(),
+        )
+        .unwrap();
+        assert!(
+            request(&reloaded, Some(&format!("Bearer {TOKEN}")), "1")
+                .body
+                .contains("monthly_quota_exceeded")
+        );
     }
 
     #[test]
@@ -1846,6 +2178,11 @@ mod tests {
         );
         assert_eq!(status, 200);
         assert!(body.contains("\"number\":42.0"));
+        let (status, metrics_body) = server.health();
+        assert_eq!(status, 200);
+        let metrics: serde_json::Value = serde_json::from_str(&metrics_body).unwrap();
+        assert_eq!(metrics["metrics"]["worker_dispatches_total"], 2);
+        assert_eq!(metrics["metrics"]["worker_quorum_successes_total"], 1);
     }
 
     #[test]
@@ -1877,6 +2214,10 @@ mod tests {
         );
         assert_eq!(status, 409, "{body}");
         assert!(body.contains("deterministic_mismatch"));
+        let (status, metrics_body) = mismatch_server.health();
+        assert_eq!(status, 200);
+        let metrics: serde_json::Value = serde_json::from_str(&metrics_body).unwrap();
+        assert_eq!(metrics["metrics"]["worker_quorum_mismatches_total"], 1);
         drop(mismatch_server);
         liar_thread.join().unwrap();
 
@@ -1901,6 +2242,10 @@ mod tests {
         );
         assert_eq!(status, 503);
         assert!(body.contains("verification_quorum_unavailable"));
+        let (status, metrics_body) = server.health();
+        assert_eq!(status, 200);
+        let metrics: serde_json::Value = serde_json::from_str(&metrics_body).unwrap();
+        assert_eq!(metrics["metrics"]["worker_quorum_unavailable_total"], 1);
     }
 
     #[test]
@@ -1983,6 +2328,9 @@ mod tests {
                 .body
                 .contains("rate_limited")
         );
+        let metrics = health(&gateway);
+        let metrics: serde_json::Value = serde_json::from_str(&metrics.body).unwrap();
+        assert_eq!(metrics["metrics"]["rate_limit_rejections_total"], 2);
     }
 
     #[test]
@@ -2005,6 +2353,9 @@ mod tests {
         let response = request(&gateway, Some(&format!("Bearer {TOKEN}")), "2");
         assert_eq!(response.status, 429);
         assert!(response.body.contains("monthly_quota_exceeded"));
+        let metrics = health(&gateway);
+        let metrics: serde_json::Value = serde_json::from_str(&metrics.body).unwrap();
+        assert_eq!(metrics["metrics"]["quota_rejections_total"], 1);
     }
 
     #[test]
@@ -2035,6 +2386,85 @@ mod tests {
         let response = request(&reloaded, Some(&format!("Bearer {TOKEN}")), "1");
         assert_eq!(response.status, 429);
         assert!(response.body.contains("monthly_quota_exceeded"));
+    }
+
+    #[test]
+    fn quota_state_lock_serializes_a_second_process() {
+        const STATE_ENV: &str = "OMNI_GATEWAY_TEST_LOCK_STATE";
+        const READY_ENV: &str = "OMNI_GATEWAY_TEST_LOCK_READY";
+
+        if std::env::var_os(STATE_ENV).is_some() {
+            let state_path = PathBuf::from(std::env::var_os(STATE_ENV).unwrap());
+            let ready_path = PathBuf::from(std::env::var_os(READY_ENV).unwrap());
+            fs::write(ready_path, b"ready").unwrap();
+            let mut settings = settings();
+            settings.config.rate_limit.free_max_requests_per_window = 0;
+            let mut tier = settings.free_tier.clone();
+            tier.api_requests_per_month = 1;
+            let gateway = Gateway::new_with_state_path(
+                settings,
+                vec![ApiKey::new(TOKEN, "cross-process", tier).unwrap()],
+                state_path,
+            )
+            .unwrap();
+            let response = request(&gateway, Some(&format!("Bearer {TOKEN}")), "1");
+            println!("child-status={}", response.status);
+            assert_eq!(response.status, 429);
+            assert!(response.body.contains("monthly_quota_exceeded"));
+            return;
+        }
+
+        let mut settings = settings();
+        settings.config.rate_limit.free_max_requests_per_window = 0;
+        let mut tier = settings.free_tier.clone();
+        tier.api_requests_per_month = 1;
+        let test_dir = TestDirectory::new();
+        let state_path = test_dir.state_path();
+        let gateway = Gateway::new_with_state_path(
+            settings,
+            vec![ApiKey::new(TOKEN, "cross-process", tier).unwrap()],
+            &state_path,
+        )
+        .unwrap();
+        assert_eq!(
+            request(&gateway, Some(&format!("Bearer {TOKEN}")), "1").status,
+            200
+        );
+
+        let state_lock = lock_usage_state_file(&state_path).unwrap();
+        let ready_path = test_dir.0.join("child-ready");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::quota_state_lock_serializes_a_second_process",
+                "--nocapture",
+            ])
+            .env(STATE_ENV, &state_path)
+            .env(READY_ENV, &ready_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        while !ready_path.exists() && Instant::now() < ready_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready_path.exists(), "child process did not become ready");
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "child bypassed the state-file lock"
+        );
+
+        drop(state_lock);
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "child process failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("child-status=429"));
     }
 
     #[test]
@@ -2106,6 +2536,7 @@ mod tests {
             &state_path,
         )
         .unwrap();
+        fs::remove_file(usage_lock_path(&state_path)).unwrap();
         fs::remove_dir(&blocked_parent).unwrap();
         fs::write(&blocked_parent, "not a directory").unwrap();
         let response = request(&gateway, Some(&format!("Bearer {TOKEN}")), "1");
@@ -2131,6 +2562,9 @@ mod tests {
         let response = request(&gateway, Some(&format!("Bearer {TOKEN}")), "1");
         assert_eq!(response.status, 429);
         assert!(response.body.contains("concurrency_limit_exceeded"));
+        let metrics = health(&gateway);
+        let metrics: serde_json::Value = serde_json::from_str(&metrics.body).unwrap();
+        assert_eq!(metrics["metrics"]["concurrency_rejections_total"], 1);
     }
 
     #[test]

@@ -16,6 +16,7 @@ toml.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
 ring = "0.17"
+fs2 = "0.4"
 
 [dev-dependencies]
 rcgen = "0.13"

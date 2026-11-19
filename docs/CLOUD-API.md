@@ -86,6 +86,13 @@ The gateway applies both quota and concurrency controls:
 - queue depth and rejection policy; and
 - retry-after metadata for throttled or capacity-rejected requests.
 
+Monthly quota and rolling-window updates are serialized across gateway
+processes sharing the same state path by an OS-backed sibling lock file; the
+snapshot is reloaded while locked before each admission and replaced atomically.
+The lock is released by the operating system if a process exits. Active-request
+concurrency permits remain process-local and are reset on restart, so use an
+external coordinator if the concurrency ceiling must span multiple replicas.
+
 Recommended HTTP responses:
 
 | Status | Meaning |
@@ -135,9 +142,13 @@ Configure a CA bundle and expected worker DNS name, and provision the PSK throug
 the gateway's secret environment. Worker-side filesystem roots and resource
 ceilings remain operator-controlled.
 
-Worker health checks use the authenticated cluster `Ping` protocol over the
-configured TLS connection; `/v1/health` is not currently served by the REST
-handler.
+The configured health endpoint (default `/v1/health`) serves unauthenticated
+aggregate gateway status over HTTPS. Its JSON response includes request
+success/failure, quota/rate/concurrency rejection, worker dispatch, and
+deterministic quorum counters, plus cluster enablement and configured worker
+count. It contains no tenant identifiers or API-key material. Health reads are
+excluded from request counters. Worker health checks separately use the
+authenticated cluster `Ping` protocol over the configured TLS connection.
 
 For requests with `"verification": "deterministic"`, the gateway dispatches to
 the configured quorum of distinct healthy workers and compares status, value

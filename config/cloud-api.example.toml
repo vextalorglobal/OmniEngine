@@ -7,6 +7,7 @@ tls_cert = "/run/secrets/tls/cert.pem"
 tls_key = "/run/secrets/tls/key.pem"
 # Durable quota/rate state; override with OMNI_GATEWAY_STATE.
 # Default: OS user state directory; falls back to ./omni-gateway-state.json.
+# A sibling .lock file coordinates durable updates across gateway processes.
 allowed_origins = []
 execute_endpoint = "/v1/execute"
 health_endpoint = "/v1/health"
