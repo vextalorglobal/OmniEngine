@@ -41,8 +41,9 @@ The project supports two deployment models:
   Bengali and other scripts. Identifiers remain ASCII-only.
 
 See [docs/HYBRID-DEPLOYMENT.md](docs/HYBRID-DEPLOYMENT.md) for deployment
-guidance and [docs/CLOUD-API.md](docs/CLOUD-API.md) for the API contract,
-limits, and runtime availability.
+guidance, [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for local and Docker/Caddy
+setup, and [docs/CLOUD-API.md](docs/CLOUD-API.md) for the API contract, limits,
+and runtime availability.
 
 ## Quick start on Windows
 
@@ -177,6 +178,7 @@ cargo check --workspace
 | `config/` and `policies/` | Gateway configuration template and usage-tier policy |
 | `docs/` | Deployment, API, cluster, and release documentation |
 | `scripts/dev-up.ps1` and `ui/` | Windows local bootstrap and browser dashboard/bridge |
+| `Dockerfile`, `docker-compose.yml`, `Caddyfile` | Multi-stage cloud deployment with private gateway and automatic HTTPS proxy |
 
 ## License
 

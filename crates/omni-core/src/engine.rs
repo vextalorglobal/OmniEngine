@@ -3150,6 +3150,28 @@ mod tests {
     }
 
     #[test]
+    fn utf8_strings_round_trip_across_scripts_and_json() {
+        let expected = "বাংলা — हिन्दी — 日本語 — العربية — Ελληνικά — 😀 — e\u{301}";
+        let source = r#"// বাংলা — हिन्दी — 日本語 — العربية — Ελληνικά — 😀
+let greeting = "বাংলা — हिन्दी — 日本語 — العربية — Ελληνικά — 😀 — e\u{301}"
+greeting"#;
+        let mut engine = Engine::new();
+        let first = engine.exec(source).unwrap();
+        let rendered = engine.render(first);
+        assert_eq!(rendered, expected);
+        assert_eq!(engine.string_of(first).unwrap(), expected.as_bytes());
+
+        let round_trip = engine
+            .exec(r#"json.parse(json.stringify("বাংলা — हिन्दी — 日本語 — العربية — Ελληνικά — 😀"))"#)
+            .unwrap();
+        assert_eq!(
+            engine.render(round_trip),
+            "বাংলা — हिन्दी — 日本語 — العربية — Ελληνικά — 😀"
+        );
+        assert_eq!(text(r#"len("ক😀")"#), "7");
+    }
+
+    #[test]
     fn escapes_decode_to_what_they_name() {
         assert_eq!(text(r#""a\nb""#), "a\nb");
         assert_eq!(text(r#""a\tb""#), "a\tb");

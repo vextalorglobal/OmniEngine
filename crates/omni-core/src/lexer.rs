@@ -583,6 +583,14 @@ mod tests {
     }
 
     #[test]
+    fn unicode_comments_keep_following_token_offsets_byte_aligned() {
+        let source = "// বাংলা — 日本語\n42";
+        let tokens = lex(source).unwrap();
+        assert_eq!(tokens[0].start as usize, source.find("42").unwrap());
+        assert_eq!(tokens[0].text(source), "42");
+    }
+
+    #[test]
     fn a_non_ascii_byte_is_reported_decoded_with_its_column() {
         // Identifiers are ASCII by design, so this is the error path a non-English
         // source file hits first: it must name the character, not a byte.

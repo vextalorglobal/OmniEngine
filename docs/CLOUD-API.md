@@ -14,6 +14,7 @@ Example REST request:
 
 ```json
 {
+  "language": "omni",
   "source": "40 + 2",
   "gas_limit": 50000,
   "timeout_ms": 50,
@@ -27,6 +28,12 @@ Example REST success:
 {
   "request_id": "req_example",
   "status": "ok",
+  "runtime": {
+    "language": "omni",
+    "name": "OmniEngine",
+    "runtime": "omni-core",
+    "available": true
+  },
   "value": {
     "tag": "number",
     "number": 42
@@ -37,6 +44,41 @@ Example REST success:
   }
 }
 ```
+
+The `language` field is optional. Omitting it preserves the original contract
+and selects `omni`; `"default"` is also accepted as an alias. Language IDs are
+case-sensitive. Successful results include additive `runtime` metadata so
+clients can identify the adapter that executed the request.
+
+Lua example:
+
+```json
+{
+  "language": "lua",
+  "source": "return 40 + 2"
+}
+```
+
+Lua uses an embedded Lua 5.4 VM with only the base and math libraries enabled;
+file, network, package, debug, output, and dynamic code-loading APIs are
+removed. Its instruction hook, VM memory limit, UTF-8 source/output bounds, and
+the same gateway CPU and request limits apply. Lua is gateway-local and does
+not support worker-cluster dispatch or deterministic quorum verification.
+
+## Runtime Discovery
+
+`GET /v1/languages` returns the available language IDs, runtime names,
+capabilities, effective gateway limits, and sandbox policy. The discovery
+response contains no tenant or credential data and does not require bearer
+authentication. At present, `omni` and `lua` are available. `javascript`,
+`python`, and `wasm` are recognized but return `503 runtime_unavailable`;
+the gateway never falls back to launching a host process. The `omni-wasm`
+crate is a binding scaffold, not a host for arbitrary WebAssembly modules.
+
+Unknown language IDs return `422 unsupported_language`. A known runtime that
+cannot execute in the configured topology returns `503` with a diagnostic
+code. In particular, Lua cannot be routed through the current Omni-only worker
+protocol.
 
 ## Planned gRPC Contract
 
@@ -54,27 +96,57 @@ message ExecuteRequest {
   uint64 gas_limit = 2;
   uint32 timeout_ms = 3;
   bool deterministic_verification = 4;
+  string language = 5;
 }
 ```
 
 REST and gRPC must produce the same status classes, value tags, sandbox
 diagnostics, and usage accounting.
 
+## Listener, TLS, and CORS
+
+The local configuration binds to `127.0.0.1:8443` and serves direct TLS using
+the configured certificate and private-key PEM paths. `omni-gateway` supports
+the following startup overrides:
+
+| Variable | Behavior |
+| --- | --- |
+| `OMNI_BIND_ADDR` | Bind address, e.g. `127.0.0.1:8443` or `0.0.0.0:8443` |
+| `OMNI_PORT` | Overrides the configured/bind-address port |
+| `OMNI_TLS_MODE` | `tls` (default) or `plain` behind a trusted TLS-terminating proxy |
+| `OMNI_ALLOWED_ORIGINS` | Comma-separated exact browser origins |
+| `OMNI_API_KEYS` | Comma-separated `tenant:key` values; overrides the configured key source |
+
+Use `OMNI_TLS_MODE=plain` only when the gateway is reachable exclusively on a
+trusted private network behind a proxy that terminates HTTPS. Do not expose a
+plain listener to the public internet. `/v1/health`, `/v1/languages`, and
+`/v1/execute` use the same routes in direct TLS and trusted-proxy modes.
+
+The gateway permits browser CORS only for exact configured origins, including
+preflight requests. Wildcard origins are rejected. An empty origin list
+disables cross-origin browser access without affecting same-origin requests
+or non-browser API clients. See [DEPLOYMENT.md](DEPLOYMENT.md) for Docker,
+Caddy, and Nginx setup.
+
 ## Authentication
 
-All public API routes require a bearer token or gRPC metadata key:
+Execution routes require a bearer token or gRPC metadata key:
 
 ```text
 authorization: Bearer <token>
 ```
 
 - tokens are issued per tenant and capability scope;
-- credentials must be sent only over TLS;
+- credentials must be sent over TLS between client and trusted reverse proxy or
+  directly to the gateway;
 - keys must be rotatable and revocable;
 - authentication occurs before source parsing or worker dispatch;
 - failed authentication must not disclose tenant or quota existence; and
 - worker-to-worker traffic uses separate cluster credentials from customer API
   tokens.
+
+`GET /v1/health` and `GET /v1/languages` are unauthenticated aggregate and
+capability endpoints; neither returns tenant identifiers or credential data.
 
 ## Rate Limiting
 
@@ -103,6 +175,7 @@ Recommended HTTP responses:
 | `409` | Deterministic worker results disagree |
 | `503` | No healthy worker or insufficient queue capacity |
 | `400` | Invalid source or resource configuration |
+| `422` | Unsupported language ID or runtime execution error |
 | `413` | Request or source exceeds gateway size limits |
 
 ## Resource Enforcement
@@ -121,6 +194,10 @@ Every request is bounded independently at the gateway and worker:
 
 If gateway and worker limits differ, the stricter effective limit applies.
 Cloud requests must never widen a worker's configured permission set.
+All registered runners declare their filesystem, network, module, host-function,
+resource-limit, cluster, and verification capabilities through the language
+discovery endpoint. A runtime without a proven isolated adapter is reported as
+unavailable rather than being launched as a subprocess.
 
 ## Latency Targets
 
@@ -158,6 +235,7 @@ a single-worker result for a verification request. Local fallback, when enabled,
 applies only to transient errors on non-verification requests.
 
 CPU deadlines are checked between VM instructions, with elapsed-time checks
-after execution. The memory ceiling accounts for engine arena and result
-reservations; it does not cap all parser or Rust process heap allocations.
-Operators should still isolate worker processes with OS/container limits.
+after execution. The Lua runner also applies its allocator limit and checks
+time/gas at each instruction. VM memory figures do not cap all Rust or gateway
+process allocations, and an in-process runtime is not an OS security boundary.
+Operators should isolate gateway and worker processes with OS/container limits.

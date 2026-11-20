@@ -1,0 +1,78 @@
+services:
+  gateway:
+    build:
+      context: .
+      target: gateway
+    environment:
+      OMNI_BIND_ADDR: 0.0.0.0:8443
+      OMNI_PORT: 8443
+      OMNI_TLS_MODE: plain
+      OMNI_API_KEYS: ${OMNI_API_KEYS:?Set OMNI_API_KEYS to comma-separated tenant:key entries}
+      OMNI_ALLOWED_ORIGINS: https://${OMNI_DOMAIN:?Set OMNI_DOMAIN to your DNS name}
+      OMNI_GATEWAY_STATE: /var/lib/omni/gateway-state.json
+    expose:
+      - "8443"
+    volumes:
+      - gateway-state:/var/lib/omni
+    networks:
+      - backend
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+
+  dashboard:
+    build:
+      context: .
+      target: dashboard
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3000
+      OMNI_GATEWAY_URL: http://gateway:8443
+      OMNI_PUBLIC_GATEWAY_URL: https://${OMNI_DOMAIN:?Set OMNI_DOMAIN to your DNS name}
+      OMNI_GATEWAY_ALLOW_HTTP: "1"
+      OMNI_GATEWAY_PROXY_LOCK: "1"
+      OMNI_UI_ALLOWED_HOSTS: ${OMNI_DOMAIN:?Set OMNI_DOMAIN to your DNS name}
+      OMNI_UI_ALLOWED_ORIGINS: https://${OMNI_DOMAIN:?Set OMNI_DOMAIN to your DNS name}
+    expose:
+      - "3000"
+    depends_on:
+      gateway:
+        condition: service_healthy
+    networks:
+      - backend
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+
+  caddy:
+    image: caddy:2
+    environment:
+      OMNI_DOMAIN: ${OMNI_DOMAIN:?Set OMNI_DOMAIN to your DNS name}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      dashboard:
+        condition: service_healthy
+    networks:
+      - backend
+    restart: unless-stopped
+
+networks:
+  backend:
+
+volumes:
+  gateway-state:
+  caddy-data:
+  caddy-config:

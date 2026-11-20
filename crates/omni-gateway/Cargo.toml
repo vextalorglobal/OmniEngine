@@ -17,13 +17,16 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pemfile = "2"
 ring = "0.17"
 fs2 = "0.4"
-
-[dev-dependencies]
 rcgen = "0.13"
+mlua = { version = "0.11.4", default-features = false, features = ["lua54", "vendored"] }
 
 [[bin]]
 name = "omni-gateway"
 path = "src/main.rs"
+
+[[bin]]
+name = "omni-gateway-dev-cert"
+path = "src/bin/dev-cert.rs"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
