@@ -8,6 +8,7 @@ services:
       OMNI_PORT: 8443
       OMNI_TLS_MODE: plain
       OMNI_API_KEYS: ${OMNI_API_KEYS:?Set OMNI_API_KEYS to comma-separated tenant:key entries}
+      OMNI_KEY_ADMIN_TOKEN: ${OMNI_KEY_ADMIN_TOKEN:?Set a separate OMNI_KEY_ADMIN_TOKEN}
       OMNI_ALLOWED_ORIGINS: https://${OMNI_DOMAIN:?Set OMNI_DOMAIN to your DNS name}
       OMNI_GATEWAY_STATE: /var/lib/omni/gateway-state.json
     expose:
@@ -35,6 +36,7 @@ services:
       OMNI_PUBLIC_SITE_URL: https://${OMNI_DOMAIN:?Set OMNI_DOMAIN to your DNS name}
       OMNI_GATEWAY_ALLOW_HTTP: "1"
       OMNI_GATEWAY_PROXY_LOCK: "1"
+      OMNI_KEY_ADMIN_ENABLED: "1"
       OMNI_ALLOWED_HOSTS: ${OMNI_DOMAIN:?Set OMNI_DOMAIN to your DNS name}
       OMNI_UI_ALLOWED_ORIGINS: https://${OMNI_DOMAIN:?Set OMNI_DOMAIN to your DNS name}
     expose:

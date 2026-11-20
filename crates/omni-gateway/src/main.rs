@@ -61,7 +61,12 @@ fn run() -> Result<(), String> {
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let gateway = Arc::new(Gateway::new(settings, keys)?);
+    let key_admin_token = std::env::var("OMNI_KEY_ADMIN_TOKEN").ok();
+    let gateway = Arc::new(Gateway::new_with_key_admin_token(
+        settings,
+        keys,
+        key_admin_token.as_deref(),
+    )?);
     gateway
         .serve()
         .map_err(|e| format!("gateway listener failed: {e}"))

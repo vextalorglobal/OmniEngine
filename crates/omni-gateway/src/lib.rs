@@ -5,6 +5,7 @@ use omni_cluster::wire::{ErrorCode, TaskStatus, ValueTag};
 use omni_cluster::{ClusterClient, RemoteError, TaskReply};
 use omni_core::DEFAULT_STEP_LIMIT;
 use ring::digest::{SHA256, digest};
+use ring::rand::{SecureRandom, SystemRandom};
 mod runners;
 use runners::{
     ExecutionLimits, ExecutionRunner, LanguageDescriptor, RunnerError, RunnerOutput,
@@ -21,13 +22,15 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
+const MAX_KEY_REQUEST_BYTES: usize = 8 * 1024;
 const MAX_BODY_OVERHEAD: usize = 4096;
 const DEFAULT_STATE_PATH: &str = "omni-gateway-state.json";
 const STATE_PATH_ENV: &str = "OMNI_GATEWAY_STATE";
+const MAX_MANAGED_KEYS: usize = 25;
 const OMNI_LANGUAGE_ID: &str = "omni";
 const OMNI_LANGUAGE_NAME: &str = "OmniEngine";
 const OMNI_RUNTIME_NAME: &str = "omni-core";
@@ -517,6 +520,28 @@ struct UsageSnapshot {
     keys: HashMap<String, PersistedKeyUsage>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedKeyRecord {
+    digest: String,
+    tenant_id: String,
+    label: String,
+    created_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedKeySnapshot {
+    version: u32,
+    keys: Vec<ManagedKeyRecord>,
+}
+
+#[derive(Default)]
+struct ManagedKeys {
+    records: Vec<ManagedKeyRecord>,
+    states: Vec<Arc<KeyState>>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct UsageState {
     keys: HashMap<String, PersistedKeyUsage>,
@@ -528,6 +553,19 @@ struct KeyState {
     digest_hex: String,
     tenant_id: String,
     limits: TierPolicy,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateManagedKeyRequest {
+    label: String,
+    tier: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevokeManagedKeysRequest {
+    api_keys: Vec<String>,
 }
 
 struct Permit {
@@ -551,6 +589,10 @@ impl Drop for Permit {
 pub struct Gateway {
     settings: GatewaySettings,
     keys: Vec<Arc<KeyState>>,
+    managed_keys: RwLock<ManagedKeys>,
+    key_registry_path: PathBuf,
+    key_admin_token_digest: Option<Vec<u8>>,
+    key_mutation_lock: Mutex<()>,
     cluster: Option<ClusterClient>,
     state_path: PathBuf,
     usage: Arc<Mutex<UsageState>>,
@@ -570,14 +612,56 @@ impl Gateway {
         state_path: impl Into<PathBuf>,
     ) -> Result<Self, String> {
         let cluster = configured_cluster_client(&settings.config.cluster)?;
-        Self::new_with_runtime_cluster(settings, api_keys, state_path, cluster)
+        Self::new_with_runtime_cluster_and_admin(settings, api_keys, state_path, cluster, None)
     }
 
+    pub fn new_with_key_admin_token(
+        settings: GatewaySettings,
+        api_keys: Vec<ApiKey>,
+        key_admin_token: Option<&str>,
+    ) -> Result<Self, String> {
+        let cluster = configured_cluster_client(&settings.config.cluster)?;
+        Self::new_with_runtime_cluster_and_admin(
+            settings,
+            api_keys,
+            default_state_path(),
+            cluster,
+            key_admin_token,
+        )
+    }
+
+    pub fn new_with_state_path_and_key_admin_token(
+        settings: GatewaySettings,
+        api_keys: Vec<ApiKey>,
+        state_path: impl Into<PathBuf>,
+        key_admin_token: Option<&str>,
+    ) -> Result<Self, String> {
+        let cluster = configured_cluster_client(&settings.config.cluster)?;
+        Self::new_with_runtime_cluster_and_admin(
+            settings,
+            api_keys,
+            state_path,
+            cluster,
+            key_admin_token,
+        )
+    }
+
+    #[cfg(test)]
     fn new_with_runtime_cluster(
         settings: GatewaySettings,
         api_keys: Vec<ApiKey>,
         state_path: impl Into<PathBuf>,
         cluster: Option<ClusterClient>,
+    ) -> Result<Self, String> {
+        Self::new_with_runtime_cluster_and_admin(settings, api_keys, state_path, cluster, None)
+    }
+
+    fn new_with_runtime_cluster_and_admin(
+        settings: GatewaySettings,
+        api_keys: Vec<ApiKey>,
+        state_path: impl Into<PathBuf>,
+        cluster: Option<ClusterClient>,
+        key_admin_token: Option<&str>,
     ) -> Result<Self, String> {
         if api_keys.is_empty() {
             return Err("at least one API key must be provisioned".to_string());
@@ -588,7 +672,23 @@ impl Gateway {
                 "cluster runtime does not match the enabled gateway configuration".to_string(),
             );
         }
+        let key_admin_token_digest = key_admin_token
+            .filter(|token| !token.is_empty())
+            .map(|token| {
+                if token.len() < 32
+                    || token.len() > 512
+                    || !token.is_ascii()
+                    || !token.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+                {
+                    return Err(
+                        "OMNI_KEY_ADMIN_TOKEN must contain 32–512 visible ASCII characters with no spaces".to_string(),
+                    );
+                }
+                Ok(digest(&SHA256, token.as_bytes()).as_ref().to_vec())
+            })
+            .transpose()?;
         let state_path = state_path.into();
+        let key_registry_path = managed_key_registry_path(&state_path);
         let mut usage = load_usage_state(&state_path)?;
         let month = current_month();
         let now = current_unix_millis();
@@ -617,9 +717,43 @@ impl Gateway {
                 }))
             })
             .collect::<Result<Vec<_>, String>>()?;
+        if key_admin_token_digest.as_ref().is_some_and(|admin_digest| {
+            keys.iter()
+                .any(|key| constant_time_eq(&key.digest, admin_digest))
+        }) {
+            return Err(
+                "OMNI_KEY_ADMIN_TOKEN must differ from every execution API key".to_string(),
+            );
+        }
+        let managed_records = load_managed_key_records(&key_registry_path)?;
+        let mut managed_seen = HashMap::new();
+        let managed_states = managed_records
+            .iter()
+            .map(|record| {
+                let digest_bytes = decode_hex_digest(&record.digest)?;
+                if seen.contains_key(&record.digest)
+                    || managed_seen.insert(record.digest.clone(), ()).is_some()
+                {
+                    return Err("duplicate managed API key digest in key registry".to_string());
+                }
+                Ok(Arc::new(KeyState {
+                    digest: digest_bytes,
+                    digest_hex: record.digest.clone(),
+                    tenant_id: record.tenant_id.clone(),
+                    limits: settings.free_tier.clone(),
+                }))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         Ok(Self {
             settings,
             keys,
+            managed_keys: RwLock::new(ManagedKeys {
+                records: managed_records,
+                states: managed_states,
+            }),
+            key_registry_path,
+            key_admin_token_digest,
+            key_mutation_lock: Mutex::new(()),
             cluster,
             state_path,
             usage: Arc::new(Mutex::new(usage)),
@@ -650,6 +784,24 @@ impl Gateway {
         if path == "/v1/languages" && method == "GET" {
             return self.languages_response();
         }
+        if path == "/v1/keys" || path == "/v1/keys/revoke" {
+            self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+            let response = if path == "/v1/keys" {
+                self.handle_create_managed_key(method, headers, body)
+            } else {
+                self.handle_revoke_managed_keys(method, headers, body)
+            };
+            if response.status < 400 {
+                self.metrics
+                    .requests_succeeded_total
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.metrics
+                    .requests_failed_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            return response;
+        }
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         let is_execute = path == self.settings.config.execute_endpoint && method == "POST";
         let response = self.handle_execute(method, path, headers, body);
@@ -668,6 +820,340 @@ impl Gateway {
                 .fetch_add(1, Ordering::Relaxed);
         }
         response
+    }
+
+    fn authorize_key_admin(&self, headers: &HashMap<String, String>) -> Result<(), HttpResponse> {
+        let Some(expected_digest) = self.key_admin_token_digest.as_ref() else {
+            return Err(HttpResponse::error(
+                503,
+                "key_management_disabled",
+                "Key management is disabled; configure OMNI_KEY_ADMIN_TOKEN on the gateway.",
+                None,
+            ));
+        };
+        let Some(token) = bearer_token(headers, &self.settings.auth.token_header) else {
+            return Err(HttpResponse::error(
+                401,
+                "unauthorized",
+                "A valid key-administration bearer token is required.",
+                None,
+            ));
+        };
+        let token_digest = digest(&SHA256, token.as_bytes());
+        if !constant_time_eq(expected_digest, token_digest.as_ref()) {
+            return Err(HttpResponse::error(
+                401,
+                "unauthorized",
+                "A valid key-administration bearer token is required.",
+                None,
+            ));
+        }
+        Ok(())
+    }
+
+    fn handle_create_managed_key(
+        &self,
+        method: &str,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> HttpResponse {
+        if method != "POST" {
+            return HttpResponse::error(405, "method_not_allowed", "POST is required", None);
+        }
+        if let Err(response) = self.authorize_key_admin(headers) {
+            return response;
+        }
+        if !has_json_content_type(headers) {
+            return HttpResponse::error(
+                415,
+                "unsupported_media_type",
+                "Content-Type must be application/json",
+                None,
+            );
+        }
+        if body.len() > MAX_KEY_REQUEST_BYTES {
+            return HttpResponse::error(
+                413,
+                "payload_too_large",
+                "key request body exceeds the configured limit",
+                None,
+            );
+        }
+        let request: CreateManagedKeyRequest = match serde_json::from_slice(body) {
+            Ok(request) => request,
+            Err(error) => {
+                return HttpResponse::error(400, "invalid_request", &error.to_string(), None);
+            }
+        };
+        let label = request.label.trim();
+        if label.is_empty()
+            || label.chars().count() > 48
+            || label.chars().any(char::is_control)
+            || request.tier != "free"
+        {
+            return HttpResponse::error(
+                400,
+                "invalid_key_request",
+                "Provide a 1–48 character label and the supported free tier.",
+                None,
+            );
+        }
+
+        let _mutation = match self.key_mutation_lock.lock() {
+            Ok(lock) => lock,
+            Err(_) => {
+                return HttpResponse::error(
+                    503,
+                    "key_registry_unavailable",
+                    "The key registry is temporarily unavailable.",
+                    None,
+                );
+            }
+        };
+        let mut managed = match self.managed_keys.write() {
+            Ok(managed) => managed,
+            Err(_) => {
+                return HttpResponse::error(
+                    503,
+                    "key_registry_unavailable",
+                    "The key registry is temporarily unavailable.",
+                    None,
+                );
+            }
+        };
+        let _file_lock = match lock_usage_state_file(&self.key_registry_path) {
+            Ok(lock) => lock,
+            Err(error) => {
+                return HttpResponse::error(
+                    503,
+                    "key_registry_unavailable",
+                    &format!("Could not lock the key registry: {error}"),
+                    None,
+                );
+            }
+        };
+        let mut records = match load_managed_key_records_unlocked(&self.key_registry_path) {
+            Ok(records) => records,
+            Err(error) => {
+                return HttpResponse::error(503, "key_registry_unavailable", &error, None);
+            }
+        };
+        if records.len() >= MAX_MANAGED_KEYS {
+            return HttpResponse::error(
+                429,
+                "key_limit_reached",
+                "The gateway key limit has been reached. Revoke a managed key before creating another.",
+                None,
+            );
+        }
+
+        let mut secret = [0_u8; 32];
+        if SystemRandom::new().fill(&mut secret).is_err() {
+            return HttpResponse::error(
+                503,
+                "key_generation_failed",
+                "The operating system could not provide secure random bytes.",
+                None,
+            );
+        }
+        let api_key = format!("omni_{}", hex_digest(&secret));
+        let token_digest = digest(&SHA256, api_key.as_bytes());
+        let token_digest_hex = hex_digest(token_digest.as_ref());
+        if self
+            .keys
+            .iter()
+            .any(|key| key.digest_hex == token_digest_hex)
+            || records
+                .iter()
+                .any(|existing| existing.digest == token_digest_hex)
+        {
+            return HttpResponse::error(
+                503,
+                "key_generation_failed",
+                "A duplicate API key digest was generated; retry the request.",
+                None,
+            );
+        }
+        let record = ManagedKeyRecord {
+            digest: token_digest_hex,
+            tenant_id: "managed".to_string(),
+            label: label.to_string(),
+            created_at_unix_ms: current_unix_millis(),
+        };
+        records.push(record.clone());
+        if let Err(error) = persist_managed_key_records(&self.key_registry_path, &records) {
+            return HttpResponse::error(
+                503,
+                "key_registry_unavailable",
+                &format!("Could not persist the new API key: {error}"),
+                None,
+            );
+        }
+        managed.records = records;
+        managed.states = match managed_key_states(&managed.records, &self.settings.free_tier) {
+            Ok(states) => states,
+            Err(error) => {
+                return HttpResponse::error(
+                    503,
+                    "key_registry_unavailable",
+                    &format!("Could not load the persisted API key: {error}"),
+                    None,
+                );
+            }
+        };
+        HttpResponse {
+            status: 201,
+            body: json!({
+                "key":{
+                    "api_key":api_key,
+                    "label":record.label,
+                    "tier":"free",
+                    "tier_label":"Free Tier",
+                    "created_at":record.created_at_unix_ms
+                }
+            })
+            .to_string(),
+            retry_after_seconds: None,
+        }
+    }
+
+    fn handle_revoke_managed_keys(
+        &self,
+        method: &str,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> HttpResponse {
+        if method != "POST" {
+            return HttpResponse::error(405, "method_not_allowed", "POST is required", None);
+        }
+        if let Err(response) = self.authorize_key_admin(headers) {
+            return response;
+        }
+        if !has_json_content_type(headers) {
+            return HttpResponse::error(
+                415,
+                "unsupported_media_type",
+                "Content-Type must be application/json",
+                None,
+            );
+        }
+        if body.len() > MAX_KEY_REQUEST_BYTES {
+            return HttpResponse::error(
+                413,
+                "payload_too_large",
+                "key request body exceeds the configured limit",
+                None,
+            );
+        }
+        let request: RevokeManagedKeysRequest = match serde_json::from_slice(body) {
+            Ok(request) => request,
+            Err(error) => {
+                return HttpResponse::error(400, "invalid_request", &error.to_string(), None);
+            }
+        };
+        if request.api_keys.is_empty()
+            || request.api_keys.len() > MAX_MANAGED_KEYS
+            || request
+                .api_keys
+                .iter()
+                .any(|token| token.len() < 24 || token.len() > 512)
+        {
+            return HttpResponse::error(
+                400,
+                "invalid_revoke_request",
+                "api_keys must contain 1–25 valid key tokens.",
+                None,
+            );
+        }
+
+        let requested: HashMap<String, String> = request
+            .api_keys
+            .iter()
+            .map(|token| {
+                (
+                    hex_digest(digest(&SHA256, token.as_bytes()).as_ref()),
+                    token.clone(),
+                )
+            })
+            .collect();
+        let _mutation = match self.key_mutation_lock.lock() {
+            Ok(lock) => lock,
+            Err(_) => {
+                return HttpResponse::error(
+                    503,
+                    "key_registry_unavailable",
+                    "The key registry is temporarily unavailable.",
+                    None,
+                );
+            }
+        };
+        let mut managed = match self.managed_keys.write() {
+            Ok(managed) => managed,
+            Err(_) => {
+                return HttpResponse::error(
+                    503,
+                    "key_registry_unavailable",
+                    "The key registry is temporarily unavailable.",
+                    None,
+                );
+            }
+        };
+        let _file_lock = match lock_usage_state_file(&self.key_registry_path) {
+            Ok(lock) => lock,
+            Err(error) => {
+                return HttpResponse::error(
+                    503,
+                    "key_registry_unavailable",
+                    &format!("Could not lock the key registry: {error}"),
+                    None,
+                );
+            }
+        };
+        let records = match load_managed_key_records_unlocked(&self.key_registry_path) {
+            Ok(records) => records,
+            Err(error) => {
+                return HttpResponse::error(503, "key_registry_unavailable", &error, None);
+            }
+        };
+        let mut revoked = Vec::new();
+        let remaining: Vec<ManagedKeyRecord> = records
+            .into_iter()
+            .filter(|record| {
+                if let Some(token) = requested.get(&record.digest) {
+                    revoked.push(token.clone());
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+        if !revoked.is_empty() {
+            if let Err(error) = persist_managed_key_records(&self.key_registry_path, &remaining) {
+                return HttpResponse::error(
+                    503,
+                    "key_registry_unavailable",
+                    &format!("Could not persist key revocations: {error}"),
+                    None,
+                );
+            }
+        }
+        managed.records = remaining;
+        managed.states = match managed_key_states(&managed.records, &self.settings.free_tier) {
+            Ok(states) => states,
+            Err(error) => {
+                return HttpResponse::error(
+                    503,
+                    "key_registry_unavailable",
+                    &format!("Could not load the persisted API keys: {error}"),
+                    None,
+                );
+            }
+        };
+        HttpResponse {
+            status: 200,
+            body: json!({"revoked_api_keys":revoked}).to_string(),
+            retry_after_seconds: None,
+        }
     }
 
     fn health_response(&self) -> HttpResponse {
@@ -734,12 +1220,31 @@ impl Gateway {
             return HttpResponse::error(401, "unauthorized", "missing or invalid API key", None);
         };
         let token_digest = digest(&SHA256, token.as_bytes());
-        let Some(key) = self
+        let static_key = self
             .keys
             .iter()
             .find(|key| constant_time_eq(&key.digest, token_digest.as_ref()))
-            .cloned()
-        else {
+            .cloned();
+        let managed_key = if static_key.is_none() {
+            match self.managed_keys.read() {
+                Ok(keys) => keys
+                    .states
+                    .iter()
+                    .find(|key| constant_time_eq(&key.digest, token_digest.as_ref()))
+                    .cloned(),
+                Err(_) => {
+                    return HttpResponse::error(
+                        503,
+                        "key_registry_unavailable",
+                        "The key registry is temporarily unavailable.",
+                        None,
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        let Some(key) = static_key.or(managed_key) else {
             return HttpResponse::error(401, "unauthorized", "missing or invalid API key", None);
         };
         let content_type = headers
@@ -1496,6 +2001,162 @@ fn hex_digest(bytes: &[u8]) -> String {
     output
 }
 
+fn decode_hex_digest(value: &str) -> Result<Vec<u8>, String> {
+    if value.len() != 64 || !value.is_ascii() {
+        return Err("managed API key digest must be 64 hexadecimal characters".to_string());
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair)
+                .map_err(|_| "managed API key digest must be hexadecimal".to_string())?;
+            u8::from_str_radix(pair, 16)
+                .map_err(|_| "managed API key digest must be hexadecimal".to_string())
+        })
+        .collect()
+}
+
+fn managed_key_registry_path(state_path: &Path) -> PathBuf {
+    let filename = state_path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("omni-gateway-state"));
+    state_path.with_file_name(format!("{}.keys.json", filename.to_string_lossy()))
+}
+
+fn load_managed_key_records(path: &Path) -> Result<Vec<ManagedKeyRecord>, String> {
+    let _registry_lock = lock_usage_state_file(path).map_err(|error| {
+        format!(
+            "cannot lock managed API key registry {}: {error}",
+            path.display()
+        )
+    })?;
+    load_managed_key_records_unlocked(path)
+}
+
+fn load_managed_key_records_unlocked(path: &Path) -> Result<Vec<ManagedKeyRecord>, String> {
+    let contents = match fs::read(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "cannot read managed API key registry {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let snapshot: ManagedKeySnapshot = serde_json::from_slice(&contents).map_err(|error| {
+        format!(
+            "invalid managed API key registry {}: {error}",
+            path.display()
+        )
+    })?;
+    if snapshot.version != 1 || snapshot.keys.len() > MAX_MANAGED_KEYS {
+        return Err(format!(
+            "unsupported or oversized managed API key registry {}",
+            path.display()
+        ));
+    }
+    let mut seen = HashMap::new();
+    for record in &snapshot.keys {
+        let digest = decode_hex_digest(&record.digest)?;
+        if hex_digest(&digest) != record.digest
+            || record.tenant_id.is_empty()
+            || record.tenant_id.len() > 64
+            || record.tenant_id.chars().any(char::is_control)
+            || record.label.trim().is_empty()
+            || record.label.chars().count() > 48
+            || record.label.chars().any(char::is_control)
+            || seen.insert(record.digest.clone(), ()).is_some()
+        {
+            return Err(format!(
+                "invalid or duplicate entry in managed API key registry {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(snapshot.keys)
+}
+
+fn managed_key_states(
+    records: &[ManagedKeyRecord],
+    limits: &TierPolicy,
+) -> Result<Vec<Arc<KeyState>>, String> {
+    records
+        .iter()
+        .map(|record| {
+            let digest = decode_hex_digest(&record.digest)?;
+            Ok(Arc::new(KeyState {
+                digest,
+                digest_hex: record.digest.clone(),
+                tenant_id: record.tenant_id.clone(),
+                limits: limits.clone(),
+            }))
+        })
+        .collect()
+}
+
+fn persist_managed_key_records(path: &Path, records: &[ManagedKeyRecord]) -> io::Result<()> {
+    static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let filename = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("omni-gateway-keys"));
+    let temporary_path = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        filename.to_string_lossy(),
+        std::process::id(),
+        NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let snapshot = ManagedKeySnapshot {
+        version: 1,
+        keys: records.to_vec(),
+    };
+    let serialized = serde_json::to_vec(&snapshot)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let write_result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary_path)?;
+        file.write_all(&serialized)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary_path, path)?;
+        #[cfg(unix)]
+        if let Err(error) = File::open(parent).and_then(|directory| directory.sync_all()) {
+            eprintln!(
+                "omni-gateway: managed API key registry was replaced but its directory could not be synced: {error}"
+            );
+        }
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    write_result
+}
+
+fn has_json_content_type(headers: &HashMap<String, String>) -> bool {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .is_some_and(|(_, value)| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("application/json"))
+        })
+}
+
 fn load_usage_state(path: &Path) -> Result<UsageState, String> {
     let _state_lock = lock_usage_state_file(path).map_err(|error| {
         format!(
@@ -1976,6 +2637,7 @@ fn write_http_response_with_cors(
     preflight: bool,
 ) -> io::Result<()> {
     let reason = match response.status {
+        201 => "Created",
         200 => "OK",
         204 => "No Content",
         400 => "Bad Request",
@@ -2030,6 +2692,7 @@ mod tests {
     const POLICY: &str = include_str!("../../../policies/usage-tiers.toml");
     const CONFIG: &str = include_str!("../../../config/cloud-api.example.toml");
     const TOKEN: &str = "omni_test_key_which_is_long_enough_01";
+    const KEY_ADMIN_TOKEN: &str = "omni_admin_test_token_which_is_long_enough_01";
     const CLUSTER_PSK: [u8; 32] = [0x5a; 32];
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
@@ -2349,6 +3012,21 @@ mod tests {
             headers.insert("Authorization".to_string(), auth.to_string());
         }
         gateway.handle("POST", "/v1/execute", &headers, body.as_bytes())
+    }
+
+    fn manage_keys_request(
+        gateway: &Gateway,
+        method: &str,
+        path: &str,
+        auth: Option<&str>,
+        body: &str,
+    ) -> HttpResponse {
+        let mut headers = HashMap::new();
+        headers.insert("Content-Type".to_string(), "application/json".to_string());
+        if let Some(auth) = auth {
+            headers.insert("Authorization".to_string(), auth.to_string());
+        }
+        gateway.handle(method, path, &headers, body.as_bytes())
     }
 
     #[test]
@@ -3076,6 +3754,111 @@ mod tests {
     }
 
     #[test]
+    fn managed_keys_require_admin_auth_persist_only_digests_and_revoke() {
+        let settings = settings();
+        let test_dir = TestDirectory::new();
+        let state_path = test_dir.state_path();
+        let gateway = Gateway::new_with_state_path_and_key_admin_token(
+            settings.clone(),
+            vec![ApiKey::new(TOKEN, "test-tenant", settings.free_tier.clone()).unwrap()],
+            &state_path,
+            Some(KEY_ADMIN_TOKEN),
+        )
+        .unwrap();
+        let create_body = json!({"label":"CI integration","tier":"free"}).to_string();
+
+        assert_eq!(
+            manage_keys_request(
+                &gateway,
+                "POST",
+                "/v1/keys",
+                Some(&format!("Bearer {TOKEN}")),
+                &create_body,
+            )
+            .status,
+            401
+        );
+
+        let created = manage_keys_request(
+            &gateway,
+            "POST",
+            "/v1/keys",
+            Some(&format!("Bearer {KEY_ADMIN_TOKEN}")),
+            &create_body,
+        );
+        assert_eq!(created.status, 201, "{}", created.body);
+        let payload: serde_json::Value = serde_json::from_str(&created.body).unwrap();
+        let token = payload["key"]["api_key"].as_str().unwrap();
+        assert!(token.starts_with("omni_"));
+        assert_eq!(payload["key"]["label"], "CI integration");
+
+        let registry_path = managed_key_registry_path(&state_path);
+        let persisted = fs::read_to_string(&registry_path).unwrap();
+        assert!(!persisted.contains(token));
+        assert_eq!(
+            request(&gateway, Some(&format!("Bearer {token}")), "40 + 2").status,
+            200
+        );
+
+        let reloaded = Gateway::new_with_state_path_and_key_admin_token(
+            settings.clone(),
+            vec![ApiKey::new(TOKEN, "test-tenant", settings.free_tier.clone()).unwrap()],
+            &state_path,
+            Some(KEY_ADMIN_TOKEN),
+        )
+        .unwrap();
+        assert_eq!(
+            request(&reloaded, Some(&format!("Bearer {token}")), "40 + 2").status,
+            200
+        );
+
+        let revoke_body = json!({"api_keys":[token]}).to_string();
+        let revoked = manage_keys_request(
+            &reloaded,
+            "POST",
+            "/v1/keys/revoke",
+            Some(&format!("Bearer {KEY_ADMIN_TOKEN}")),
+            &revoke_body,
+        );
+        assert_eq!(revoked.status, 200, "{}", revoked.body);
+        let revoked_payload: serde_json::Value = serde_json::from_str(&revoked.body).unwrap();
+        assert_eq!(revoked_payload["revoked_api_keys"][0], token);
+
+        let restarted = Gateway::new_with_state_path_and_key_admin_token(
+            settings.clone(),
+            vec![ApiKey::new(TOKEN, "test-tenant", settings.free_tier).unwrap()],
+            &state_path,
+            Some(KEY_ADMIN_TOKEN),
+        )
+        .unwrap();
+        assert_eq!(
+            request(&restarted, Some(&format!("Bearer {token}")), "40 + 2").status,
+            401
+        );
+    }
+
+    #[test]
+    fn managed_key_routes_are_disabled_without_admin_token() {
+        let settings = settings();
+        let test_dir = TestDirectory::new();
+        let gateway = Gateway::new_with_state_path(
+            settings.clone(),
+            vec![ApiKey::new(TOKEN, "test-tenant", settings.free_tier).unwrap()],
+            test_dir.state_path(),
+        )
+        .unwrap();
+        let response = manage_keys_request(
+            &gateway,
+            "POST",
+            "/v1/keys",
+            Some(&format!("Bearer {KEY_ADMIN_TOKEN}")),
+            r#"{"label":"Local key","tier":"free"}"#,
+        );
+        assert_eq!(response.status, 503);
+        assert!(response.body.contains("key_management_disabled"));
+    }
+
+    #[test]
     fn enforces_monthly_quota_and_rate_limit() {
         let mut settings = settings();
         settings.config.rate_limit.free_max_requests_per_window = 1;
@@ -3310,6 +4093,7 @@ mod tests {
         )
         .unwrap();
         fs::remove_file(usage_lock_path(&state_path)).unwrap();
+        fs::remove_file(usage_lock_path(&managed_key_registry_path(&state_path))).unwrap();
         fs::remove_dir(&blocked_parent).unwrap();
         fs::write(&blocked_parent, "not a directory").unwrap();
         let response = request(&gateway, Some(&format!("Bearer {TOKEN}")), "1");

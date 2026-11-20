@@ -44,22 +44,6 @@
         </div>
       </header>
 
-      <section class="product-intro" aria-labelledby="productPurpose">
-        <div class="product-intro-heading">
-          <p class="eyebrow">Rust execution platform</p>
-          <h2 id="productPurpose">Run sandboxed tasks locally or through a managed API</h2>
-        </div>
-        <div class="product-intro-copy">
-          <p>OmniEngine combines a local-first language engine and SDKs with an HTTPS gateway for policy-bounded remote execution. The gateway currently supports OmniEngine, Lua 5.4, and self-contained WebAssembly Text modules; runtime discovery reports availability, limits, and sandbox capabilities.</p>
-          <p>Local execution stays on the caller's device or server. Managed requests process only the data sent to the API and apply authentication, CPU, memory, and usage limits.</p>
-          <nav class="product-links" aria-label="OmniEngine documentation">
-            <a href="https://github.com/vextalorglobal/OmniEngine">Source code and README</a>
-            <a href="https://github.com/vextalorglobal/OmniEngine/blob/main/docs/CLOUD-API.md">Cloud API reference</a>
-            <a href="https://github.com/vextalorglobal/OmniEngine/blob/main/docs/HYBRID-DEPLOYMENT.md">Deployment guide</a>
-          </nav>
-        </div>
-      </section>
-
       <section class="connection-panel" aria-label="Gateway connection settings">
         <div class="tier-summary">
           <span class="tier-mark">F</span>
@@ -114,6 +98,10 @@
               <span>Generate API Key</span>
             </button>
           </div>
+          <label class="field key-admin-field" id="keyAdminField" hidden>
+            <span>Gateway administrator provisioning token</span>
+            <input id="keyAdminToken" type="password" autocomplete="off" spellcheck="false" placeholder="Enter the gateway admin token">
+          </label>
           <p class="key-generator-policy">Only Free Tier is supported by this gateway configuration; these limits are enforced on every generated key.</p>
           <div class="generated-key-result" id="generatedKeyResult" hidden>
             <label class="field key-result-field">
@@ -123,7 +111,7 @@
             <button class="quiet-button" id="copyGeneratedKey" type="button">Copy key</button>
           </div>
           <p class="key-generator-status" id="keyGeneratorStatus" role="status" aria-live="polite">
-            Keys are generated locally and synced with the managed development gateway.
+            Keys are created and activated by the configured gateway backend.
           </p>
           <div class="generated-key-section">
             <div class="generated-key-heading">
@@ -290,6 +278,21 @@
           </article>
         </section>
       </main>
+      <section class="product-intro" aria-labelledby="productPurpose">
+        <div class="product-intro-heading">
+          <p class="eyebrow">RUST EXECUTION PLATFORM</p>
+          <h2 id="productPurpose">Run sandboxed tasks locally or through a managed API</h2>
+        </div>
+        <div class="product-intro-copy">
+          <p>OmniEngine combines a local-first language engine and SDKs with an HTTPS gateway for policy-bounded remote execution. The gateway currently supports OmniEngine, Lua 5.4, and self-contained WebAssembly Text modules; runtime discovery reports availability, limits, and sandbox capabilities.</p>
+          <p>Local execution stays on the caller's device or server. Managed requests process only the data sent to the API and apply authentication, CPU, memory, and usage limits.</p>
+          <nav class="product-links" aria-label="OmniEngine documentation">
+            <a href="https://github.com/vextalorglobal/OmniEngine">Source code and README</a>
+            <a href="https://github.com/vextalorglobal/OmniEngine/blob/main/docs/CLOUD-API.md">Cloud API reference</a>
+            <a href="https://github.com/vextalorglobal/OmniEngine/blob/main/docs/HYBRID-DEPLOYMENT.md">Deployment guide</a>
+          </nav>
+        </div>
+      </section>
       <footer class="page-footer">
         <span>Local dashboard bridge</span>
         <span class="footer-divider">/</span>

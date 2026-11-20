@@ -11,16 +11,35 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev-up.ps1
 The bootstrap builds the gateway and its Rust-native certificate helper,
 generates fresh self-signed PEM files for `localhost` and `127.0.0.1`, writes
 `.dev\gateway.toml`, creates a persistent random local API key, then starts the
-dashboard bridge. The bridge supervises the TLS gateway and restarts it when
-generated keys are added or revoked. It opens the dashboard in the default
-browser at <http://127.0.0.1:3000>; close the one PowerShell session with
-Ctrl+C to stop both services. No OpenSSL, mkcert, npm install, or second
-terminal is required.
+dashboard bridge. The bridge supervises the TLS gateway, while the gateway
+itself handles generated-key creation and revocation without restarting.
+The bootstrap opens the dashboard at <http://127.0.0.1:3000>; close the one
+PowerShell session with Ctrl+C to stop both services. No OpenSSL, mkcert, npm
+install, or second terminal is required.
 
 The generated API key is stored in `.dev\api-key.txt`, restricted to the
 current Windows user, and automatically supplied to the dashboard for the
-current browser session. `.dev/` is gitignored. These credentials and the
-self-signed certificate are for local development only.
+current browser session. A separate random administrator token is stored in
+`.dev\key-admin.txt` with the same ACL. `.dev/` is gitignored. These credentials
+and the self-signed certificate are for local development only.
+
+For hidden/background startup (no persistent terminal window):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev-up-background.ps1
+```
+
+Stop it with:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev-down-background.ps1
+```
+
+The background helper logs to `.dev\bootstrap.stdout.log` and
+`.dev\bootstrap.stderr.log`. Its hidden supervisor restarts the gateway and
+dashboard after unexpected startup/runtime exits, with a bounded backoff.
+`dev-down-background.ps1` requests a graceful stop without terminating an
+unrelated process.
 
 The Studio's **Gateway mode** selector switches between
 `https://127.0.0.1:8443` and a custom/cloud URL. The selected URL is kept in
@@ -63,16 +82,24 @@ imports, network, and host APIs. The gateway deliberately never launches
 
 ## Generate and manage local keys
 
-Open the collapsed **API Key Generator** panel in the dashboard. Add a label
-and generate a Free Tier key (100,000 requests/month, 50ms CPU, 128MB memory,
-10 concurrent requests). The bridge uses Node's cryptographic random generator,
-updates the protected local key file, and restarts the managed gateway so the
-new key works immediately. Use **Copy** or **Use in Studio** to activate it;
-revoke individual keys or all generated keys from the current browser session.
-The browser keeps the session list in `sessionStorage`; the bridge keeps active
-key material in the protected, gitignored `.dev\api-key.txt` so it survives
-gateway restarts. It is local-only and must not be committed. This gateway
-currently assigns the Free Tier policy to all keys.
+Open **API Key Generator**, add a label, and generate a Free Tier key
+(100,000 requests/month, 50ms CPU, 128MB memory, 10 concurrent requests). The
+bridge forwards the request to the gateway's authenticated `POST /v1/keys`
+endpoint. The gateway generates the token, activates it immediately, and
+persists only its SHA-256 digest in the gateway state registry. The raw token
+is returned once, put in the Studio's API key field, and listed in browser
+`sessionStorage`; use **Copy** to save it securely. It cannot be recovered
+from the gateway after that response. Generated keys survive a gateway
+restart because the digest registry is persisted under `.dev\`.
+
+The gateway API key and key-administration token are separate. The local
+bootstrap supplies the administrator token only to loopback requests; cloud
+dashboards require an operator to enter the provisioning token in the panel.
+The cloud token is used only in request memory and is not saved in browser
+storage. The gateway currently assigns the configured Free Tier policy to all
+generated keys and allows at most 25 managed keys. Revoke a generated key
+from its session row or revoke all session-listed keys; revocation is handled
+by `POST /v1/keys/revoke` at the gateway.
 
 ## Verify the gateway and execute a task
 
@@ -117,3 +144,13 @@ If port `8443` or `3000` is already occupied, the bootstrap reports which port
 to free and leaves the existing process untouched. Startup logs are written
 under `.dev\`. To start without opening a browser, add `-NoBrowser` to the
 PowerShell command.
+
+## Hosted key management
+
+For cloud deployments, configure both `OMNI_KEY_ADMIN_ENABLED=1` on the
+dashboard bridge and a separate `OMNI_KEY_ADMIN_TOKEN` on the gateway. Keep the
+admin token in the hosting provider's secret store, never in the UI build,
+query string, or checked-in configuration. The Studio asks for this token
+before enabling key issuance; normal execution still uses the generated
+tenant API key. See the [Cloud API key lifecycle](../docs/CLOUD-API.md#managed-api-key-lifecycle)
+and [deployment guide](../docs/DEPLOYMENT.md#render-and-custom-hosted-domains).

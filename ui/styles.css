@@ -120,7 +120,7 @@ textarea:focus-visible {
   grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
   align-items: center;
   gap: 25px;
-  margin-bottom: 19px;
+  margin-top: 24px;
   padding: 17px 20px;
   border: 1px solid var(--line);
   background: var(--card);
@@ -355,6 +355,24 @@ textarea:focus-visible {
   min-height: 36px;
   padding: 0 15px;
   white-space: nowrap;
+}
+
+.key-admin-field {
+  max-width: 460px;
+  margin-top: 12px;
+}
+
+.key-admin-field input {
+  width: 100%;
+  min-width: 0;
+  height: 36px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 0;
+  background: var(--canvas);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 11px;
 }
 
 .key-generate-button:disabled,
@@ -932,6 +950,7 @@ kbd {
 
 .metric-card-wide .metric-caption {
   display: inline-block;
+  max-width: 100%;
 }
 
 .gateway-health-indicator {

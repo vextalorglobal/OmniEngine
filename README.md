@@ -61,11 +61,19 @@ random local API key, then starts the gateway and dashboard bridge. It opens
 the Studio in your browser at <http://localhost:3000>. Press `Ctrl+C` in that
 PowerShell session to stop both services.
 
+To start without keeping a foreground terminal open, use
+`.\scripts\dev-up-background.ps1`; stop it with
+`.\scripts\dev-down-background.ps1`. The hidden supervisor retries unexpected
+gateway or dashboard exits and records diagnostics under `.dev\`.
+
 The local gateway listens on `https://127.0.0.1:8443`. The development bridge
 proxies requests from the browser, so the browser does not need to handle the
 self-signed gateway certificate directly. The bootstrap wires the local API
-key into the dashboard session. You can also generate a key in the Studio's
-**API Key Generator** panel and select **Use in Studio**.
+key into the dashboard session. The Studio's **API Key Generator** requests
+new keys from the gateway backend, which persists only a digest and activates
+the new key immediately in the API-key field. Local development supplies its
+administrator token only to loopback requests; hosted key issuance requires a
+separate operator-provided administrator token.
 
 All local certificates, keys, quota state, and logs live under `.dev\`. That
 directory is gitignored and must remain local; do not commit its contents.
@@ -92,8 +100,9 @@ Invoke-RestMethod http://127.0.0.1:3000/api/execute `
   -Body '{"source":"40 + 2"}'
 ```
 
-The API key is returned only by the loopback development bridge and should not
-be copied into logs, source control, or shared terminals.
+The default development key is exposed only by the loopback bridge. A newly
+created key is returned once to the authenticated key administrator; store it
+securely and do not copy it into logs, source control, or shared terminals.
 
 ## Gateway API
 
@@ -104,6 +113,8 @@ The main routes are:
 | `POST` | `/v1/execute` | Bearer token | Execute source under gateway policy |
 | `GET` | `/v1/health` | None | Aggregate gateway health and metrics |
 | `GET` | `/v1/languages` | None | Runtime availability, capabilities, and limits |
+| `POST` | `/v1/keys` | Admin bearer token | Create a managed Free Tier API key |
+| `POST` | `/v1/keys/revoke` | Admin bearer token | Revoke managed API keys |
 
 Example request:
 

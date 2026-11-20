@@ -20,9 +20,13 @@ sets a local `OMNI_API_KEYS` value, starts the gateway at
 certificate; browsers only connect to the HTTP localhost dashboard. Stop both
 processes with `Ctrl+C` in the bootstrap PowerShell window.
 
-The generated key, certificate/private key, gateway state, and logs stay under
-`.dev\`; `.dev/` is gitignored. Never commit or share those files. Check the
-gateway from another PowerShell window:
+The generated execution key, separate administrator token, certificate/private
+key, managed-key digest registry, gateway state, and logs stay under `.dev\`;
+`.dev/` is gitignored. Never commit or share those files. For terminal-free
+background operation, run `.\scripts\dev-up-background.ps1` and stop it with
+`.\scripts\dev-down-background.ps1`. The hidden supervisor restarts failed
+gateway/dashboard processes with bounded backoff. Check the gateway from
+another PowerShell window:
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:3000/api/health
@@ -53,15 +57,16 @@ to the dashboard.
 3. Allow inbound TCP ports `80` and `443` (and optionally UDP `443` for HTTP/3)
    in the VPS firewall and cloud security group. Do **not** publish the
    gateway's internal port `8443` to the public internet.
-4. Create an API key in a secret manager or generate a cryptographically
-   random value. Use the `tenant:key` format; multiple entries are comma
-   separated. Do not put production keys in a checked-in file.
+4. Create an execution key and a distinct administrator token in a secret
+   manager. Use the execution-key `tenant:key` format; multiple entries are
+   comma separated. Do not put production keys in a checked-in file.
 
 For a temporary shell-based setup:
 
 ```sh
 export OMNI_DOMAIN=api.example.com
 export OMNI_API_KEYS="production:$(openssl rand -hex 32)"
+export OMNI_KEY_ADMIN_TOKEN="$(openssl rand -hex 32)"
 docker compose up --build -d
 ```
 
@@ -74,12 +79,19 @@ $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
 try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
 $token = [BitConverter]::ToString($bytes).Replace('-', '').ToLowerInvariant()
 $env:OMNI_API_KEYS = "production:$token"
+$adminBytes = New-Object 'System.Byte[]' 32
+$rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+try { $rng.GetBytes($adminBytes) } finally { $rng.Dispose() }
+$adminToken = [BitConverter]::ToString($adminBytes).Replace('-', '').ToLowerInvariant()
+$env:OMNI_KEY_ADMIN_TOKEN = $adminToken
 docker compose up --build -d
 ```
 
 Prefer your platform's secret injection for long-running services. The Compose
-file requires `OMNI_API_KEYS` and `OMNI_DOMAIN` and fails rather than starting
-with missing credentials. After startup, test the proxy and API:
+file requires `OMNI_API_KEYS`, `OMNI_KEY_ADMIN_TOKEN`, and `OMNI_DOMAIN` and
+fails rather than starting with missing credentials. The dashboard enables its
+key panel, but only an operator who supplies the administrator token can
+create keys. After startup, test the proxy and API:
 
 ```sh
 curl --fail https://api.example.com/v1/health
@@ -96,6 +108,39 @@ docker compose logs --tail=100 gateway dashboard caddy
 The sample key extraction command is only for a single `tenant:key` entry.
 Avoid putting bearer tokens on shared command lines or in shell history;
 production health and language discovery do not require a key.
+
+### Single-container and Render deployment
+
+The final Docker build target is `all-in-one`; it runs the gateway and UI
+bridge under a small process supervisor and exposes only the dashboard port.
+The gateway listens on loopback inside the container in plain mode, and the
+platform's HTTPS proxy terminates public TLS. The entrypoint requires both
+`OMNI_API_KEYS` and a distinct `OMNI_KEY_ADMIN_TOKEN`, enables the UI key
+panel, and restarts either child with bounded backoff if it exits. Container
+termination stops both processes. Persist
+`/var/lib/omni` to retain quota state and the managed-key digest registry:
+
+```sh
+docker build -t omniengine .
+docker run --rm -p 3000:3000 \
+  -e OMNI_API_KEYS='production:<secret>' \
+  -e OMNI_KEY_ADMIN_TOKEN='<separate-admin-secret>' \
+  -v omni-state:/var/lib/omni \
+  omniengine
+```
+
+Supply secrets using the platform's secret manager instead of literal shell
+arguments in production. For Render, deploy this Dockerfile as a Web Service,
+set both secret environment variables, and attach a persistent disk at
+`/var/lib/omni` if generated keys must survive container replacement. Render
+sets `PORT` and `RENDER_EXTERNAL_HOSTNAME`; the entrypoint binds the UI to the
+provided port and configures the public gateway/site origin. Runtime discovery,
+key creation/revocation, health checks, and sandboxed execution are all served
+by the same container process group without a foreground operator terminal.
+Render's Free service may use approximately 0.1 CPU and 512 MB RAM and can spin
+down after inactivity according to Render's platform policy; endpoints are
+available while the instance is running, but the platform controls cold starts
+and sleep behavior.
 
 ### TLS termination and network boundaries
 
@@ -177,6 +222,7 @@ Environment values override the corresponding gateway config at startup:
 | `OMNI_BIND_ADDR` | Listener address, such as `127.0.0.1:8443` or `0.0.0.0:8443` |
 | `OMNI_PORT` | Listener port; overrides the port component of `OMNI_BIND_ADDR` |
 | `OMNI_API_KEYS` | Comma-separated `tenant:key` credentials; API keys are never logged |
+| `OMNI_KEY_ADMIN_TOKEN` | Separate bearer credential required for `POST /v1/keys` and `POST /v1/keys/revoke` |
 | `OMNI_TLS_MODE` | `tls` (default) for direct TLS, or `plain` behind a trusted TLS proxy |
 | `OMNI_ALLOWED_ORIGINS` | Comma-separated exact browser origins, e.g. `https://studio.example.com` |
 | `OMNI_GATEWAY_CONFIG` | TOML config file path |
@@ -253,6 +299,9 @@ protects quota/rate updates among processes sharing a suitable local filesystem;
 active concurrency limits are process-local. For multiple replicas, use a
 shared locking-capable filesystem and an external concurrency coordinator if
 the concurrency ceiling must apply cluster-wide.
+Managed API-key registries are loaded into each gateway's memory at startup;
+keep one gateway replica when using key creation/revocation, because the
+current registry does not broadcast live changes across replicas.
 
 ## Configuration and operations
 
@@ -260,8 +309,8 @@ the concurrency ceiling must apply cluster-wide.
   locally by default and has placeholder TLS paths.
 - `policies/usage-tiers.toml` must remain aligned with the gateway config.
 - Rotate keys by updating the injected `OMNI_API_KEYS` and restarting/recreating
-  the gateway; never expose production key-generation or revocation controls to
-  unauthenticated public users.
+  the gateway; managed keys can be created/revoked with the separate admin
+  token. Never expose that token or key-management controls to untrusted users.
 - Back up the Compose `gateway-state` volume using the host's protected backup
   process. It contains usage metadata, not raw API keys.
 - Inspect startup and request errors with `docker compose logs`; local errors

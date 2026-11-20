@@ -1,10 +1,12 @@
 param(
-    [switch]$NoBrowser
+    [switch]$NoBrowser,
+    [switch]$ManagedBySupervisor
 )
 
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $devDir = Join-Path $root '.dev'
+$shutdownPath = Join-Path $devDir 'shutdown.request'
 $uiProcess = $null
 
 function Assert-PortAvailable {
@@ -114,11 +116,15 @@ try {
     Assert-PortAvailable -Port 3000 -Service 'the dashboard'
 
     New-Item -ItemType Directory -Path $devDir -Force | Out-Null
+    if (-not $ManagedBySupervisor) {
+        Remove-Item -LiteralPath $shutdownPath -Force -ErrorAction SilentlyContinue
+    }
     $templatePath = Join-Path $root 'config\cloud-api.example.toml'
     $configPath = Join-Path $devDir 'gateway.toml'
     $certificatePath = Join-Path $devDir 'cert.pem'
     $privateKeyPath = Join-Path $devDir 'key.pem'
     $apiKeyPath = Join-Path $devDir 'api-key.txt'
+    $adminTokenPath = Join-Path $devDir 'key-admin.txt'
     $statePath = Join-Path $devDir 'gateway-state.json'
 
     $gitignorePath = Join-Path $root '.gitignore'
@@ -149,6 +155,19 @@ try {
         }
     }
     Protect-LocalSecret -Path $apiKeyPath
+
+    $keyAdminToken = ''
+    if (Test-Path -LiteralPath $adminTokenPath) {
+        $keyAdminToken = [System.IO.File]::ReadAllText($adminTokenPath).Trim()
+    }
+    if ([string]::IsNullOrWhiteSpace($keyAdminToken)) {
+        $keyAdminToken = 'omni_admin_' + (New-LocalApiKey)
+        [System.IO.File]::WriteAllText($adminTokenPath, $keyAdminToken, [System.Text.Encoding]::ASCII)
+    }
+    if ($keyAdminToken -notmatch '^[\x21-\x7E]{32,512}$') {
+        throw 'The local key-administration token is invalid; expected 32-512 visible ASCII characters.'
+    }
+    Protect-LocalSecret -Path $adminTokenPath
 
     $configText = [System.IO.File]::ReadAllText($templatePath)
     $certificateTomlPath = $certificatePath.Replace('\', '/')
@@ -197,7 +216,11 @@ try {
     $env:OMNI_API_KEYS = $apiKeys
     $env:OMNI_GATEWAY_URL = 'https://127.0.0.1:8443'
     $env:OMNI_GATEWAY_INSECURE_TLS = '1'
-    $env:OMNI_DEV_API_KEY = $apiKeys.Substring($apiKeys.IndexOf(':') + 1)
+    $localApiKeyParts = (($apiKeys -split ',')[0] -split ':', 2)
+    $env:OMNI_DEV_API_KEY = $localApiKeyParts[1].Trim()
+    $env:OMNI_KEY_ADMIN_TOKEN = $keyAdminToken
+    $env:OMNI_DEV_KEY_ADMIN_TOKEN = $keyAdminToken
+    $env:OMNI_KEY_ADMIN_ENABLED = '1'
     $env:OMNI_DEV_MANAGED = '1'
     $env:OMNI_DEV_KEY_FILE = $apiKeyPath
     $env:OMNI_GATEWAY_BINARY = Join-Path $root 'target\debug\omni-gateway.exe'
@@ -256,7 +279,15 @@ try {
     }
     Write-Host 'Press Ctrl+C in this PowerShell window to stop both services.'
 
+    $shutdownRequested = $false
     while (-not $uiProcess.HasExited) {
+        if (Test-Path -LiteralPath $shutdownPath) {
+            if (-not $ManagedBySupervisor) {
+                Remove-Item -LiteralPath $shutdownPath -Force
+            }
+            $shutdownRequested = $true
+            break
+        }
         try {
             $bridgeConfig = Invoke-RestMethod `
                 -UseBasicParsing `
@@ -272,6 +303,10 @@ try {
             }
         }
         Start-Sleep -Seconds 1
+    }
+    if ($shutdownRequested) {
+        Write-Host 'Background development services stopped.'
+        return
     }
     throw "The dashboard server stopped unexpectedly.`n$(Get-LogTail $uiStderr)$(Get-LogTail $uiStdout)"
 }

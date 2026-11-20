@@ -158,6 +158,50 @@ authorization: Bearer <token>
 `GET /v1/health` and `GET /v1/languages` are unauthenticated aggregate and
 capability endpoints; neither returns tenant identifiers or credential data.
 
+## Managed API Key Lifecycle
+
+Key provisioning is a separate administrative operation from task execution.
+Set `OMNI_KEY_ADMIN_TOKEN` on the gateway to enable the endpoints; it must be
+a strong secret distinct from every `OMNI_API_KEYS` execution token. Requests
+must use the administrator bearer token over HTTPS:
+
+```text
+POST /v1/keys
+Authorization: Bearer <OMNI_KEY_ADMIN_TOKEN>
+Content-Type: application/json
+```
+
+```json
+{"label":"Build runner","tier":"free"}
+```
+
+The successful `201` response contains the new `api_key` once, together with
+its label, tier, and configured limits. Store that token securely: the gateway
+persists only its SHA-256 digest, so the raw value cannot be retrieved later.
+The current configuration supports the `free` tier and at most 25 managed
+keys. The gateway loads this registry at startup; run a single gateway replica
+for managed-key creation and revocation unless the deployment provides a
+shared registry with explicit cross-replica invalidation. Revocation uses:
+
+```text
+POST /v1/keys/revoke
+Authorization: Bearer <OMNI_KEY_ADMIN_TOKEN>
+Content-Type: application/json
+```
+
+```json
+{"api_keys":["omni_<issued-token>"]}
+```
+
+The dashboard bridge proxies these requests to the configured gateway; it
+does not generate keys itself. Local development uses a random administrator
+token in the gitignored `.dev` directory and only supplies it to loopback
+requests. Hosted dashboards request an operator-provided token in the key
+panel and send it in the request header; it is not persisted in browser
+storage. Configure `OMNI_KEY_ADMIN_ENABLED=1` on the dashboard bridge to show
+the hosted key-management controls. Do not expose the admin token to
+untrusted users.
+
 ## Rate Limiting
 
 The gateway applies both quota and concurrency controls:
