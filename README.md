@@ -34,16 +34,18 @@ The project supports two deployment models:
   Arithmetic, Gas limit, Memory load, and Unicode text presets; round-trip,
   sandbox-usage, quota, and health telemetry; execution history; and a
   structured result/error inspector.
-- **Languages and Unicode:** `omni` is the default runtime; embedded Lua 5.4 is
-  also available in the gateway. JavaScript, Python, and WebAssembly are listed
-  for discovery but are not currently executable by the gateway. Source,
-  comments, string literals, inputs, and outputs support UTF-8, including
-  Bengali and other scripts. Identifiers remain ASCII-only.
+- **Languages and Unicode:** `omni` is the default runtime; embedded Lua 5.4
+  and no-import WebAssembly Text (WAT) are also available in the gateway.
+  JavaScript and Python source execution are not enabled; their SDKs are client
+  bindings, not sandboxed interpreters. Source, comments, string literals,
+  inputs, and outputs support UTF-8, including Bengali and other scripts.
+  Identifiers remain ASCII-only.
 
 See [docs/HYBRID-DEPLOYMENT.md](docs/HYBRID-DEPLOYMENT.md) for deployment
 guidance, [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for local and Docker/Caddy
 setup, and [docs/CLOUD-API.md](docs/CLOUD-API.md) for the API contract, limits,
-and runtime availability.
+and runtime availability. The public Studio's crawlability and Google Search
+Console setup are described in [docs/SEO.md](docs/SEO.md).
 
 ## Quick start on Windows
 
@@ -128,6 +130,22 @@ Gateway configuration is read from `OMNI_GATEWAY_CONFIG` and
 through `OMNI_API_KEYS` as comma-separated `tenant:key` entries. The gateway
 binary has no command-line flags. `omni serve` is a separate command for
 starting a cluster worker, not the REST gateway.
+
+## Uses and architecture
+
+Use the local engine, CLI, or SDK when source and results should remain within
+your own process or server. Use the managed gateway when you need an HTTPS API
+boundary with bearer authentication, per-key usage policy, execution limits,
+and optional worker-quorum verification. The Studio demonstrates the same
+gateway contract in a browser; its runtime catalog is served by
+`GET /v1/languages`.
+
+The public [Execution Studio](https://omniengine.onrender.com/) is the
+product overview and interactive local/cloud gateway client. Search crawlers
+can discover its root page through
+[`robots.txt`](https://omniengine.onrender.com/robots.txt) and
+[`sitemap.xml`](https://omniengine.onrender.com/sitemap.xml). Search engines
+decide independently whether and when to index a page.
 
 ## Troubleshooting
 

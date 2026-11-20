@@ -212,6 +212,17 @@ default HTTPS gateway URL when no public URL is configured. If the gateway is
 on a separate private address, set `OMNI_GATEWAY_URL` to that upstream and
 keep `OMNI_PUBLIC_GATEWAY_URL` set to the browser-facing HTTPS URL.
 
+Set `OMNI_PUBLIC_SITE_URL` to the canonical public UI origin when the dashboard
+is served behind a custom domain or reverse proxy. The Docker Compose example
+sets it from `OMNI_DOMAIN`; otherwise the bridge derives the origin from
+Render's external hostname or the validated request host.
+
+The public Studio root includes canonical and social-card metadata. The bridge
+serves `/robots.txt`, `/sitemap.xml`, and the Google Search Console verification
+file. The crawler rules exclude `/api/` and `/v1/`; these are indexing hints,
+not replacements for gateway authentication or sandbox enforcement. See
+[`SEO.md`](SEO.md) for Search Console setup and local verification commands.
+
 The bridge still defaults to loopback hosts only outside hosted mode. Set
 `OMNI_ALLOWED_HOSTS=*` only when intentionally accepting every Host header;
 wildcard host access does not disable gateway bearer-token authentication.

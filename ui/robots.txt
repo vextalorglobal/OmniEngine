@@ -1,0 +1,5 @@
+User-agent: *
+Allow: /
+Disallow: /api/
+Disallow: /v1/
+Sitemap: __OMNI_SITE_ORIGIN__/sitemap.xml

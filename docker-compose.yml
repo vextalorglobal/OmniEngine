@@ -32,6 +32,7 @@ services:
       PORT: 3000
       OMNI_GATEWAY_URL: http://gateway:8443
       OMNI_PUBLIC_GATEWAY_URL: https://${OMNI_DOMAIN:?Set OMNI_DOMAIN to your DNS name}
+      OMNI_PUBLIC_SITE_URL: https://${OMNI_DOMAIN:?Set OMNI_DOMAIN to your DNS name}
       OMNI_GATEWAY_ALLOW_HTTP: "1"
       OMNI_GATEWAY_PROXY_LOCK: "1"
       OMNI_ALLOWED_HOSTS: ${OMNI_DOMAIN:?Set OMNI_DOMAIN to your DNS name}
