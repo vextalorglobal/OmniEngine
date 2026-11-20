@@ -68,6 +68,8 @@ pub struct GatewayConfig {
     pub bind: String,
     pub tls_cert: PathBuf,
     pub tls_key: PathBuf,
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
     pub execute_endpoint: String,
     pub health_endpoint: String,
     pub rate_limit: RateLimitConfig,
@@ -167,7 +169,8 @@ impl GatewaySettings {
             .map_err(|e| format!("cannot read {}: {e}", policy_path.display()))?;
         let config_text = std::fs::read_to_string(config_path)
             .map_err(|e| format!("cannot read {}: {e}", config_path.display()))?;
-        Self::parse(&policy_text, &config_text)
+        let settings = Self::parse(&policy_text, &config_text)?;
+        settings.with_environment_overrides(&std::env::vars().collect())
     }
 
     pub fn parse(policy_text: &str, config_text: &str) -> Result<Self, String> {
@@ -176,13 +179,9 @@ impl GatewaySettings {
         let example: ExampleConfig =
             toml::from_str(config_text).map_err(|e| format!("invalid cloud config: {e}"))?;
         let config = example.gateway;
+        validate_allowed_origins(&config.allowed_origins)?;
         if policy.gateway.rest_execute_endpoint != config.execute_endpoint {
             return Err("REST execute endpoint differs between policy and config".to_string());
-        }
-        if policy.gateway.tls_required
-            && (config.tls_cert.as_os_str().is_empty() || config.tls_key.as_os_str().is_empty())
-        {
-            return Err("TLS is required but certificate or key path is empty".to_string());
         }
         let free = policy.tiers.free;
         if free.api_requests_per_month != config.rate_limit.free_requests_per_month
@@ -220,6 +219,92 @@ impl GatewaySettings {
             },
         })
     }
+
+    fn with_environment_overrides(
+        mut self,
+        environment: &HashMap<String, String>,
+    ) -> Result<Self, String> {
+        if let Some(bind) = environment.get("OMNI_BIND_ADDR") {
+            if bind.trim().is_empty() {
+                return Err("OMNI_BIND_ADDR must not be empty".to_string());
+            }
+            self.config.bind = bind.trim().to_string();
+        }
+        if let Some(port) = environment.get("OMNI_PORT") {
+            let port = port
+                .parse::<u16>()
+                .ok()
+                .filter(|port| *port != 0)
+                .ok_or_else(|| "OMNI_PORT must be an integer between 1 and 65535".to_string())?;
+            let bind = self.config.bind.trim();
+            self.config.bind = if let Ok(mut address) = bind.parse::<std::net::SocketAddr>() {
+                address.set_port(port);
+                address.to_string()
+            } else if let Ok(address) = bind.parse::<std::net::IpAddr>() {
+                std::net::SocketAddr::new(address, port).to_string()
+            } else if let Some((host, existing_port)) = bind.rsplit_once(':') {
+                if !host.is_empty() && existing_port.parse::<u16>().is_ok() {
+                    format!("{host}:{port}")
+                } else {
+                    format!("{bind}:{port}")
+                }
+            } else {
+                format!("{bind}:{port}")
+            };
+        }
+        if let Some(origins) = environment.get("OMNI_ALLOWED_ORIGINS") {
+            self.config.allowed_origins = origins
+                .split(',')
+                .map(str::trim)
+                .filter(|origin| !origin.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
+        validate_allowed_origins(&self.config.allowed_origins)?;
+        if let Some(keys) = environment.get("OMNI_API_KEYS") {
+            if keys.trim().is_empty() {
+                return Err("OMNI_API_KEYS must not be empty when set".to_string());
+            }
+            self.auth.token_secret_source = "env:OMNI_API_KEYS".to_string();
+        }
+        if let Some(mode) = environment.get("OMNI_TLS_MODE") {
+            match mode.trim().to_ascii_lowercase().as_str() {
+                "tls" => self.tls_required = true,
+                "plain" => self.tls_required = false,
+                _ => return Err("OMNI_TLS_MODE must be either 'tls' or 'plain'".to_string()),
+            }
+        }
+        if self.tls_required
+            && (self.config.tls_cert.as_os_str().is_empty()
+                || self.config.tls_key.as_os_str().is_empty())
+        {
+            return Err("TLS mode requires nonempty certificate and private-key paths".to_string());
+        }
+        Ok(self)
+    }
+}
+
+fn validate_allowed_origins(origins: &[String]) -> Result<(), String> {
+    for origin in origins {
+        let Some((scheme, authority)) = origin.split_once("://") else {
+            return Err(format!(
+                "invalid allowed origin '{origin}': expected an http(s) origin"
+            ));
+        };
+        if !matches!(scheme, "http" | "https")
+            || authority.is_empty()
+            || !authority.chars().all(|character| {
+                character.is_ascii_alphanumeric()
+                    || matches!(character, '.' | '-' | ':' | '[' | ']')
+            })
+            || origin.trim() != origin
+        {
+            return Err(format!(
+                "invalid allowed origin '{origin}': expected an exact http(s) origin without path, credentials, or wildcard"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_cluster_config(config: &ClusterConfig) -> Result<(), String> {
@@ -1166,29 +1251,27 @@ impl Gateway {
         })
     }
 
-    /// Serve TLS-protected HTTP/1.1 connections. TLS termination is mandatory
-    /// when the loaded policy declares `tls_required`.
+    /// Serve HTTP/1.1 directly with TLS, or plain HTTP behind a trusted TLS
+    /// reverse proxy when OMNI_TLS_MODE=plain is explicitly configured.
     pub fn serve(self: Arc<Self>) -> io::Result<()> {
-        if !self.settings.tls_required {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "gateway requires TLS",
-            ));
-        }
-        let tls = Arc::new(
-            load_tls_config(
-                &self.settings.config.tls_cert,
-                &self.settings.config.tls_key,
-            )
-            .map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!(
-                        "{error}. For local development, run .\\scripts\\dev-up.ps1 to generate valid PEM certificate and key files."
-                    ),
+        let tls = if self.settings.tls_required {
+            Some(Arc::new(
+                load_tls_config(
+                    &self.settings.config.tls_cert,
+                    &self.settings.config.tls_key,
                 )
-            })?,
-        );
+                .map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!(
+                            "{error}. For local development, run .\\scripts\\dev-up.ps1 to generate valid PEM certificate and key files."
+                        ),
+                    )
+                })?,
+            ))
+        } else {
+            None
+        };
         let listener = TcpListener::bind(&self.settings.config.bind).map_err(|error| {
             let action = if error.kind() == io::ErrorKind::AddrInUse {
                 "the port is already in use; stop the existing listener or free this address"
@@ -1203,7 +1286,19 @@ impl Gateway {
                 ),
             )
         })?;
-        serve_tls_listener(listener, tls, self, None)
+        if let Some(tls) = tls {
+            eprintln!(
+                "omni-gateway: serving HTTPS on {}",
+                self.settings.config.bind
+            );
+            serve_tls_listener(listener, tls, self, None)
+        } else {
+            eprintln!(
+                "omni-gateway: serving plain HTTP on {} (use only behind a trusted TLS reverse proxy)",
+                self.settings.config.bind
+            );
+            serve_plain_listener(listener, self, None)
+        }
     }
 }
 
@@ -1650,7 +1745,23 @@ fn serve_tls_connection(
     let connection = rustls::ServerConnection::new(tls)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let mut stream = rustls::StreamOwned::new(connection, stream);
-    let mut reader = BufReader::new(&mut stream);
+    serve_http_connection(&mut stream, gateway)?;
+    stream.conn.send_close_notify();
+    stream.flush()
+}
+
+fn serve_plain_connection(stream: TcpStream, gateway: Arc<Gateway>) -> io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let mut stream = stream;
+    serve_http_connection(&mut stream, gateway)
+}
+
+fn serve_http_connection(
+    stream: &mut (impl Read + Write),
+    gateway: Arc<Gateway>,
+) -> io::Result<()> {
+    let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
     let mut parts = request_line.split_whitespace();
@@ -1702,6 +1813,46 @@ fn serve_tls_connection(
             ),
         );
     }
+    let origin = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("origin"))
+        .map(|(_, value)| value.as_str());
+    let cors_origin = match origin {
+        Some(origin)
+            if gateway
+                .settings
+                .config
+                .allowed_origins
+                .iter()
+                .any(|allowed| allowed == origin) =>
+        {
+            Some(origin)
+        }
+        Some(_) => {
+            return write_http_response(
+                reader.get_mut(),
+                HttpResponse::error(403, "origin_not_allowed", "origin is not allowed", None),
+            );
+        }
+        None => None,
+    };
+    if method.eq_ignore_ascii_case("OPTIONS") {
+        let response = if cors_origin.is_some() {
+            HttpResponse {
+                status: 204,
+                body: String::new(),
+                retry_after_seconds: None,
+            }
+        } else {
+            HttpResponse::error(
+                405,
+                "method_not_allowed",
+                "OPTIONS requires an allowed Origin",
+                None,
+            )
+        };
+        return write_http_response_with_cors(reader.get_mut(), response, cors_origin, true);
+    }
     let content_length_header = headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
@@ -1710,9 +1861,11 @@ fn serve_tls_connection(
         Some(value) => match value.parse::<usize>() {
             Ok(length) => length,
             Err(_) => {
-                return write_http_response(
+                return write_http_response_with_cors(
                     reader.get_mut(),
                     HttpResponse::error(400, "bad_request", "invalid Content-Length", None),
+                    cors_origin,
+                    false,
                 );
             }
         },
@@ -1720,7 +1873,7 @@ fn serve_tls_connection(
     };
     let max_body = gateway.settings.config.resource_limits.max_source_bytes + MAX_BODY_OVERHEAD;
     if content_length > max_body {
-        return write_http_response(
+        return write_http_response_with_cors(
             reader.get_mut(),
             HttpResponse::error(
                 413,
@@ -1728,14 +1881,14 @@ fn serve_tls_connection(
                 "request body exceeds configured limit",
                 None,
             ),
+            cors_origin,
+            false,
         );
     }
     let mut body = vec![0; content_length];
     reader.read_exact(&mut body)?;
     let response = gateway.handle(method, path, &headers, &body);
-    write_http_response(reader.get_mut(), response)?;
-    reader.get_mut().conn.send_close_notify();
-    reader.get_mut().flush()
+    write_http_response_with_cors(reader.get_mut(), response, cors_origin, false)
 }
 
 fn serve_tls_listener(
@@ -1776,11 +1929,59 @@ fn serve_tls_listener(
     }
 }
 
+fn serve_plain_listener(
+    listener: TcpListener,
+    gateway: Arc<Gateway>,
+    stop: Option<Arc<AtomicBool>>,
+) -> io::Result<()> {
+    if stop.is_some() {
+        listener.set_nonblocking(true)?;
+    }
+    loop {
+        if stop
+            .as_ref()
+            .is_some_and(|stop| stop.load(Ordering::Acquire))
+        {
+            return Ok(());
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false)?;
+                let gateway = Arc::clone(&gateway);
+                std::thread::Builder::new()
+                    .name("omni-gateway-connection".to_string())
+                    .spawn(move || {
+                        if let Err(error) = serve_plain_connection(stream, gateway) {
+                            eprintln!("omni-gateway connection failed: {error}");
+                        }
+                    })?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock && stop.is_some() => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn write_http_response(stream: &mut impl Write, response: HttpResponse) -> io::Result<()> {
+    write_http_response_with_cors(stream, response, None, false)
+}
+
+fn write_http_response_with_cors(
+    stream: &mut impl Write,
+    response: HttpResponse,
+    origin: Option<&str>,
+    preflight: bool,
+) -> io::Result<()> {
     let reason = match response.status {
         200 => "OK",
+        204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
+        409 => "Conflict",
         422 => "Unprocessable Content",
         404 => "Not Found",
         405 => "Method Not Allowed",
@@ -1801,6 +2002,18 @@ fn write_http_response(stream: &mut impl Write, response: HttpResponse) -> io::R
     )?;
     if let Some(retry) = response.retry_after_seconds {
         write!(stream, "Retry-After: {retry}\r\n")?;
+    }
+    if let Some(origin) = origin {
+        write!(
+            stream,
+            "Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\n"
+        )?;
+        if preflight {
+            write!(
+                stream,
+                "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Authorization, Content-Type\r\nAccess-Control-Max-Age: 600\r\n"
+            )?;
+        }
     }
     write!(stream, "\r\n{}", response.body)?;
     stream.flush()
@@ -2474,6 +2687,127 @@ mod tests {
         assert_eq!(settings.free_tier.sandbox_memory_mib, 128);
         assert_eq!(settings.free_tier.max_concurrent_requests, 10);
         assert_eq!(settings.config.execute_endpoint, "/v1/execute");
+        assert_eq!(settings.config.bind, "127.0.0.1:8443");
+        assert!(settings.tls_required);
+    }
+
+    #[test]
+    fn deployment_environment_overrides_preserve_sandbox_policy() {
+        let environment = HashMap::from([
+            ("OMNI_BIND_ADDR".to_string(), "0.0.0.0".to_string()),
+            ("OMNI_PORT".to_string(), "9443".to_string()),
+            (
+                "OMNI_API_KEYS".to_string(),
+                "tenant:opaque-secret-value-not-logged".to_string(),
+            ),
+            ("OMNI_TLS_MODE".to_string(), "plain".to_string()),
+            (
+                "OMNI_ALLOWED_ORIGINS".to_string(),
+                "https://studio.example.com, https://console.example.com".to_string(),
+            ),
+        ]);
+        let overridden = settings().with_environment_overrides(&environment).unwrap();
+
+        assert_eq!(overridden.config.bind, "0.0.0.0:9443");
+        assert!(!overridden.tls_required);
+        assert_eq!(overridden.auth.token_secret_source, "env:OMNI_API_KEYS");
+        assert_eq!(
+            overridden.config.allowed_origins,
+            ["https://studio.example.com", "https://console.example.com"]
+        );
+        assert!(!overridden.config.sandbox.filesystem_reads);
+        assert!(!overridden.config.sandbox.filesystem_writes);
+        assert!(!overridden.config.sandbox.module_imports);
+        assert!(!overridden.config.sandbox.host_functions);
+        assert!(!overridden.config.sandbox.network_access);
+        assert!(overridden.config.sandbox.deterministic_verification);
+    }
+
+    #[test]
+    fn deployment_environment_overrides_reject_invalid_values() {
+        let invalid_mode = HashMap::from([("OMNI_TLS_MODE".to_string(), "disabled".to_string())]);
+        assert!(
+            settings()
+                .with_environment_overrides(&invalid_mode)
+                .unwrap_err()
+                .contains("OMNI_TLS_MODE")
+        );
+
+        for origin in [
+            "https://studio.example.com/path",
+            "https://studio.example.com\r\nX-Injected: yes",
+            "https://*.example.com",
+        ] {
+            let invalid_origin =
+                HashMap::from([("OMNI_ALLOWED_ORIGINS".to_string(), origin.to_string())]);
+            assert!(
+                settings()
+                    .with_environment_overrides(&invalid_origin)
+                    .unwrap_err()
+                    .contains("invalid allowed origin")
+            );
+        }
+    }
+
+    #[test]
+    fn plain_http_listener_serves_health_and_enforces_cors_origins() {
+        let directory = TestDirectory::new();
+        let mut settings = settings();
+        settings
+            .config
+            .allowed_origins
+            .push("https://studio.example.com".to_string());
+        let tier = settings.free_tier.clone();
+        let gateway = Arc::new(
+            Gateway::new_with_state_path(
+                settings,
+                vec![ApiKey::new(TOKEN, "plain-http-test", tier).unwrap()],
+                directory.state_path(),
+            )
+            .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let server =
+            std::thread::spawn(move || serve_plain_listener(listener, gateway, Some(server_stop)));
+
+        let request = |raw: &str| {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream.write_all(raw.as_bytes()).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        };
+        let health = request(
+            "GET /v1/health HTTP/1.1\r\nHost: localhost\r\nOrigin: https://studio.example.com\r\nConnection: close\r\n\r\n",
+        );
+        assert!(health.starts_with("HTTP/1.1 200 OK"));
+        assert!(health.contains("Access-Control-Allow-Origin: https://studio.example.com"));
+
+        let body = json!({"source":"40 + 2"}).to_string();
+        let execution = request(&format!(
+            "POST /v1/execute HTTP/1.1\r\nHost: localhost\r\nOrigin: https://studio.example.com\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ));
+        assert!(execution.starts_with("HTTP/1.1 200 OK"));
+        assert!(execution.contains("\"number\":42"));
+        assert!(execution.contains("Access-Control-Allow-Origin: https://studio.example.com"));
+
+        let preflight = request(
+            "OPTIONS /v1/execute HTTP/1.1\r\nHost: localhost\r\nOrigin: https://studio.example.com\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: authorization,content-type\r\nConnection: close\r\n\r\n",
+        );
+        assert!(preflight.starts_with("HTTP/1.1 204 No Content"));
+        assert!(preflight.contains("Access-Control-Allow-Methods: GET, POST, OPTIONS"));
+
+        let blocked = request(
+            "GET /v1/health HTTP/1.1\r\nHost: localhost\r\nOrigin: https://attacker.example\r\nConnection: close\r\n\r\n",
+        );
+        assert!(blocked.starts_with("HTTP/1.1 403 Forbidden"));
+
+        stop.store(true, Ordering::Release);
+        server.join().unwrap().unwrap();
     }
 
     #[test]

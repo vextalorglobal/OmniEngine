@@ -2,9 +2,13 @@
 # Secrets must come from the deployment secret store, never this example file.
 
 [gateway]
-bind = "0.0.0.0:8443"
+bind = "127.0.0.1:8443"
 tls_cert = "/run/secrets/tls/cert.pem"
 tls_key = "/run/secrets/tls/key.pem"
+# Override bind with OMNI_BIND_ADDR / OMNI_PORT for a container or VPS.
+# OMNI_TLS_MODE=tls (default) serves HTTPS directly; use plain only behind a
+# trusted TLS reverse proxy, and bind the plaintext listener to a private network.
+# Comma-separated exact browser origins can be supplied with OMNI_ALLOWED_ORIGINS.
 # Durable quota/rate state; override with OMNI_GATEWAY_STATE.
 # Default: OS user state directory; falls back to ./omni-gateway-state.json.
 # A sibling .lock file coordinates durable updates across gateway processes.

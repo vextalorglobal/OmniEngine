@@ -38,3 +38,6 @@ anim/
 %SystemDrive%/
 
 .dev/
+.env
+.env.*
+!.env.example

@@ -7,6 +7,8 @@ const languageSelector = byId('languageSelector');
 const editor = byId('sourceEditor');
 const lineNumbers = byId('lineNumbers');
 const runButton = byId('runButton');
+const LOCAL_GATEWAY_URL = 'https://127.0.0.1:8443';
+const gatewayUrlStorageKey = 'omni-gateway-url';
 const historyStorageKey = 'omni-execution-history';
 const generatedKeyStorageKey = 'omni-generated-api-keys';
 const languageStorageKey = 'omni-execution-language';
@@ -25,6 +27,7 @@ let generatedApiKeys = getGeneratedApiKeys();
 let runtimeLanguages = fallbackLanguages;
 let keyManagementEnabled = false;
 let gatewayReachable = false;
+let configuredGatewayUrl = LOCAL_GATEWAY_URL;
 let selectedHistoryId = null;
 let nextHistoryId = Date.now() * 1000;
 let activePreset = 'arithmetic';
@@ -122,6 +125,46 @@ function setSessionValue(key, value) {
     sessionStorage.setItem(key, value);
   } catch {
     byId('runNote').textContent = 'Session storage is unavailable; connection values will not persist.';
+  }
+}
+
+function getPersistentValue(key) {
+  try {
+    return localStorage.getItem(key) || '';
+  } catch {
+    return '';
+  }
+}
+
+function setPersistentValue(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    byId('runNote').textContent = 'Local storage is unavailable; the gateway URL will not persist.';
+  }
+}
+
+function updateGatewayMode() {
+  const url = selectedGatewayUrl();
+  byId('gatewayMode').value = url === LOCAL_GATEWAY_URL ? 'local' : 'custom';
+}
+
+function selectGatewayMode(mode) {
+  if (mode === 'local') {
+    gatewayUrlInput.value = LOCAL_GATEWAY_URL;
+  } else if (gatewayUrlInput.value === LOCAL_GATEWAY_URL) {
+    gatewayUrlInput.value = configuredGatewayUrl === LOCAL_GATEWAY_URL
+      ? ''
+      : configuredGatewayUrl;
+  }
+  setPersistentValue(gatewayUrlStorageKey, gatewayUrlInput.value);
+  updateGatewayMode();
+  if (gatewayUrlInput.value) {
+    checkGateway();
+    loadLanguages();
+  } else {
+    setConnectionState('offline', 'Gateway URL required');
+    gatewayUrlInput.focus();
   }
 }
 
@@ -421,7 +464,8 @@ async function useGeneratedApiKey(entry) {
   setSessionValue('omni-api-key', entry.api_key);
   if (entry.gateway_url) {
     gatewayUrlInput.value = entry.gateway_url;
-    setSessionValue('omni-gateway-url', entry.gateway_url);
+    setPersistentValue(gatewayUrlStorageKey, entry.gateway_url);
+    updateGatewayMode();
   }
   setKeyGeneratorStatus('Checking the selected key with the local gateway…');
   const online = await checkGateway();
@@ -937,12 +981,13 @@ function setupTheme() {
 async function initialize() {
   setupTheme();
   apiKeyInput.value = getSessionValue('omni-api-key');
-  gatewayUrlInput.value = getSessionValue('omni-gateway-url');
+  gatewayUrlInput.value = getPersistentValue(gatewayUrlStorageKey);
   try {
     const response = await fetch('/api/config', { cache: 'no-store' });
     const config = await response.json();
+    configuredGatewayUrl = config.gateway_url || LOCAL_GATEWAY_URL;
     if (!gatewayUrlInput.value) {
-      gatewayUrlInput.value = config.gateway_url || 'https://127.0.0.1:8443';
+      gatewayUrlInput.value = configuredGatewayUrl;
     }
     if (!apiKeyInput.value && config.api_key) {
       apiKeyInput.value = config.api_key;
@@ -957,10 +1002,11 @@ async function initialize() {
     }
   } catch {
     if (!gatewayUrlInput.value) {
-      gatewayUrlInput.value = 'https://127.0.0.1:8443';
+      gatewayUrlInput.value = LOCAL_GATEWAY_URL;
     }
     setKeyManagementEnabled(false);
   }
+  updateGatewayMode();
 
   await loadLanguages();
   renderGeneratedApiKeys();
@@ -974,9 +1020,13 @@ async function initialize() {
     lineNumbers.scrollTop = editor.scrollTop;
   });
   byId('gatewayUrl').addEventListener('change', () => {
-    setSessionValue('omni-gateway-url', selectedGatewayUrl());
+    setPersistentValue(gatewayUrlStorageKey, selectedGatewayUrl());
+    updateGatewayMode();
     checkGateway();
     loadLanguages();
+  });
+  byId('gatewayMode').addEventListener('change', (event) => {
+    selectGatewayMode(event.target.value);
   });
   languageSelector.addEventListener('change', () => {
     setSessionValue(languageStorageKey, selectedLanguage());

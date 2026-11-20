@@ -35,6 +35,13 @@ For managed cloud execution:
 
 ## Execution and Routing
 
+The local developer bootstrap runs the UI at `http://localhost:3000` and a
+direct-TLS gateway at `https://127.0.0.1:8443`. A cloud deployment may instead
+terminate public TLS at Caddy/Nginx and use plain HTTP only across a private
+proxy-to-gateway network. The gateway's sandbox and request policy is identical
+in both transport modes. See [DEPLOYMENT.md](DEPLOYMENT.md) for the concrete
+Docker, reverse-proxy, environment, and firewall configuration.
+
 ```text
 Local SDK/host
   +-- Rust engine / C FFI / Python / Node

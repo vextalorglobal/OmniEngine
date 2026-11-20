@@ -1,0 +1,8 @@
+{$OMNI_DOMAIN} {
+	encode zstd gzip
+
+	@gateway path /v1/*
+	reverse_proxy @gateway gateway:8443
+
+	reverse_proxy dashboard:3000
+}

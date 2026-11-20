@@ -22,6 +22,14 @@ current Windows user, and automatically supplied to the dashboard for the
 current browser session. `.dev/` is gitignored. These credentials and the
 self-signed certificate are for local development only.
 
+The Studio's **Gateway mode** selector switches between
+`https://127.0.0.1:8443` and a custom/cloud URL. The selected URL is kept in
+browser `localStorage`; API keys remain in `sessionStorage`. In hosted
+deployments, set `OMNI_PUBLIC_GATEWAY_URL` to the public HTTPS origin and
+`OMNI_GATEWAY_URL` to the dashboard bridge's private gateway upstream. The
+bridge maps the public origin to that upstream and, when
+`OMNI_GATEWAY_PROXY_LOCK=1`, refuses unconfigured proxy targets.
+
 ## Unicode source
 
 Source files, comments, string literals, JSON inputs, and results use UTF-8;

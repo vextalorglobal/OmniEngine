@@ -1,0 +1,15 @@
+.git
+.dev
+target
+**/target
+%SystemDrive%
+.env
+.env.*
+!.env.example
+node_modules
+**/node_modules
+dist
+anim
+*.pem
+*.pfx
+*.key

@@ -103,6 +103,31 @@ message ExecuteRequest {
 REST and gRPC must produce the same status classes, value tags, sandbox
 diagnostics, and usage accounting.
 
+## Listener, TLS, and CORS
+
+The local configuration binds to `127.0.0.1:8443` and serves direct TLS using
+the configured certificate and private-key PEM paths. `omni-gateway` supports
+the following startup overrides:
+
+| Variable | Behavior |
+| --- | --- |
+| `OMNI_BIND_ADDR` | Bind address, e.g. `127.0.0.1:8443` or `0.0.0.0:8443` |
+| `OMNI_PORT` | Overrides the configured/bind-address port |
+| `OMNI_TLS_MODE` | `tls` (default) or `plain` behind a trusted TLS-terminating proxy |
+| `OMNI_ALLOWED_ORIGINS` | Comma-separated exact browser origins |
+| `OMNI_API_KEYS` | Comma-separated `tenant:key` values; overrides the configured key source |
+
+Use `OMNI_TLS_MODE=plain` only when the gateway is reachable exclusively on a
+trusted private network behind a proxy that terminates HTTPS. Do not expose a
+plain listener to the public internet. `/v1/health`, `/v1/languages`, and
+`/v1/execute` use the same routes in direct TLS and trusted-proxy modes.
+
+The gateway permits browser CORS only for exact configured origins, including
+preflight requests. Wildcard origins are rejected. An empty origin list
+disables cross-origin browser access without affecting same-origin requests
+or non-browser API clients. See [DEPLOYMENT.md](DEPLOYMENT.md) for Docker,
+Caddy, and Nginx setup.
+
 ## Authentication
 
 Execution routes require a bearer token or gRPC metadata key:
@@ -112,7 +137,8 @@ authorization: Bearer <token>
 ```
 
 - tokens are issued per tenant and capability scope;
-- credentials must be sent only over TLS;
+- credentials must be sent over TLS between client and trusted reverse proxy or
+  directly to the gateway;
 - keys must be rotatable and revocable;
 - authentication occurs before source parsing or worker dispatch;
 - failed authentication must not disclose tenant or quota existence; and

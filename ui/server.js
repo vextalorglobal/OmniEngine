@@ -7,11 +7,31 @@ const { spawn, execFileSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const HOST = '127.0.0.1';
+const HOST = process.env.OMNI_UI_BIND_ADDR || process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT || 3000);
 const MAX_REQUEST_BYTES = 80 * 1024;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
-const DEFAULT_GATEWAY_URL = 'https://127.0.0.1:8443';
+const LOCAL_GATEWAY_URL = 'https://127.0.0.1:8443';
+const DEFAULT_GATEWAY_URL = process.env.OMNI_PUBLIC_GATEWAY_URL
+  || process.env.OMNI_GATEWAY_URL
+  || LOCAL_GATEWAY_URL;
+const ALLOWED_HOSTS = new Set([
+  `localhost:${PORT}`,
+  `127.0.0.1:${PORT}`,
+  'localhost',
+  '127.0.0.1',
+  ...(process.env.OMNI_UI_ALLOWED_HOSTS || '')
+    .split(',')
+    .map((host) => host.trim().toLowerCase())
+    .filter(Boolean),
+]);
+const ALLOWED_ORIGINS = new Set([
+  ...(process.env.OMNI_UI_ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean),
+]);
+const GATEWAY_PROXY_LOCK = process.env.OMNI_GATEWAY_PROXY_LOCK === '1';
 const ROOT = __dirname;
 const REPO_ROOT = path.resolve(ROOT, '..');
 const DEV_DIR = path.join(REPO_ROOT, '.dev');
@@ -345,7 +365,7 @@ async function handleKeyGeneration(request, response) {
         tier_label: 'Free Tier',
         api_key: token,
         created_at: new Date().toISOString(),
-        gateway_url: process.env.OMNI_GATEWAY_URL || DEFAULT_GATEWAY_URL,
+        gateway_url: DEFAULT_GATEWAY_URL,
       },
     });
   } catch (error) {
@@ -436,16 +456,12 @@ function localHost(hostname) {
 
 function allowedHostHeader(hostHeader) {
   if (typeof hostHeader !== 'string') return false;
-  return new Set([
-    `localhost:${PORT}`,
-    `127.0.0.1:${PORT}`,
-    `localhost`,
-    `127.0.0.1`,
-  ]).has(hostHeader.toLowerCase());
+  return ALLOWED_HOSTS.has(hostHeader.toLowerCase());
 }
 
 function allowedOrigin(origin) {
   if (!origin) return true;
+  if (ALLOWED_ORIGINS.has(origin)) return true;
   try {
     const parsed = new URL(origin);
     return parsed.protocol === 'http:'
@@ -458,9 +474,31 @@ function allowedOrigin(origin) {
 
 function gatewayBase(request) {
   const requested = request.headers['x-omni-gateway-url'];
-  const raw = typeof requested === 'string' && requested.trim()
+  let raw = typeof requested === 'string' && requested.trim()
     ? requested.trim()
     : (process.env.OMNI_GATEWAY_URL || DEFAULT_GATEWAY_URL);
+  const internalGatewayUrl = process.env.OMNI_GATEWAY_URL;
+  const publicGatewayUrl = process.env.OMNI_PUBLIC_GATEWAY_URL;
+  if (GATEWAY_PROXY_LOCK) {
+    const allowedTargets = new Set(
+      [internalGatewayUrl, publicGatewayUrl].filter(Boolean).map((value) => {
+        const target = new URL(value);
+        return target.origin;
+      }),
+    );
+    let selectedOrigin;
+    try {
+      selectedOrigin = new URL(raw).origin;
+    } catch {
+      throw new Error('Gateway URL must be a valid HTTP(S) origin');
+    }
+    if (!allowedTargets.has(selectedOrigin)) {
+      throw new Error('Gateway URL is not in this dashboard bridge’s configured upstream allowlist');
+    }
+    if (publicGatewayUrl && selectedOrigin === new URL(publicGatewayUrl).origin) {
+      raw = internalGatewayUrl || publicGatewayUrl;
+    }
+  }
   const target = new URL(raw);
   if (!['http:', 'https:'].includes(target.protocol)
       || target.username
@@ -613,7 +651,7 @@ async function handle(request, response) {
 
   if (pathname === '/api/config' && request.method === 'GET') {
     sendJson(response, 200, {
-      gateway_url: process.env.OMNI_GATEWAY_URL || DEFAULT_GATEWAY_URL,
+      gateway_url: DEFAULT_GATEWAY_URL,
       api_key: process.env.OMNI_DEV_API_KEY || '',
       key_management_enabled: MANAGED_GATEWAY,
       managed_gateway_status: managedGatewayState,

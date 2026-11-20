@@ -472,6 +472,7 @@ textarea:focus-visible {
 }
 
 .field-inline input,
+.field-inline select,
 .field input,
 .field select {
   width: 100%;
@@ -485,9 +486,20 @@ textarea:focus-visible {
   font-size: 12px;
 }
 
-.field-inline input {
+.field-inline input,
+.field-inline select {
   height: 32px;
+}
+
+.field-inline input {
   font-family: var(--mono);
+  font-size: 11px;
+}
+
+.field-inline select {
+  min-width: 135px;
+  background: var(--canvas);
+  color: var(--ink);
   font-size: 11px;
 }
 
