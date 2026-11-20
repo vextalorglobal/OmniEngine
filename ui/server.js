@@ -2,8 +2,7 @@
 
 const http = require('node:http');
 const https = require('node:https');
-const crypto = require('node:crypto');
-const { spawn, execFileSync } = require('node:child_process');
+const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -81,7 +80,8 @@ const MANAGED_GATEWAY = process.env.OMNI_DEV_MANAGED === '1'
   && fs.existsSync(GATEWAY_BINARY)
   && fs.existsSync(GATEWAY_CONFIG)
   && fs.existsSync(DEV_KEY_FILE);
-const MAX_MANAGED_KEYS = 25;
+const KEY_MANAGEMENT_ENABLED = MANAGED_GATEWAY || process.env.OMNI_KEY_ADMIN_ENABLED === '1';
+const KEY_ADMIN_REQUIRED = KEY_MANAGEMENT_ENABLED && !MANAGED_GATEWAY;
 const STATIC_FILES = new Map([
   ['/', ['index.html', 'text/html; charset=utf-8']],
   ['/index.html', ['index.html', 'text/html; charset=utf-8']],
@@ -100,7 +100,6 @@ if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
 let managedGateway = null;
 let managedGatewayState = MANAGED_GATEWAY ? 'starting' : 'disabled';
 let managedGatewayError = '';
-let keyMutationQueue = Promise.resolve();
 
 function samePath(actual, expected) {
   return typeof actual === 'string'
@@ -175,41 +174,6 @@ function readManagedKeyEntries() {
     }
   }
   return entries;
-}
-
-function writeManagedKeyEntries(entries) {
-  const temporary = `${DEV_KEY_FILE}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
-  let descriptor;
-  try {
-    descriptor = fs.openSync(temporary, 'wx', 0o600);
-    if (process.platform === 'win32') {
-      const sid = process.env.OMNI_DEV_USER_SID;
-      if (!sid || !/^S-\d-(?:\d+-){1,14}\d+$/.test(sid)) {
-        throw new Error('Current Windows user SID is unavailable; refusing to write an unprotected API key file.');
-      }
-      execFileSync('icacls.exe', [
-        temporary,
-        '/inheritance:r',
-        '/grant:r',
-        `*${sid}:(F)`,
-      ], { stdio: 'ignore' });
-    }
-    fs.writeFileSync(descriptor, `${entries.join(',')}\n`, 'utf8');
-    fs.fsyncSync(descriptor);
-    fs.closeSync(descriptor);
-    descriptor = undefined;
-    fs.renameSync(temporary, DEV_KEY_FILE);
-  } catch (error) {
-    if (descriptor !== undefined) fs.closeSync(descriptor);
-    try {
-      fs.unlinkSync(temporary);
-    } catch (cleanupError) {
-      if (cleanupError.code !== 'ENOENT') {
-        console.error(`Could not remove temporary API key file: ${cleanupError.message}`);
-      }
-    }
-    throw new Error(`Could not safely update the local API key file: ${error.message}`);
-  }
 }
 
 function waitForChildExit(child, timeoutMs) {
@@ -368,154 +332,28 @@ async function startManagedGateway(entries) {
   }
 }
 
-function serializeKeyMutation(operation) {
-  const result = keyMutationQueue.then(operation);
-  keyMutationQueue = result.catch(() => {});
-  return result;
-}
-
-async function replaceManagedKeys(nextEntries) {
-  const previousEntries = readManagedKeyEntries();
-  writeManagedKeyEntries(nextEntries);
-  try {
-    await startManagedGateway(nextEntries);
-  } catch (error) {
-    writeManagedKeyEntries(previousEntries);
-    try {
-      await startManagedGateway(previousEntries);
-    } catch (rollbackError) {
-      throw new Error(`${error.message} Rollback could not restore the previous gateway keys: ${rollbackError.message}`);
-    }
-    throw error;
+async function handleKeyManagementProxy(request, response, route) {
+  if (!KEY_MANAGEMENT_ENABLED) {
+    sendJson(response, 503, {
+      error: {
+        code: 'key_manager_unavailable',
+        message: 'Key management is not enabled for this dashboard deployment.',
+      },
+    });
+    return;
   }
-}
-
-function parseJsonBody(request, response) {
   if (!String(request.headers['content-type'] || '').toLowerCase().startsWith('application/json')) {
     sendJson(response, 415, {
       error: { code: 'unsupported_media_type', message: 'Send application/json' },
     });
-    return null;
-  }
-  return readBody(request).then((body) => {
-    try {
-      return JSON.parse(body.toString('utf8'));
-    } catch {
-      throw Object.assign(new Error('Request body must be valid JSON'), {
-        status: 400,
-        code: 'invalid_json',
-      });
-    }
-  });
-}
-
-async function handleKeyGeneration(request, response) {
-  if (!MANAGED_GATEWAY) {
-    sendJson(response, 503, {
-      error: { code: 'key_manager_unavailable', message: 'Key generation requires the managed local gateway. Start with .\\scripts\\dev-up.ps1.' },
-    });
     return;
   }
-  let body;
   try {
-    body = await parseJsonBody(request, response);
-    if (body === null) return;
+    const body = await readBody(request);
+    proxyToGateway(request, response, route, body);
   } catch (error) {
     sendJson(response, error.status || 400, {
       error: { code: error.code || 'bad_request', message: error.message },
-    });
-    return;
-  }
-  if (!body || typeof body !== 'object' || Array.isArray(body)
-      || typeof body.label !== 'string'
-      || !body.label.trim()
-      || body.label.trim().length > 48
-      || /[\u0000-\u001f\u007f]/.test(body.label)
-      || body.tier !== 'free') {
-    sendJson(response, 400, {
-      error: { code: 'invalid_key_request', message: 'Provide a 1–48 character label and the supported free tier.' },
-    });
-    return;
-  }
-
-  try {
-    const token = `omni_local_${crypto.randomBytes(32).toString('hex')}`;
-    await serializeKeyMutation(async () => {
-      const entries = readManagedKeyEntries();
-      const generatedCount = entries.filter((entry) => entry.slice(entry.indexOf(':') + 1).startsWith('omni_local_')).length;
-      if (generatedCount >= MAX_MANAGED_KEYS) {
-        const error = new Error(`The local gateway already has ${MAX_MANAGED_KEYS} generated keys. Revoke one before creating another.`);
-        error.status = 429;
-        error.code = 'key_limit_reached';
-        throw error;
-      }
-      await replaceManagedKeys([...entries, `local:${token}`]);
-    });
-    sendJson(response, 201, {
-      key: {
-        label: body.label.trim(),
-        tier: 'free',
-        tier_label: 'Free Tier',
-        api_key: token,
-        created_at: new Date().toISOString(),
-        gateway_url: DEFAULT_GATEWAY_URL,
-      },
-    });
-  } catch (error) {
-    sendJson(response, error.status || 503, {
-      error: { code: error.code || 'key_sync_failed', message: error.message },
-    });
-  }
-}
-
-async function handleKeyRevocation(request, response) {
-  if (!MANAGED_GATEWAY) {
-    sendJson(response, 503, {
-      error: { code: 'key_manager_unavailable', message: 'Key revocation requires the managed local gateway. Start with .\\scripts\\dev-up.ps1.' },
-    });
-    return;
-  }
-  let body;
-  try {
-    body = await parseJsonBody(request, response);
-    if (body === null) return;
-  } catch (error) {
-    sendJson(response, error.status || 400, {
-      error: { code: error.code || 'bad_request', message: error.message },
-    });
-    return;
-  }
-  if (!body || typeof body !== 'object' || Array.isArray(body)
-      || !Array.isArray(body.api_keys)
-      || body.api_keys.length < 1
-      || body.api_keys.length > MAX_MANAGED_KEYS
-      || body.api_keys.some((key) => typeof key !== 'string' || !/^omni_local_[0-9a-f]{64}$/.test(key))) {
-    sendJson(response, 400, {
-      error: { code: 'invalid_revoke_request', message: 'api_keys must contain 1–25 generated local keys.' },
-    });
-    return;
-  }
-
-  try {
-    let revoked = [];
-    await serializeKeyMutation(async () => {
-      const entries = readManagedKeyEntries();
-      const requested = new Set(body.api_keys);
-      const remaining = entries.filter((entry) => {
-        const separator = entry.indexOf(':');
-        const token = entry.slice(separator + 1);
-        if (requested.has(token)) {
-          revoked.push(token);
-          return false;
-        }
-        return true;
-      });
-      if (revoked.length > 0) await replaceManagedKeys(remaining);
-    });
-    sendJson(response, 200, { revoked_api_keys: revoked });
-  } catch (error) {
-    sendJson(response, error.status || 503, {
-      error: { code: error.code || 'key_sync_failed', message: error.message },
     });
   }
 }
@@ -545,6 +383,14 @@ function sendJson(response, status, payload) {
 function localHost(hostname) {
   const value = hostname.toLowerCase().replace(/^\[|\]$/g, '');
   return value === 'localhost' || value === '127.0.0.1' || value === '::1';
+}
+
+function isLoopbackRequest(request) {
+  const address = String(request.socket.remoteAddress || '')
+    .toLowerCase()
+    .replace(/^::ffff:/, '')
+    .split('%')[0];
+  return address === '::1' || /^127(?:\.\d{1,3}){3}$/.test(address);
 }
 
 function allowedHostHeader(hostHeader) {
@@ -771,18 +617,52 @@ async function handle(request, response) {
     sendJson(response, 200, {
       gateway_url: DEFAULT_GATEWAY_URL,
       api_key: process.env.OMNI_DEV_API_KEY || '',
-      key_management_enabled: MANAGED_GATEWAY,
+      key_admin_token: MANAGED_GATEWAY && isLoopbackRequest(request)
+        ? process.env.OMNI_DEV_KEY_ADMIN_TOKEN || ''
+        : '',
+      key_management_enabled: KEY_MANAGEMENT_ENABLED,
+      key_admin_required: KEY_ADMIN_REQUIRED,
       managed_gateway_status: managedGatewayState,
       managed_gateway_error: managedGatewayError,
     });
     return;
   }
   if (pathname === '/api/keys/generate' && request.method === 'POST') {
-    await handleKeyGeneration(request, response);
+    await handleKeyManagementProxy(request, response, '/v1/keys');
     return;
   }
   if (pathname === '/api/keys/revoke' && request.method === 'POST') {
-    await handleKeyRevocation(request, response);
+    await handleKeyManagementProxy(request, response, '/v1/keys/revoke');
+    return;
+  }
+  if (pathname === '/v1/health' && request.method === 'GET') {
+    proxyToGateway(request, response, '/v1/health');
+    return;
+  }
+  if (pathname === '/v1/languages' && request.method === 'GET') {
+    proxyToGateway(request, response, '/v1/languages');
+    return;
+  }
+  if ((pathname === '/v1/keys' || pathname === '/v1/keys/revoke')
+      && request.method === 'POST') {
+    await handleKeyManagementProxy(request, response, pathname);
+    return;
+  }
+  if (pathname === '/v1/execute' && request.method === 'POST') {
+    if (!String(request.headers['content-type'] || '').toLowerCase().startsWith('application/json')) {
+      sendJson(response, 415, {
+        error: { code: 'unsupported_media_type', message: 'Send application/json' },
+      });
+      return;
+    }
+    try {
+      const body = await readBody(request);
+      proxyToGateway(request, response, '/v1/execute', body);
+    } catch (error) {
+      sendJson(response, error.status || 400, {
+        error: { code: error.code || 'bad_request', message: error.message },
+      });
+    }
     return;
   }
   if (pathname === '/api/health' && request.method === 'GET') {
@@ -838,7 +718,7 @@ async function handle(request, response) {
     return;
   }
 
-  if (pathname.startsWith('/api/')) {
+  if (pathname.startsWith('/api/') || pathname.startsWith('/v1/')) {
     sendJson(response, 404, { error: { code: 'not_found', message: 'API route not found' } });
     return;
   }
@@ -863,7 +743,9 @@ function serveStaticFile(request, response, pathname, asset) {
       return;
     }
     let body = contents;
-    if (pathname !== GOOGLE_VERIFICATION_PATH) {
+    const isTextAsset = asset[1].startsWith('text/')
+      || asset[1].startsWith('application/xml');
+    if (pathname !== GOOGLE_VERIFICATION_PATH && isTextAsset) {
       const siteOrigin = publicSiteOrigin(request);
       body = Buffer.from(contents.toString('utf8')
         .split(SITE_ORIGIN_TOKEN).join(siteOrigin)
@@ -891,14 +773,16 @@ server.listen(PORT, HOST, () => {
   console.log(`OmniEngine dashboard: http://localhost:${PORT}`);
   console.log(`Gateway target: ${process.env.OMNI_GATEWAY_URL || DEFAULT_GATEWAY_URL}`);
   if (MANAGED_GATEWAY) {
-    serializeKeyMutation(() => startManagedGateway(readManagedKeyEntries()))
+    startManagedGateway(readManagedKeyEntries())
       .catch((error) => {
         managedGatewayState = 'error';
         managedGatewayError = error.message;
         console.error(`Managed gateway startup failed: ${error.message}`);
       });
+  } else if (process.env.OMNI_KEY_ADMIN_ENABLED === '1') {
+    console.log('Gateway key management is enabled; requests require the configured administrator bearer token.');
   } else {
-    console.log('Local API key management is disabled; start with .\\scripts\\dev-up.ps1 to enable it.');
+    console.log('Gateway key management is disabled; set OMNI_KEY_ADMIN_ENABLED=1 and configure OMNI_KEY_ADMIN_TOKEN on the gateway to enable it.');
   }
 });
 

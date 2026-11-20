@@ -45,6 +45,8 @@ let history = loadExecutionHistory();
 let generatedApiKeys = getGeneratedApiKeys();
 let runtimeLanguages = fallbackLanguages;
 let keyManagementEnabled = false;
+let localKeyAdminToken = '';
+let keyAdminRequired = false;
 let gatewayReachable = false;
 let configuredGatewayUrl = LOCAL_GATEWAY_URL;
 let selectedHistoryId = null;
@@ -351,17 +353,48 @@ function setKeyGeneratorStatus(message, state) {
   else delete status.dataset.state;
 }
 
-function setKeyManagementEnabled(enabled) {
+function dashboardBridgeUnavailableMessage() {
+  const hostname = window.location.hostname.toLowerCase();
+  if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1') {
+    return 'The local dashboard bridge is not responding. Start or restart it with .\\scripts\\dev-up-background.ps1; inspect .dev\\bootstrap.stderr.log if it does not come online.';
+  }
+  return 'The dashboard service is not responding. Check its hosting status and logs; if it is waking from sleep, wait for it to become healthy before retrying.';
+}
+
+function requestFailureMessage(error, action) {
+  if (error && error.name === 'TypeError' && /fetch|network/i.test(error.message || '')) {
+    return `${action}: ${dashboardBridgeUnavailableMessage()}`;
+  }
+  return error && error.message ? error.message : `${action}: request failed.`;
+}
+
+function setKeyManagementEnabled(enabled, adminRequired = false) {
   keyManagementEnabled = enabled;
-  byId('generateKeyButton').disabled = !enabled;
+  keyAdminRequired = enabled && adminRequired;
   byId('keyLabel').disabled = !enabled;
   byId('keyTier').disabled = !enabled;
+  byId('keyAdminField').hidden = !keyAdminRequired;
+  byId('keyAdminToken').disabled = !keyAdminRequired;
+  updateKeyManagementButton();
   if (!enabled) {
     setKeyGeneratorStatus(
-      'Key generation and runtime sync require the managed local gateway. Start it with .\\scripts\\dev-up.ps1.',
+      'Key generation is disabled. Configure gateway key administration to enable it.',
       'error',
     );
+  } else if (keyAdminRequired) {
+    setKeyGeneratorStatus('Enter the gateway administrator provisioning token to create or revoke keys.');
   }
+}
+
+function updateKeyManagementButton() {
+  const canManageKeys = keyManagementEnabled
+    && (!keyAdminRequired
+      || (localKeyAdminToken || byId('keyAdminToken').value.trim()).length >= 32);
+  byId('generateKeyButton').disabled = !canManageKeys;
+  byId('clearGeneratedKeys').disabled = !canManageKeys || generatedApiKeys.length === 0;
+  document.querySelectorAll('.generated-key-actions button:last-child').forEach((button) => {
+    button.disabled = !canManageKeys;
+  });
 }
 
 function createKeyAction(label, action) {
@@ -403,14 +436,14 @@ async function copyGeneratedKey(apiKey, button) {
       button.textContent = label;
     }, 1400);
   } catch (error) {
-    setKeyGeneratorStatus(error.message, 'error');
+    setKeyGeneratorStatus(requestFailureMessage(error, 'Could not create the API key'), 'error');
   }
 }
 
 function renderGeneratedApiKeys() {
   const list = byId('generatedKeyList');
   list.replaceChildren();
-  byId('clearGeneratedKeys').disabled = !keyManagementEnabled || generatedApiKeys.length === 0;
+  updateKeyManagementButton();
   if (generatedApiKeys.length === 0) {
     const empty = document.createElement('p');
     empty.className = 'key-list-empty';
@@ -447,12 +480,18 @@ function renderGeneratedApiKeys() {
     item.append(details, actions);
     list.append(item);
   }
+  updateKeyManagementButton();
 }
 
 async function postKeyManagerRequest(route, body) {
+  const headers = { 'Content-Type': 'application/json' };
+  const adminToken = localKeyAdminToken || byId('keyAdminToken').value.trim();
+  if (adminToken) headers.Authorization = `Bearer ${adminToken}`;
+  const gatewayUrl = selectedGatewayUrl();
+  if (gatewayUrl) headers['X-Omni-Gateway-URL'] = gatewayUrl;
   const response = await fetch(route, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify(body),
     cache: 'no-store',
   });
@@ -473,10 +512,15 @@ async function generateApiKey() {
     byId('keyLabel').focus();
     return;
   }
+  if (keyAdminRequired && byId('keyAdminToken').value.trim().length < 32) {
+    setKeyGeneratorStatus('Enter the gateway administrator provisioning token.', 'error');
+    byId('keyAdminToken').focus();
+    return;
+  }
 
   const button = byId('generateKeyButton');
   button.disabled = true;
-  setKeyGeneratorStatus('Generating a secure key and syncing the local gateway…');
+  setKeyGeneratorStatus('Requesting a secure key from the gateway backend…');
   try {
     const payload = await postKeyManagerRequest('/api/keys/generate', {
       label,
@@ -487,17 +531,23 @@ async function generateApiKey() {
     const storedForSession = saveGeneratedApiKeys();
     byId('generatedKeyOutput').value = payload.key.api_key;
     byId('generatedKeyResult').hidden = false;
+    apiKeyInput.value = payload.key.api_key;
+    setSessionValue('omni-api-key', payload.key.api_key);
+    updateGatewayConnection(gatewayReachable);
     renderGeneratedApiKeys();
     setKeyGeneratorStatus(
       storedForSession
-        ? 'Key generated and accepted by the managed gateway.'
+        ? 'Key created and activated by the gateway; it is now in the API key field.'
         : 'Key is active in the gateway, but browser session storage is unavailable.',
       storedForSession ? 'success' : 'error',
     );
+    void checkGateway().then((online) => {
+      if (!online) setKeyGeneratorStatus('Key was created, but the selected gateway health check failed.', 'error');
+    });
   } catch (error) {
-    setKeyGeneratorStatus(error.message, 'error');
+    setKeyGeneratorStatus(requestFailureMessage(error, 'Could not revoke the API key'), 'error');
   } finally {
-    button.disabled = !keyManagementEnabled;
+    updateKeyManagementButton();
   }
 }
 
@@ -509,7 +559,7 @@ async function useGeneratedApiKey(entry) {
     setPersistentValue(gatewayUrlStorageKey, entry.gateway_url);
     updateGatewayMode();
   }
-  setKeyGeneratorStatus('Checking the selected key with the local gateway…');
+  setKeyGeneratorStatus('Checking the selected key with the gateway…');
   const online = await checkGateway();
   setKeyGeneratorStatus(
     online ? 'Key is active; the gateway health check succeeded.' : 'Key selected, but the gateway health check failed.',
@@ -534,7 +584,7 @@ async function revokeGeneratedApiKeys(apiKeys) {
       byId('generatedKeyResult').hidden = true;
     }
     renderGeneratedApiKeys();
-    setKeyGeneratorStatus(`Revoked ${payload.revoked_api_keys.length} key(s) from the local gateway.`, 'success');
+    setKeyGeneratorStatus(`Revoked ${payload.revoked_api_keys.length} key(s) from the gateway.`, 'success');
   } catch (error) {
     setKeyGeneratorStatus(error.message, 'error');
   }
@@ -662,10 +712,10 @@ async function checkGateway() {
       updateHealthMetrics(payload);
     }
     return online;
-  } catch {
+  } catch (error) {
     updateGatewayConnection(false);
     byId('quotaMetric').textContent = 'Unavailable';
-    byId('quotaCaption').textContent = 'Bridge could not read gateway health';
+    byId('quotaCaption').textContent = requestFailureMessage(error, 'Health check failed');
     return false;
   }
 }
@@ -922,12 +972,12 @@ async function runExecution() {
     });
     httpStatus = response.status;
     payload = await response.json();
-  } catch {
+  } catch (error) {
     updateGatewayConnection(false);
     payload = {
       error: {
         code: 'gateway_unavailable',
-        message: 'The local bridge could not reach the gateway. Check the URL and gateway status.',
+        message: requestFailureMessage(error, 'Execution could not be sent'),
       },
     };
   } finally {
@@ -1028,6 +1078,7 @@ async function initialize() {
     const response = await fetch('/api/config', { cache: 'no-store' });
     const config = await response.json();
     configuredGatewayUrl = config.gateway_url || LOCAL_GATEWAY_URL;
+    localKeyAdminToken = config.key_admin_token || '';
     if (!gatewayUrlInput.value) {
       gatewayUrlInput.value = configuredGatewayUrl;
     }
@@ -1035,18 +1086,22 @@ async function initialize() {
       apiKeyInput.value = config.api_key;
       setSessionValue('omni-api-key', config.api_key);
     }
-    setKeyManagementEnabled(config.key_management_enabled === true);
+    setKeyManagementEnabled(
+      config.key_management_enabled === true,
+      config.key_admin_required === true,
+    );
     if (config.key_management_enabled === true && config.managed_gateway_status === 'error') {
       setKeyGeneratorStatus(
         config.managed_gateway_error || 'The managed gateway did not start. Check the .dev gateway logs.',
         'error',
       );
     }
-  } catch {
+  } catch (error) {
     if (!gatewayUrlInput.value) {
       gatewayUrlInput.value = LOCAL_GATEWAY_URL;
     }
-    setKeyManagementEnabled(false);
+    setKeyManagementEnabled(false, false);
+    setKeyGeneratorStatus(requestFailureMessage(error, 'Dashboard setup failed'), 'error');
   }
   updateGatewayMode();
 
@@ -1084,6 +1139,7 @@ async function initialize() {
   byId('apiKey').addEventListener('input', () => {
     updateGatewayConnection(gatewayReachable);
   });
+  byId('keyAdminToken').addEventListener('input', updateKeyManagementButton);
   byId('connectButton').addEventListener('click', checkGateway);
   byId('runButton').addEventListener('click', runExecution);
   byId('copyResultButton').addEventListener('click', copyResult);
