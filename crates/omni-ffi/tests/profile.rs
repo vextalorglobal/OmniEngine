@@ -216,9 +216,9 @@ fn null_arguments_are_refused() {
 }
 
 #[test]
-fn the_surface_is_additive_within_abi_five() {
+fn the_surface_is_additive_within_abi_six() {
     // No layout of an existing struct moved, and no signature changed: a host
-    // compiled against the v5 header remains correct.
+    // compiled against the v6 header remains correct.
     assert_eq!(omni_abi_version(), OMNI_ABI_VERSION);
-    assert_eq!(OMNI_ABI_VERSION, 5);
+    assert_eq!(OMNI_ABI_VERSION, 6);
 }

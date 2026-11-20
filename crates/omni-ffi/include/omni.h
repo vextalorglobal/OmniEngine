@@ -1,5 +1,5 @@
 /*
- * omni.h -- the C ABI of OmniEngine, version 4.
+ * omni.h -- the C ABI of OmniEngine, version 6.
  *
  * Copyright (c) 2026 Tamjid Abdur Rahman. All Rights Reserved.
  * Engineered by Vextalor Global. Licensed under VGPIL 1.0; see LICENSE.
