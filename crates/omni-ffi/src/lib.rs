@@ -1961,10 +1961,10 @@ mod tests {
     }
 
     #[test]
-    fn the_abi_reports_five_and_the_header_agrees() {
+    fn the_abi_reports_six_and_the_header_agrees() {
         assert_eq!(omni_abi_version(), OMNI_ABI_VERSION);
         assert_eq!(
-            OMNI_ABI_VERSION, 5,
+            OMNI_ABI_VERSION, 6,
             "the header and both SDKs hard-code this"
         );
     }
