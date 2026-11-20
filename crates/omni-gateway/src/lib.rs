@@ -2430,10 +2430,42 @@ mod tests {
         assert_eq!(body["error"]["code"], "runtime_unavailable");
         assert_eq!(body["runtime"]["available"], false);
 
+        let python = request_language(&gateway, Some(&auth), "python", "print(1)");
+        assert_eq!(python.status, 503);
+        let body: serde_json::Value = serde_json::from_str(&python.body).unwrap();
+        assert_eq!(body["error"]["code"], "runtime_unavailable");
+        assert_eq!(body["runtime"]["available"], false);
+
         let unsupported = request_language(&gateway, Some(&auth), "ruby", "puts 1");
         assert_eq!(unsupported.status, 422);
         let body: serde_json::Value = serde_json::from_str(&unsupported.body).unwrap();
         assert_eq!(body["error"]["code"], "unsupported_language");
+    }
+
+    #[test]
+    fn execute_selects_sandboxed_wasm_and_reports_runtime() {
+        let settings = settings();
+        let test_dir = TestDirectory::new();
+        let gateway = Gateway::new_with_state_path(
+            settings.clone(),
+            vec![ApiKey::new(TOKEN, "wasm-tenant", settings.free_tier).unwrap()],
+            test_dir.state_path(),
+        )
+        .unwrap();
+
+        let response = request_language(
+            &gateway,
+            Some(&format!("Bearer {TOKEN}")),
+            "wasm",
+            "(module (func (export \"run\") (result i32) i32.const 42))",
+        );
+
+        assert_eq!(response.status, 200, "{}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(body["runtime"]["language"], "wasm");
+        assert_eq!(body["runtime"]["runtime"], "Wasmi 0.46 / WAT");
+        assert_eq!(body["value"]["tag"], "number");
+        assert_eq!(body["value"]["number"], 42.0);
     }
 
     #[test]
@@ -2463,6 +2495,11 @@ mod tests {
                 .iter()
                 .any(|language| language["id"] == "python" && language["available"] == false)
         );
+        assert!(
+            languages
+                .iter()
+                .any(|language| language["id"] == "wasm" && language["available"] == true)
+        );
         let lua = languages
             .iter()
             .find(|language| language["id"] == "lua")
@@ -2475,6 +2512,20 @@ mod tests {
         assert_eq!(lua["capabilities"]["network_access"], false);
         assert_eq!(lua["capabilities"]["cluster_dispatch"], false);
         assert_eq!(lua["capabilities"]["memory_limit"], true);
+        let wasm = languages
+            .iter()
+            .find(|language| language["id"] == "wasm")
+            .unwrap();
+        assert_eq!(wasm["capabilities"]["filesystem_reads"], false);
+        assert_eq!(wasm["capabilities"]["filesystem_writes"], false);
+        assert_eq!(wasm["capabilities"]["module_imports"], false);
+        assert_eq!(wasm["capabilities"]["host_functions"], false);
+        assert_eq!(wasm["capabilities"]["network_access"], false);
+        assert_eq!(wasm["capabilities"]["gas_limit"], true);
+        assert_eq!(wasm["capabilities"]["cpu_limit"], true);
+        assert_eq!(wasm["capabilities"]["memory_limit"], true);
+        assert_eq!(wasm["capabilities"]["deterministic_verification"], false);
+        assert_eq!(wasm["capabilities"]["cluster_dispatch"], false);
         assert_eq!(body["sandbox"]["filesystem_reads"], false);
         assert_eq!(body["sandbox"]["filesystem_writes"], false);
         assert_eq!(body["sandbox"]["module_imports"], false);

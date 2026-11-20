@@ -70,10 +70,20 @@ not support worker-cluster dispatch or deterministic quorum verification.
 `GET /v1/languages` returns the available language IDs, runtime names,
 capabilities, effective gateway limits, and sandbox policy. The discovery
 response contains no tenant or credential data and does not require bearer
-authentication. At present, `omni` and `lua` are available. `javascript`,
-`python`, and `wasm` are recognized but return `503 runtime_unavailable`;
-the gateway never falls back to launching a host process. The `omni-wasm`
-crate is a binding scaffold, not a host for arbitrary WebAssembly modules.
+authentication. `omni`, `lua`, and `wasm` are available. The Wasm runner uses
+the embedded Wasmi interpreter to execute WebAssembly Text (WAT) source. A
+module must have no imports and export a no-argument `run` function returning
+at most one `i32`, `i64`, `f32`, or `f64` value (or no value). Fuel, linear
+memory, table, instance, and stack limits are enforced. It has no WASI,
+filesystem, network, or host-function access and does not support worker
+dispatch or deterministic quorum verification. The separate `omni-wasm`
+crate remains a browser-binding scaffold.
+
+`javascript` and `python` are recognized but return `503 runtime_unavailable`.
+The gateway does not invoke system interpreters: no embedded interpreter with
+enforced gas/memory budgets and disabled host APIs is currently configured.
+The repository's Python and Node packages are client SDKs over the native C
+ABI, not interpreters for submitted Python or JavaScript source.
 
 Unknown language IDs return `422 unsupported_language`. A known runtime that
 cannot execute in the configured topology returns `503` with a diagnostic
