@@ -159,7 +159,7 @@ export OMNI_GATEWAY_URL=http://127.0.0.1:8443
 export OMNI_PUBLIC_GATEWAY_URL=https://api.example.com
 export OMNI_GATEWAY_ALLOW_HTTP=1
 export OMNI_GATEWAY_PROXY_LOCK=1
-export OMNI_UI_ALLOWED_HOSTS=api.example.com
+export OMNI_ALLOWED_HOSTS=api.example.com
 export OMNI_UI_ALLOWED_ORIGINS=https://api.example.com
 node ui/server.js
 ```
@@ -193,8 +193,35 @@ The `gateway` service keeps state in the named `gateway-state` volume. The
 dashboard bridge uses `OMNI_GATEWAY_URL` for the internal gateway URL and
 `OMNI_PUBLIC_GATEWAY_URL` for the URL presented in the UI. Its upstream lock
 allows only those configured origins, preventing the hosted bridge from
-becoming an arbitrary-URL proxy. `OMNI_UI_ALLOWED_HOSTS` and
-`OMNI_UI_ALLOWED_ORIGINS` authorize the hosted domain at the bridge.
+becoming an arbitrary-URL proxy. `OMNI_ALLOWED_HOSTS` is a comma-separated
+exact host/host:port allowlist for the bridge; the older
+`OMNI_UI_ALLOWED_HOSTS` remains supported. `OMNI_UI_ALLOWED_ORIGINS` can
+explicitly allow browser origins.
+
+### Render and custom hosted domains
+
+On Render, the bridge automatically permits the exact
+`RENDER_EXTERNAL_HOSTNAME`, accepts same-origin HTTPS requests, and uses
+`https://<RENDER_EXTERNAL_HOSTNAME>` as the dashboard's initial gateway URL
+unless `OMNI_PUBLIC_GATEWAY_URL` is set. Render deployments also accept
+`*.onrender.com` Host headers when `RENDER`, `RENDER_EXTERNAL_HOSTNAME`, or
+`OMNI_TLS_MODE=plain` indicates a hosted deployment. For a custom domain, set
+`OMNI_ALLOWED_HOSTS` to its exact hostname (for example
+`omniengine.onrender.com` or `engine.example.com`); this also supplies the
+default HTTPS gateway URL when no public URL is configured. If the gateway is
+on a separate private address, set `OMNI_GATEWAY_URL` to that upstream and
+keep `OMNI_PUBLIC_GATEWAY_URL` set to the browser-facing HTTPS URL.
+
+The bridge still defaults to loopback hosts only outside hosted mode. Set
+`OMNI_ALLOWED_HOSTS=*` only when intentionally accepting every Host header;
+wildcard host access does not disable gateway bearer-token authentication.
+For other cloud platforms, explicitly configure the exact host and origin:
+
+```text
+OMNI_ALLOWED_HOSTS=engine.example.com
+OMNI_PUBLIC_GATEWAY_URL=https://engine.example.com
+OMNI_UI_ALLOWED_ORIGINS=https://engine.example.com
+```
 
 For a non-Docker cloud service, configure `OMNI_GATEWAY_CONFIG`,
 `OMNI_USAGE_POLICY`, `OMNI_API_KEYS`, `OMNI_BIND_ADDR`, and `OMNI_TLS_MODE`
