@@ -12,24 +12,54 @@ const PORT = Number(process.env.PORT || 3000);
 const MAX_REQUEST_BYTES = 80 * 1024;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const LOCAL_GATEWAY_URL = 'https://127.0.0.1:8443';
-const DEFAULT_GATEWAY_URL = process.env.OMNI_PUBLIC_GATEWAY_URL
+const CONFIGURED_HOST_VALUES = [
+  process.env.OMNI_ALLOWED_HOSTS,
+  process.env.OMNI_UI_ALLOWED_HOSTS,
+]
+  .filter(Boolean)
+  .flatMap((hosts) => hosts.split(',').map((host) => host.trim().toLowerCase()).filter(Boolean));
+const CONFIGURED_HOST_ENTRIES = CONFIGURED_HOST_VALUES
+  .filter((host) => host !== '*')
+  .map(normalizeHostEntry)
+  .filter(Boolean);
+const RENDER_EXTERNAL_HOST = normalizeHostEntry(process.env.RENDER_EXTERNAL_HOSTNAME);
+const RENDER_MODE = Boolean(
+  process.env.RENDER
+  || RENDER_EXTERNAL_HOST
+  || (process.env.OMNI_TLS_MODE || '').toLowerCase() === 'plain',
+);
+const PUBLIC_GATEWAY_URL = process.env.OMNI_PUBLIC_GATEWAY_URL
+  || (RENDER_EXTERNAL_HOST ? `https://${RENDER_EXTERNAL_HOST}` : '')
+  || configuredPublicHostUrl(CONFIGURED_HOST_ENTRIES)
+  || '';
+const DEFAULT_GATEWAY_URL = PUBLIC_GATEWAY_URL
   || process.env.OMNI_GATEWAY_URL
   || LOCAL_GATEWAY_URL;
 const ALLOWED_HOSTS = new Set([
   `localhost:${PORT}`,
   `127.0.0.1:${PORT}`,
   'localhost',
+  'localhost:3000',
+  'localhost:8443',
   '127.0.0.1',
-  ...(process.env.OMNI_UI_ALLOWED_HOSTS || '')
-    .split(',')
-    .map((host) => host.trim().toLowerCase())
-    .filter(Boolean),
+  '127.0.0.1:3000',
+  '127.0.0.1:8443',
+  '::1',
+  '[::1]',
+  `[::1]:${PORT}`,
+  '[::1]:3000',
+  '[::1]:8443',
+  ...CONFIGURED_HOST_ENTRIES,
+  ...(RENDER_EXTERNAL_HOST ? [RENDER_EXTERNAL_HOST] : []),
 ]);
+const ALLOW_ANY_HOST = CONFIGURED_HOST_VALUES.includes('*');
 const ALLOWED_ORIGINS = new Set([
   ...(process.env.OMNI_UI_ALLOWED_ORIGINS || '')
     .split(',')
     .map((origin) => origin.trim())
     .filter(Boolean),
+  ...(RENDER_EXTERNAL_HOST ? [`https://${RENDER_EXTERNAL_HOST}`] : []),
+  ...configuredHttpsOrigins(CONFIGURED_HOST_ENTRIES),
 ]);
 const GATEWAY_PROXY_LOCK = process.env.OMNI_GATEWAY_PROXY_LOCK === '1';
 const ROOT = __dirname;
@@ -67,6 +97,31 @@ let keyMutationQueue = Promise.resolve();
 function samePath(actual, expected) {
   return typeof actual === 'string'
     && path.resolve(actual).toLowerCase() === path.resolve(expected).toLowerCase();
+}
+
+function normalizeHostEntry(value) {
+  if (typeof value !== 'string' || !value.trim() || value.includes('*')) return '';
+  try {
+    const raw = value.trim();
+    const target = new URL(raw.includes('://') ? raw : `http://${raw}`);
+    if (target.username || target.password || target.pathname !== '/' || target.search || target.hash) {
+      return '';
+    }
+    return target.host.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+function configuredPublicHostUrl(hosts) {
+  const host = hosts.find((entry) => !localHost(new URL(`http://${entry}`).hostname));
+  return host ? `https://${host}` : '';
+}
+
+function configuredHttpsOrigins(hosts) {
+  return hosts
+    .filter((host) => !localHost(new URL(`http://${host}`).hostname))
+    .map((host) => new URL(`https://${host}`).origin);
 }
 
 function readManagedKeyEntries() {
@@ -456,14 +511,28 @@ function localHost(hostname) {
 
 function allowedHostHeader(hostHeader) {
   if (typeof hostHeader !== 'string') return false;
-  return ALLOWED_HOSTS.has(hostHeader.toLowerCase());
+  const rawHost = hostHeader.trim().toLowerCase();
+  if (ALLOW_ANY_HOST || ALLOWED_HOSTS.has(rawHost)) return true;
+  const normalized = normalizeHostEntry(hostHeader);
+  if (!normalized) return false;
+  if (ALLOWED_HOSTS.has(normalized)) return true;
+  if (!RENDER_MODE) return false;
+  const hostname = new URL(`http://${normalized}`).hostname.toLowerCase();
+  return hostname.endsWith('.onrender.com');
 }
 
-function allowedOrigin(origin) {
+function allowedOrigin(origin, hostHeader) {
   if (!origin) return true;
   if (ALLOWED_ORIGINS.has(origin)) return true;
   try {
     const parsed = new URL(origin);
+    const requestHost = normalizeHostEntry(hostHeader);
+    if (RENDER_MODE
+        && parsed.protocol === 'https:'
+        && normalizeHostEntry(parsed.host) === requestHost
+        && allowedHostHeader(hostHeader)) {
+      return true;
+    }
     return parsed.protocol === 'http:'
       && localHost(parsed.hostname)
       && (parsed.port === String(PORT) || (parsed.port === '' && PORT === 80));
@@ -478,7 +547,7 @@ function gatewayBase(request) {
     ? requested.trim()
     : (process.env.OMNI_GATEWAY_URL || DEFAULT_GATEWAY_URL);
   const internalGatewayUrl = process.env.OMNI_GATEWAY_URL;
-  const publicGatewayUrl = process.env.OMNI_PUBLIC_GATEWAY_URL;
+  const publicGatewayUrl = PUBLIC_GATEWAY_URL;
   if (GATEWAY_PROXY_LOCK) {
     const allowedTargets = new Set(
       [internalGatewayUrl, publicGatewayUrl].filter(Boolean).map((value) => {
@@ -633,10 +702,15 @@ function gatewayFailureMessage(target, error) {
 async function handle(request, response) {
   setSecurityHeaders(response);
   if (!allowedHostHeader(request.headers.host)) {
-    sendJson(response, 403, { error: { code: 'invalid_host', message: 'Use localhost:3000' } });
+    sendJson(response, 403, {
+      error: {
+        code: 'invalid_host',
+        message: 'Host is not allowed. Configure OMNI_ALLOWED_HOSTS with this hostname; local defaults include localhost:3000.',
+      },
+    });
     return;
   }
-  if (!allowedOrigin(request.headers.origin)) {
+  if (!allowedOrigin(request.headers.origin, request.headers.host)) {
     sendJson(response, 403, { error: { code: 'invalid_origin', message: 'Origin is not allowed' } });
     return;
   }

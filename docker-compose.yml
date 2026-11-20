@@ -34,7 +34,7 @@ services:
       OMNI_PUBLIC_GATEWAY_URL: https://${OMNI_DOMAIN:?Set OMNI_DOMAIN to your DNS name}
       OMNI_GATEWAY_ALLOW_HTTP: "1"
       OMNI_GATEWAY_PROXY_LOCK: "1"
-      OMNI_UI_ALLOWED_HOSTS: ${OMNI_DOMAIN:?Set OMNI_DOMAIN to your DNS name}
+      OMNI_ALLOWED_HOSTS: ${OMNI_DOMAIN:?Set OMNI_DOMAIN to your DNS name}
       OMNI_UI_ALLOWED_ORIGINS: https://${OMNI_DOMAIN:?Set OMNI_DOMAIN to your DNS name}
     expose:
       - "3000"
