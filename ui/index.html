@@ -4,7 +4,22 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#f6f5f2">
-    <title>OmniEngine — Execution Studio</title>
+    <meta name="description" content="OmniEngine is a Rust execution platform for local-first development and managed API workloads, with sandboxed execution and a browser-based Execution Studio.">
+    <meta name="robots" content="index, follow">
+    <link rel="canonical" href="__OMNI_CANONICAL_URL__">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="OmniEngine">
+    <meta property="og:title" content="OmniEngine — Sandboxed Rust Execution Engine">
+    <meta property="og:description" content="Run sandboxed tasks locally or through a managed Rust API gateway. Explore runtime availability, execution limits, and results in the OmniEngine Studio.">
+    <meta property="og:url" content="__OMNI_CANONICAL_URL__">
+    <meta property="og:image" content="__OMNI_SITE_ORIGIN__/omni-logo.png">
+    <meta property="og:image:alt" content="OmniEngine logo">
+    <meta property="og:locale" content="en_US">
+    <meta name="twitter:card" content="summary">
+    <meta name="twitter:title" content="OmniEngine — Sandboxed Rust Execution Engine">
+    <meta name="twitter:description" content="A local-first Rust execution platform with a policy-limited API gateway and browser Studio.">
+    <meta name="twitter:image" content="__OMNI_SITE_ORIGIN__/omni-logo.png">
+    <title>OmniEngine — Sandboxed Rust Execution Engine &amp; API Gateway</title>
     <link rel="icon" type="image/png" href="/omni-logo.png">
     <link rel="stylesheet" href="/styles.css">
     <script src="/app.js" defer></script>
@@ -28,6 +43,22 @@
           </button>
         </div>
       </header>
+
+      <section class="product-intro" aria-labelledby="productPurpose">
+        <div class="product-intro-heading">
+          <p class="eyebrow">Rust execution platform</p>
+          <h2 id="productPurpose">Run sandboxed tasks locally or through a managed API</h2>
+        </div>
+        <div class="product-intro-copy">
+          <p>OmniEngine combines a local-first language engine and SDKs with an HTTPS gateway for policy-bounded remote execution. The gateway currently supports OmniEngine, Lua 5.4, and self-contained WebAssembly Text modules; runtime discovery reports availability, limits, and sandbox capabilities.</p>
+          <p>Local execution stays on the caller's device or server. Managed requests process only the data sent to the API and apply authentication, CPU, memory, and usage limits.</p>
+          <nav class="product-links" aria-label="OmniEngine documentation">
+            <a href="https://github.com/vextalorglobal/OmniEngine">Source code and README</a>
+            <a href="https://github.com/vextalorglobal/OmniEngine/blob/main/docs/CLOUD-API.md">Cloud API reference</a>
+            <a href="https://github.com/vextalorglobal/OmniEngine/blob/main/docs/HYBRID-DEPLOYMENT.md">Deployment guide</a>
+          </nav>
+        </div>
+      </section>
 
       <section class="connection-panel" aria-label="Gateway connection settings">
         <div class="tier-summary">

@@ -115,6 +115,54 @@ textarea:focus-visible {
   margin-bottom: 22px;
 }
 
+.product-intro {
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+  align-items: center;
+  gap: 25px;
+  margin-bottom: 19px;
+  padding: 17px 20px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  box-shadow: var(--shadow);
+}
+
+.product-intro-heading h2 {
+  margin: 6px 0 0;
+  font-size: 17px;
+  font-weight: 620;
+  letter-spacing: -0.025em;
+  line-height: 1.35;
+}
+
+.product-intro-copy p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.product-intro-copy p + p {
+  margin-top: 7px;
+}
+
+.product-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px 17px;
+  margin-top: 9px;
+  font-size: 11px;
+}
+
+.product-links a {
+  color: var(--brass);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+.product-links a:hover {
+  color: var(--ink);
+}
+
 .brand-lockup {
   gap: 13px;
 }
@@ -1189,6 +1237,16 @@ kbd {
     align-items: flex-end;
     flex-direction: column-reverse;
     gap: 8px;
+  }
+
+  .product-intro {
+    grid-template-columns: 1fr;
+    gap: 10px;
+    padding: 14px;
+  }
+
+  .product-intro-heading h2 {
+    font-size: 15px;
   }
 
   .brand-lockup h1 {

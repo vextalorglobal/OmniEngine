@@ -12,6 +12,11 @@ const PORT = Number(process.env.PORT || 3000);
 const MAX_REQUEST_BYTES = 80 * 1024;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const LOCAL_GATEWAY_URL = 'https://127.0.0.1:8443';
+const DEFAULT_PUBLIC_SITE_ORIGIN = 'https://omniengine.onrender.com';
+const CONFIGURED_PUBLIC_SITE_ORIGIN = normalizePublicSiteOrigin(process.env.OMNI_PUBLIC_SITE_URL);
+const GOOGLE_VERIFICATION_PATH = '/googlebf0032297d3c5fef.html';
+const SITE_ORIGIN_TOKEN = '__OMNI_SITE_ORIGIN__';
+const CANONICAL_URL_TOKEN = '__OMNI_CANONICAL_URL__';
 const CONFIGURED_HOST_VALUES = [
   process.env.OMNI_ALLOWED_HOSTS,
   process.env.OMNI_UI_ALLOWED_HOSTS,
@@ -83,6 +88,9 @@ const STATIC_FILES = new Map([
   ['/styles.css', ['styles.css', 'text/css; charset=utf-8']],
   ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],
   ['/omni-logo.png', ['omni-logo.png', 'image/png']],
+  ['/robots.txt', ['robots.txt', 'text/plain; charset=utf-8']],
+  ['/sitemap.xml', ['sitemap.xml', 'application/xml; charset=utf-8']],
+  [GOOGLE_VERIFICATION_PATH, ['googlebf0032297d3c5fef.html', 'text/html; charset=utf-8']],
 ]);
 
 if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
@@ -122,6 +130,36 @@ function configuredHttpsOrigins(hosts) {
   return hosts
     .filter((host) => !localHost(new URL(`http://${host}`).hostname))
     .map((host) => new URL(`https://${host}`).origin);
+}
+
+function normalizePublicSiteOrigin(value) {
+  if (!value) return '';
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error('OMNI_PUBLIC_SITE_URL must be an HTTP(S) origin');
+  }
+  if (!['http:', 'https:'].includes(url.protocol)
+      || url.username
+      || url.password
+      || (url.pathname !== '/' && url.pathname !== '')
+      || url.search
+      || url.hash
+      || (url.protocol === 'http:' && !localHost(url.hostname))) {
+    throw new Error('OMNI_PUBLIC_SITE_URL must be a public HTTPS origin (HTTP is allowed only for loopback)');
+  }
+  return url.origin;
+}
+
+function publicSiteOrigin(request) {
+  if (CONFIGURED_PUBLIC_SITE_ORIGIN) return CONFIGURED_PUBLIC_SITE_ORIGIN;
+  if (RENDER_EXTERNAL_HOST) return new URL(`https://${RENDER_EXTERNAL_HOST}`).origin;
+  const host = normalizeHostEntry(request.headers.host);
+  if (host && !localHost(new URL(`http://${host}`).hostname)) {
+    return new URL(`https://${host}`).origin;
+  }
+  return DEFAULT_PUBLIC_SITE_ORIGIN;
 }
 
 function readManagedKeyEntries() {
@@ -701,6 +739,20 @@ function gatewayFailureMessage(target, error) {
 
 async function handle(request, response) {
   setSecurityHeaders(response);
+  let pathname;
+  try {
+    pathname = new URL(request.url, 'http://127.0.0.1').pathname;
+  } catch {
+    sendJson(response, 400, { error: { code: 'bad_request', message: 'Invalid request URL' } });
+    return;
+  }
+
+  if (pathname === GOOGLE_VERIFICATION_PATH
+      && (request.method === 'GET' || request.method === 'HEAD')) {
+    serveStaticFile(request, response, pathname, STATIC_FILES.get(pathname));
+    return;
+  }
+
   if (!allowedHostHeader(request.headers.host)) {
     sendJson(response, 403, {
       error: {
@@ -712,14 +764,6 @@ async function handle(request, response) {
   }
   if (!allowedOrigin(request.headers.origin, request.headers.host)) {
     sendJson(response, 403, { error: { code: 'invalid_origin', message: 'Origin is not allowed' } });
-    return;
-  }
-
-  let pathname;
-  try {
-    pathname = new URL(request.url, 'http://127.0.0.1').pathname;
-  } catch {
-    sendJson(response, 400, { error: { code: 'bad_request', message: 'Invalid request URL' } });
     return;
   }
 
@@ -789,23 +833,8 @@ async function handle(request, response) {
   }
 
   const asset = STATIC_FILES.get(pathname);
-  if (asset && request.method === 'GET') {
-    const filePath = path.join(ROOT, asset[0]);
-    fs.readFile(filePath, (error, contents) => {
-      if (error) {
-        sendJson(response, 500, {
-          error: { code: 'asset_unavailable', message: 'Dashboard asset could not be read' },
-        });
-        return;
-      }
-      setSecurityHeaders(response);
-      response.writeHead(200, {
-        'Cache-Control': 'no-store',
-        'Content-Type': asset[1],
-        'Content-Length': contents.length,
-      });
-      response.end(contents);
-    });
+  if (asset && (request.method === 'GET' || request.method === 'HEAD')) {
+    serveStaticFile(request, response, pathname, asset);
     return;
   }
 
@@ -818,6 +847,36 @@ async function handle(request, response) {
     return;
   }
   sendJson(response, 404, { error: { code: 'not_found', message: 'Dashboard asset not found' } });
+}
+
+function serveStaticFile(request, response, pathname, asset) {
+  if (!asset) {
+    sendJson(response, 404, { error: { code: 'not_found', message: 'Static asset not found' } });
+    return;
+  }
+  const filePath = path.join(ROOT, asset[0]);
+  fs.readFile(filePath, (error, contents) => {
+    if (error) {
+      sendJson(response, 500, {
+        error: { code: 'asset_unavailable', message: 'Dashboard asset could not be read' },
+      });
+      return;
+    }
+    let body = contents;
+    if (pathname !== GOOGLE_VERIFICATION_PATH) {
+      const siteOrigin = publicSiteOrigin(request);
+      body = Buffer.from(contents.toString('utf8')
+        .split(SITE_ORIGIN_TOKEN).join(siteOrigin)
+        .split(CANONICAL_URL_TOKEN).join(`${siteOrigin}/`));
+    }
+    setSecurityHeaders(response);
+    response.writeHead(200, {
+      'Cache-Control': 'no-store',
+      'Content-Type': asset[1],
+      'Content-Length': body.length,
+    });
+    response.end(request.method === 'HEAD' ? undefined : body);
+  });
 }
 
 const server = http.createServer((request, response) => {
