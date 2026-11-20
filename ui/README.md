@@ -43,15 +43,23 @@ Unicode text values.
 The Studio defaults to `omni`, so existing requests and presets continue to
 work. `lua` runs in the gateway's embedded Lua 5.4 VM with only base and math
 libraries, plus per-request instruction, time, and VM memory limits. Lua chunks
-use standard `return` syntax. Use **Language / runtime** to switch the language
-and load its arithmetic, limit, or Unicode example.
+use standard `return` syntax.
 
-`javascript`, `python`, and `wasm` are listed for discovery but are not
-available yet. The gateway returns a structured `503 runtime_unavailable` for
-those IDs; it never invokes a system interpreter. `GET /v1/languages` lists
-runtime availability and capabilities. Lua currently runs only in the gateway
-and cannot use Omni worker-cluster dispatch or deterministic quorum
-verification.
+`wasm` runs WebAssembly Text (WAT) in the embedded Wasmi interpreter. A task
+must be a self-contained module (no imports) exporting a no-argument function
+named `run` that returns zero or one scalar (`i32`, `i64`, `f32`, or `f64`).
+The gateway enforces instruction fuel, linear-memory and table caps, and a
+bounded interpreter stack. No WASI, filesystem, network, or host functions are
+linked. The arithmetic, gas-limit, and memory presets demonstrate this
+contract. Wasm is gateway-local and does not support worker dispatch or
+deterministic quorum verification.
+
+`javascript` and `python` remain recognized but unavailable
+(`503 runtime_unavailable`). This build has no embedded interpreter that can
+enforce the gateway's gas/CPU/memory limits while disabling filesystem,
+imports, network, and host APIs. The gateway deliberately never launches
+`node`, `python`, or another host executable for untrusted source.
+`GET /v1/languages` is authoritative for availability and capabilities.
 
 ## Generate and manage local keys
 

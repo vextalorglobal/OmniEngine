@@ -18,9 +18,28 @@ const memoryLimitBytes = 128 * 1024 * 1024;
 const fallbackLanguages = [
   { id: 'omni', name: 'OmniEngine', runtime: 'omni-core', available: true },
   { id: 'lua', name: 'Lua 5.4', runtime: 'mlua / Lua 5.4', available: true },
-  { id: 'javascript', name: 'JavaScript', runtime: 'not installed', available: false, unavailable_reason: 'No isolated JavaScript runtime is installed.' },
-  { id: 'python', name: 'Python', runtime: 'not installed', available: false, unavailable_reason: 'No isolated Python runtime is installed.' },
-  { id: 'wasm', name: 'WebAssembly', runtime: 'host not installed', available: false, unavailable_reason: 'No untrusted-module WebAssembly host is configured.' },
+  { id: 'javascript', name: 'JavaScript', runtime: 'not configured', available: false, unavailable_reason: 'No embedded JavaScript interpreter with enforced gas and memory limits is configured; host processes are disabled.' },
+  { id: 'python', name: 'Python', runtime: 'not configured', available: false, unavailable_reason: 'No embedded Python interpreter with enforced gas and memory limits is configured; host processes are disabled.' },
+  {
+    id: 'wasm',
+    name: 'WebAssembly',
+    runtime: 'Wasmi 0.46 / WAT',
+    available: true,
+    standard_libraries: [],
+    capabilities: {
+      filesystem_reads: false,
+      filesystem_writes: false,
+      module_imports: false,
+      host_functions: false,
+      network_access: false,
+      gas_limit: true,
+      cpu_limit: true,
+      memory_limit: true,
+      unicode_text: false,
+      deterministic_verification: false,
+      cluster_dispatch: false,
+    },
+  },
 ];
 let history = loadExecutionHistory();
 let generatedApiKeys = getGeneratedApiKeys();
@@ -91,6 +110,29 @@ const presets = {
       source: '-- বাংলা — हिन्दी — 日本語 — العربية — Ελληνικά — 😀\nreturn "বাংলা — नमस्ते — 日本語 — العربية — Ελληνικά — 😀"',
       gas: '',
       timeout: '',
+      verification: '',
+    },
+  },
+  wasm: {
+    arithmetic: {
+      label: 'Arithmetic',
+      source: ';; WAT module: export a no-argument run function.\n(module\n  (func (export "run") (result i32)\n    i32.const 42))',
+      gas: '',
+      timeout: '',
+      verification: '',
+    },
+    gas: {
+      label: 'Gas limit',
+      source: '(module\n  (func (export "run")\n    (loop $again\n      (br $again))))',
+      gas: '500',
+      timeout: '50',
+      verification: '',
+    },
+    memory: {
+      label: 'Memory load',
+      source: '(module\n  (memory (export "memory") 1 2)\n  (func (export "run") (result i32)\n    memory.size))',
+      gas: '50000',
+      timeout: '50',
       verification: '',
     },
   },

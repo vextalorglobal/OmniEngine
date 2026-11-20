@@ -115,12 +115,13 @@ Example request:
 ```
 
 The `language` field is optional; omitting it preserves compatibility and
-selects `omni`. Use `language: "lua"` with standard Lua `return` syntax for the
-embedded Lua 5.4 runtime. Lua exposes only base and math libraries and has
-instruction, time, and VM memory limits. It does not support worker-cluster
-dispatch or deterministic quorum verification. The gateway returns
-`503 runtime_unavailable` for recognized but unavailable runtimes rather than
-launching a host interpreter.
+selects `omni`. `lua` runs in the embedded Lua 5.4 VM with only base and math
+libraries. `wasm` runs no-import WAT modules in the embedded Wasmi interpreter;
+export a no-argument `run` function returning a scalar value. Both have runtime
+resource limits; Lua and Wasm are gateway-local and do not support worker
+dispatch or deterministic quorum verification. JavaScript and Python remain
+recognized but unavailable because this build does not include sandboxed
+embedded interpreters; the gateway never launches host executables.
 
 Gateway configuration is read from `OMNI_GATEWAY_CONFIG` and
 `OMNI_USAGE_POLICY`; the API key source is configured in TOML and supplied
@@ -173,7 +174,7 @@ cargo check --workspace
 | `crates/omni-cluster` | TLS worker protocol, client, node, and dispatch logic |
 | `crates/omni-gateway` | HTTPS REST gateway, policy enforcement, language runners, and dev certificate helper |
 | `crates/omni-jit` | Cranelift JIT integration |
-| `crates/omni-wasm` | WebAssembly binding scaffold; not a general untrusted Wasm host |
+| `crates/omni-wasm` | WebAssembly binding scaffold; gateway WAT execution uses Wasmi |
 | `sdks/` | Python and Node.js local SDKs |
 | `config/` and `policies/` | Gateway configuration template and usage-tier policy |
 | `docs/` | Deployment, API, cluster, and release documentation |

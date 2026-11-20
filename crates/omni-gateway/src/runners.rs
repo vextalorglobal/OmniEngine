@@ -6,6 +6,11 @@ use serde::Serialize;
 use std::cell::Cell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
+use wasmi::core::{LimiterError, ResourceLimiter};
+use wasmi::{
+    Config as WasmConfig, Engine as WasmEngine, Linker as WasmLinker, Module as WasmModule,
+    StackLimits as WasmStackLimits, Store as WasmStore, StoreLimits, StoreLimitsBuilder,
+};
 
 const LUA_CPU_LIMIT: &str = "__OMNI_CPU_LIMIT__";
 const LUA_GAS_LIMIT: &str = "__OMNI_GAS_LIMIT__";
@@ -88,6 +93,7 @@ pub enum RunnerResolutionError {
 pub struct RunnerRegistry {
     omni: OmniRunner,
     lua: LuaRunner,
+    wasm: WasmRunner,
 }
 
 impl RunnerRegistry {
@@ -97,7 +103,7 @@ impl RunnerRegistry {
             "lua" => Ok(&self.lua),
             "javascript" | "js" => Err(RunnerResolutionError::Unavailable(UNAVAILABLE_JAVASCRIPT)),
             "python" => Err(RunnerResolutionError::Unavailable(UNAVAILABLE_PYTHON)),
-            "wasm" => Err(RunnerResolutionError::Unavailable(UNAVAILABLE_WASM)),
+            "wasm" => Ok(&self.wasm),
             _ => Err(RunnerResolutionError::Unsupported(id.to_string())),
         }
     }
@@ -108,7 +114,7 @@ impl RunnerRegistry {
             LUA_DESCRIPTOR,
             UNAVAILABLE_JAVASCRIPT,
             UNAVAILABLE_PYTHON,
-            UNAVAILABLE_WASM,
+            WASM_DESCRIPTOR,
         ]
     }
 
@@ -141,6 +147,20 @@ const LUA_CAPABILITIES: RunnerCapabilities = RunnerCapabilities {
     cpu_limit: true,
     memory_limit: true,
     unicode_text: true,
+    deterministic_verification: false,
+    cluster_dispatch: false,
+};
+
+const WASM_CAPABILITIES: RunnerCapabilities = RunnerCapabilities {
+    filesystem_reads: false,
+    filesystem_writes: false,
+    module_imports: false,
+    host_functions: false,
+    network_access: false,
+    gas_limit: true,
+    cpu_limit: true,
+    memory_limit: true,
+    unicode_text: false,
     deterministic_verification: false,
     cluster_dispatch: false,
 };
@@ -182,37 +202,35 @@ const LUA_DESCRIPTOR: LanguageDescriptor = LanguageDescriptor {
 const UNAVAILABLE_JAVASCRIPT: LanguageDescriptor = LanguageDescriptor {
     id: "javascript",
     name: "JavaScript",
-    runtime: "not installed",
+    runtime: "not configured",
     available: false,
     standard_libraries: &[],
     capabilities: UNAVAILABLE_CAPABILITIES,
     unavailable_reason: Some(
-        "No isolated JavaScript runtime is installed; the gateway will not launch a host process.",
+        "No embedded JavaScript interpreter with enforced gas and memory limits is configured; host processes are disabled.",
     ),
 };
 
 const UNAVAILABLE_PYTHON: LanguageDescriptor = LanguageDescriptor {
     id: "python",
     name: "Python",
-    runtime: "not installed",
+    runtime: "not configured",
     available: false,
     standard_libraries: &[],
     capabilities: UNAVAILABLE_CAPABILITIES,
     unavailable_reason: Some(
-        "No isolated Python runtime is installed; the gateway will not launch a host process.",
+        "No embedded Python interpreter with enforced gas and memory limits is configured; host processes are disabled.",
     ),
 };
 
-const UNAVAILABLE_WASM: LanguageDescriptor = LanguageDescriptor {
+const WASM_DESCRIPTOR: LanguageDescriptor = LanguageDescriptor {
     id: "wasm",
     name: "WebAssembly",
-    runtime: "host not installed",
-    available: false,
+    runtime: "Wasmi 0.46 / WAT",
+    available: true,
     standard_libraries: &[],
-    capabilities: UNAVAILABLE_CAPABILITIES,
-    unavailable_reason: Some(
-        "omni-wasm is a binding scaffold, not a WebAssembly host for untrusted modules.",
-    ),
+    capabilities: WASM_CAPABILITIES,
+    unavailable_reason: None,
 };
 
 #[derive(Default)]
@@ -451,6 +469,205 @@ impl ExecutionRunner for LuaRunner {
     }
 }
 
+#[derive(Default)]
+struct WasmRunner;
+
+impl ExecutionRunner for WasmRunner {
+    fn descriptor(&self) -> LanguageDescriptor {
+        WASM_DESCRIPTOR
+    }
+
+    fn execute(&self, source: &str, limits: ExecutionLimits) -> Result<RunnerOutput, RunnerError> {
+        if limits.memory_limit_bytes == 0 {
+            return Err(RunnerError::MemoryLimit);
+        }
+
+        let mut config = WasmConfig::default();
+        config.consume_fuel(true);
+        config.set_stack_limits(
+            WasmStackLimits::new(1_024, 64 * 1024, 128)
+                .map_err(|error| RunnerError::Runtime(error.to_string()))?,
+        );
+        let engine = WasmEngine::new(&config);
+        let module = WasmModule::new(&engine, source.as_bytes())
+            .map_err(|error| RunnerError::Compile(error.to_string()))?;
+        if module.imports().next().is_some() {
+            return Err(RunnerError::UnsupportedResult(
+                "WebAssembly imports are disabled; modules must be self-contained".to_string(),
+            ));
+        }
+
+        let table_limit = limits.memory_limit_bytes / std::mem::size_of::<u128>();
+        let state = WasmStoreState {
+            limits: StoreLimitsBuilder::new()
+                .memory_size(limits.memory_limit_bytes)
+                .memories(1)
+                .tables(1)
+                .table_elements(table_limit)
+                .instances(1)
+                .trap_on_grow_failure(true)
+                .build(),
+            peak_memory_bytes: 0,
+            memory_limit_exceeded: false,
+        };
+        let mut store = WasmStore::new(&engine, state);
+        store.limiter(|state| state);
+        store
+            .set_fuel(limits.gas_limit)
+            .map_err(|error| RunnerError::Runtime(error.to_string()))?;
+
+        let linker = WasmLinker::new(&engine);
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .and_then(|instance| instance.start(&mut store))
+            .map_err(|error| map_wasm_runtime_error(error, &store))?;
+        let started = Instant::now();
+        let function = instance.get_func(&store, "run").ok_or_else(|| {
+            RunnerError::UnsupportedResult(
+                "WebAssembly module must export a no-argument function named 'run'".to_string(),
+            )
+        })?;
+
+        let value = if let Ok(function) = function.typed::<(), i32>(&store) {
+            let value = function
+                .call(&mut store, ())
+                .map_err(|error| map_wasm_runtime_error(error, &store))?;
+            wasm_number_value(value.to_string(), value as f64)
+        } else if let Ok(function) = function.typed::<(), i64>(&store) {
+            let value = function
+                .call(&mut store, ())
+                .map_err(|error| map_wasm_runtime_error(error, &store))?;
+            wasm_number_value(value.to_string(), value as f64)
+        } else if let Ok(function) = function.typed::<(), f32>(&store) {
+            let value = function
+                .call(&mut store, ())
+                .map_err(|error| map_wasm_runtime_error(error, &store))?;
+            if !value.is_finite() {
+                return Err(RunnerError::Runtime(
+                    "WebAssembly returned a non-finite number".to_string(),
+                ));
+            }
+            wasm_number_value(value.to_string(), value as f64)
+        } else if let Ok(function) = function.typed::<(), f64>(&store) {
+            let value = function
+                .call(&mut store, ())
+                .map_err(|error| map_wasm_runtime_error(error, &store))?;
+            if !value.is_finite() {
+                return Err(RunnerError::Runtime(
+                    "WebAssembly returned a non-finite number".to_string(),
+                ));
+            }
+            wasm_number_value(value.to_string(), value)
+        } else if let Ok(function) = function.typed::<(), ()>(&store) {
+            function
+                .call(&mut store, ())
+                .map_err(|error| map_wasm_runtime_error(error, &store))?;
+            RunnerValue {
+                tag: "null",
+                text: "null".to_string(),
+                number: None,
+                boolean: None,
+            }
+        } else {
+            return Err(RunnerError::UnsupportedResult(
+                "WebAssembly 'run' must take no parameters and return at most one i32, i64, f32, f64, or no value"
+                    .to_string(),
+            ));
+        };
+
+        let elapsed = started.elapsed();
+        if elapsed >= limits.cpu_limit {
+            return Err(RunnerError::CpuLimit);
+        }
+        if value.text.len() > limits.max_output_bytes {
+            return Err(RunnerError::OutputLimit);
+        }
+
+        Ok(RunnerOutput {
+            value,
+            cpu_ms: elapsed.as_millis(),
+            memory_bytes: store.data().peak_memory_bytes as u64,
+        })
+    }
+
+    fn supports_cluster_dispatch(&self) -> bool {
+        false
+    }
+
+    fn supports_deterministic_verification(&self) -> bool {
+        false
+    }
+}
+
+fn wasm_number_value(text: String, number: f64) -> RunnerValue {
+    RunnerValue {
+        tag: "number",
+        text,
+        number: Some(number),
+        boolean: None,
+    }
+}
+
+fn map_wasm_runtime_error(error: wasmi::Error, store: &WasmStore<WasmStoreState>) -> RunnerError {
+    if store.data().memory_limit_exceeded {
+        return RunnerError::MemoryLimit;
+    }
+    let message = error.to_string();
+    if message.to_ascii_lowercase().contains("fuel") {
+        RunnerError::GasLimit
+    } else {
+        RunnerError::Runtime(message)
+    }
+}
+
+struct WasmStoreState {
+    limits: StoreLimits,
+    peak_memory_bytes: usize,
+    memory_limit_exceeded: bool,
+}
+
+impl ResourceLimiter for WasmStoreState {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> Result<bool, LimiterError> {
+        let permitted = self.limits.memory_growing(current, desired, maximum);
+        match &permitted {
+            Ok(true) => self.peak_memory_bytes = self.peak_memory_bytes.max(desired),
+            Ok(false) | Err(_) => self.memory_limit_exceeded = true,
+        }
+        permitted
+    }
+
+    fn table_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> Result<bool, LimiterError> {
+        let permitted = self.limits.table_growing(current, desired, maximum);
+        match &permitted {
+            Ok(true) => {}
+            Ok(false) | Err(_) => self.memory_limit_exceeded = true,
+        }
+        permitted
+    }
+
+    fn instances(&self) -> usize {
+        self.limits.instances()
+    }
+
+    fn tables(&self) -> usize {
+        self.limits.tables()
+    }
+
+    fn memories(&self) -> usize {
+        self.limits.memories()
+    }
+}
+
 fn map_lua_error(error: LuaError) -> RunnerError {
     match error {
         LuaError::SyntaxError { message, .. } => RunnerError::Compile(message),
@@ -487,7 +704,9 @@ mod tests {
         assert!(languages[1].available);
         assert!(!languages[2].available);
         assert!(!languages[3].available);
-        assert!(!languages[4].available);
+        assert_eq!(languages[4].id, "wasm");
+        assert!(languages[4].available);
+        assert!(registry.resolve("wasm").is_ok());
     }
 
     #[test]
@@ -577,5 +796,77 @@ mod tests {
             assert_eq!(result.value.tag, "null", "{source}");
             assert_eq!(result.value.text, "nil", "{source}");
         }
+    }
+
+    #[test]
+    fn wasm_runner_executes_wat_and_enforces_fuel_and_memory_limits() {
+        let runner = WasmRunner;
+        let result = runner
+            .execute(
+                ";; WAT module: export a no-argument run function.\n\
+                 (module\n\
+                   (func (export \"run\") (result i32)\n\
+                     i32.const 42))",
+                limits(10_000, Duration::from_millis(50), 128 * 1024 * 1024),
+            )
+            .unwrap();
+        assert_eq!(result.value.tag, "number");
+        assert_eq!(result.value.number, Some(42.0));
+
+        let memory_preset = runner
+            .execute(
+                "(module\n\
+                   (memory (export \"memory\") 1 2)\n\
+                   (func (export \"run\") (result i32)\n\
+                     memory.size))",
+                limits(50_000, Duration::from_millis(50), 128 * 1024 * 1024),
+            )
+            .unwrap();
+        assert_eq!(memory_preset.value.number, Some(1.0));
+
+        let gas_error = runner
+            .execute(
+                "(module (func (export \"run\") (loop $again (br $again))))",
+                limits(100, Duration::from_millis(50), 128 * 1024 * 1024),
+            )
+            .unwrap_err();
+        assert!(matches!(gas_error, RunnerError::GasLimit));
+
+        let memory_error = runner
+            .execute(
+                "(module (memory (export \"memory\") 1 4) \
+                 (func (export \"run\") (result i32) i32.const 2 memory.grow drop i32.const 42))",
+                limits(10_000, Duration::from_millis(50), 64 * 1024),
+            )
+            .unwrap_err();
+        assert!(matches!(memory_error, RunnerError::MemoryLimit));
+
+        let table_error = runner
+            .execute(
+                "(module (table 5000 funcref) (func (export \"run\")))",
+                limits(10_000, Duration::from_millis(50), 64 * 1024),
+            )
+            .unwrap_err();
+        assert!(matches!(table_error, RunnerError::MemoryLimit));
+    }
+
+    #[test]
+    fn wasm_runner_rejects_host_imports_and_unsupported_exports() {
+        let runner = WasmRunner;
+        let import_error = runner
+            .execute(
+                "(module (import \"env\" \"host\" (func)) (func (export \"run\")))",
+                limits(10_000, Duration::from_millis(50), 128 * 1024 * 1024),
+            )
+            .unwrap_err();
+        assert!(matches!(import_error, RunnerError::UnsupportedResult(_)));
+
+        let signature_error = runner
+            .execute(
+                "(module (func (export \"run\") (param i32) (result i32) local.get 0))",
+                limits(10_000, Duration::from_millis(50), 128 * 1024 * 1024),
+            )
+            .unwrap_err();
+        assert!(matches!(signature_error, RunnerError::UnsupportedResult(_)));
     }
 }
